@@ -1,25 +1,25 @@
-//! MCP（Model Context Protocol）只读服务：JSON-RPC 2.0 envelope
+//! MCP (Model Context Protocol) read-only service: JSON-RPC 2.0 envelope
 //!
-//! 把网关能力以 MCP 工具暴露给外部 agent（Claude Code / Cursor 等），
-//! 当前仅 3 个只读工具，零写操作：
-//! - `list_models`   可用模型 ID 列表
-//! - `list_accounts` 账号健康状态快照
-//! - `usage_summary` 累计用量统计
+//! Exposes gateway capabilities as MCP tools to external agents (Claude Code / Cursor etc.),
+//! currently only 3 read-only tools, zero write operations:
+//! - `list_models`   list of available model IDs
+//! - `list_accounts` account health status snapshot
+//! - `usage_summary` cumulative usage stats
 //!
-//! 本模块不依赖 `AppState`（避免循环依赖），通过调用方注入的
-//! [`GatewaySnapshot`] 数据快照工作；HTTP 接线方负责从 AppState 组装快照
-//! 并在 POST 路由中调用 [`handle_json`]。
+//! This module does not depend on `AppState` (avoids circular dependency); it works off a
+//! [`GatewaySnapshot`] data snapshot injected by the caller. The HTTP wiring is responsible for
+//! assembling the snapshot from AppState and calling [`handle_json`] in the POST route.
 //!
-//! 协议要点（MCP 2024-11-05）：
-//! - 请求：`{"jsonrpc":"2.0","id":N,"method":"...","params":{...}}`
-//! - 成功：`{"jsonrpc":"2.0","id":N,"result":{...}}`
-//! - 失败：`{"jsonrpc":"2.0","id":N,"error":{"code":N,"message":"..."}}`
-//! - 无 `id` 字段 = notification，不应答（返回 `None`）
-//! - `tools/call` 的工具级失败用 `isError:true` 的 tool result 表达，不是协议错误
+//! Protocol notes (MCP 2024-11-05):
+//! - Request: `{"jsonrpc":"2.0","id":N,"method":"...","params":{...}}`
+//! - Success: `{"jsonrpc":"2.0","id":N,"result":{...}}`
+//! - Failure: `{"jsonrpc":"2.0","id":N,"error":{"code":N,"message":"..."}}`
+//! - No `id` field = notification, no reply (returns `None`)
+//! - `tools/call` tool-level failures are expressed via an `isError:true` tool result, not a protocol error
 
 use serde_json::{json, Value};
 
-/// 支持的 MCP 协议版本
+/// Supported MCP protocol version
 pub const PROTOCOL_VERSION: &str = "2024-11-05";
 /// serverInfo.name
 pub const SERVER_NAME: &str = "freebuff2api";
@@ -29,68 +29,68 @@ const ERR_INVALID_REQUEST: i64 = -32600;
 const ERR_METHOD_NOT_FOUND: i64 = -32601;
 const ERR_INVALID_PARAMS: i64 = -32602;
 
-/// 工具执行时由调用方提供的数据快照（接线方从 AppState 组装）
+/// Data snapshot provided by the caller at tool execution time (the wiring assembles this from AppState)
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct GatewaySnapshot {
-    /// 可用模型 ID 列表
+    /// List of available model IDs
     pub models: Vec<String>,
-    /// 账号健康摘要
+    /// Account health summary
     pub accounts: Vec<AccountBrief>,
-    /// 用量汇总（`usage.totals()` 原样透传）
+    /// Usage totals (passed through as-is from `usage.totals()`)
     pub usage_totals: Value,
-    /// 网关版本（建议 `env!("CARGO_PKG_VERSION")`）
+    /// Gateway version (recommend `env!("CARGO_PKG_VERSION")`)
     pub version: String,
-    /// 进程已运行秒数
+    /// Process uptime in seconds
     pub uptime_sec: u64,
 }
 
-/// 账号健康摘要（从 `pool::AccountSnapshot` 映射）
+/// Account health summary (mapped from `pool::AccountSnapshot`)
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct AccountBrief {
     pub name: String,
     pub healthy: bool,
     pub score: f64,
-    /// 会话状态（`session::SessionSnapshot::status`，缺失时为 "unknown"）
+    /// Session status (`session::SessionSnapshot::status`, "unknown" when missing)
     pub session_status: String,
 }
 
-/// MCP 工具定义（`tools/list` 的 result）
+/// MCP tool definitions (the result of `tools/list`)
 pub fn tool_definitions() -> Value {
     json!({
         "tools": [
             {
                 "name": "list_models",
-                "description": "列出网关当前可用的模型 ID 列表（只读）",
+                "description": "List the model IDs currently available on the gateway (read-only)",
                 "inputSchema": { "type": "object", "properties": {}, "required": [] }
             },
             {
                 "name": "list_accounts",
-                "description": "列出上游账号健康状态：名称、是否可用、评分、会话状态（只读）",
+                "description": "List upstream account health status: name, availability, score, session status (read-only)",
                 "inputSchema": { "type": "object", "properties": {}, "required": [] }
             },
             {
                 "name": "usage_summary",
-                "description": "返回网关累计用量统计（请求数、token 等，只读）",
+                "description": "Return the gateway's cumulative usage stats (request count, tokens, etc., read-only)",
                 "inputSchema": { "type": "object", "properties": {}, "required": [] }
             }
         ]
     })
 }
 
-/// 处理一个 JSON-RPC 请求，返回 JSON-RPC 响应（`None` = notification，无需响应）
+/// Handle one JSON-RPC request, returning a JSON-RPC response (`None` = notification, no reply needed)
 ///
-/// 支持方法：`initialize` / `tools/list` / `tools/call` / `ping`；
-/// 未知方法返回 `-32601`；非法信封返回 `-32600`；`tools/call` 参数缺失返回 `-32602`。
+/// Supported methods: `initialize` / `tools/list` / `tools/call` / `ping`;
+/// unknown methods return `-32601`; an invalid envelope returns `-32600`; missing `tools/call` params returns `-32602`.
 pub fn handle_request(req: &Value, snapshot: &GatewaySnapshot) -> Option<Value> {
     let Some(obj) = req.as_object() else {
         return Some(error_response(
             &Value::Null,
             ERR_INVALID_REQUEST,
-            "Invalid Request: 请求必须是 JSON 对象",
+            "Invalid Request: request must be a JSON object",
         ));
     };
 
-    // 无 id 字段 = notification，按 JSON-RPC 2.0 不应答
+    // No id field = notification, no reply per JSON-RPC 2.0
     if !obj.contains_key("id") {
         return None;
     }
@@ -100,14 +100,14 @@ pub fn handle_request(req: &Value, snapshot: &GatewaySnapshot) -> Option<Value> 
         return Some(error_response(
             &id,
             ERR_INVALID_REQUEST,
-            "Invalid Request: jsonrpc 必须为 \"2.0\"",
+            "Invalid Request: jsonrpc must be \"2.0\"",
         ));
     }
     let Some(method) = obj.get("method").and_then(Value::as_str) else {
         return Some(error_response(
             &id,
             ERR_INVALID_REQUEST,
-            "Invalid Request: method 必须是字符串",
+            "Invalid Request: method must be a string",
         ));
     };
 
@@ -125,17 +125,17 @@ pub fn handle_request(req: &Value, snapshot: &GatewaySnapshot) -> Option<Value> 
     })
 }
 
-/// 便捷入口：处理原始 JSON 字符串；解析失败返回 `-32700`（id 为 null）
+/// Convenience entry point: handles a raw JSON string; returns `-32700` on parse failure (id is null)
 pub fn handle_json(raw: &str, snapshot: &GatewaySnapshot) -> Option<String> {
     match serde_json::from_str::<Value>(raw) {
         Ok(req) => handle_request(&req, snapshot).map(|resp| resp.to_string()),
         Err(_) => {
-            Some(error_response(&Value::Null, ERR_PARSE, "Parse error: 非法 JSON").to_string())
+            Some(error_response(&Value::Null, ERR_PARSE, "Parse error: invalid JSON").to_string())
         }
     }
 }
 
-/// `initialize` 结果：协议版本 + 能力 + 服务信息
+/// `initialize` result: protocol version + capabilities + server info
 fn initialize_result(snapshot: &GatewaySnapshot) -> Value {
     json!({
         "protocolVersion": PROTOCOL_VERSION,
@@ -144,14 +144,14 @@ fn initialize_result(snapshot: &GatewaySnapshot) -> Value {
     })
 }
 
-/// 分发 `tools/call`；仅参数信封错误走协议错误，未知工具走 isError tool result
+/// Dispatch `tools/call`; only param envelope errors go through the protocol error path, unknown tools go through the isError tool result
 fn tools_call(params: Option<&Value>, snapshot: &GatewaySnapshot) -> Result<Value, (i64, String)> {
     let name = params
         .and_then(|p| p.get("name"))
         .and_then(Value::as_str)
         .ok_or((
             ERR_INVALID_PARAMS,
-            "Invalid params: tools/call 需要字符串字段 \"name\"".to_string(),
+            "Invalid params: tools/call requires a string field \"name\"".to_string(),
         ))?;
 
     match name {
@@ -159,33 +159,33 @@ fn tools_call(params: Option<&Value>, snapshot: &GatewaySnapshot) -> Result<Valu
         "list_accounts" => Ok(tool_text(to_json(&snapshot.accounts), false)),
         "usage_summary" => Ok(tool_text(snapshot.usage_totals.clone(), false)),
         other => Ok(tool_text(
-            json!({ "error": format!("未知工具: {other}") }),
+            json!({ "error": format!("Unknown tool: {other}") }),
             true,
         )),
     }
 }
 
-/// 构造 MCP tool result；文本统一为 pretty JSON 字符串
+/// Build an MCP tool result; text is always a pretty JSON string
 fn tool_text(payload: Value, is_error: bool) -> Value {
     let text = serde_json::to_string_pretty(&payload)
-        .unwrap_or_else(|e| format!("{{\"error\":\"序列化失败: {e}\"}}"));
+        .unwrap_or_else(|e| format!("{{\"error\":\"serialization failed: {e}\"}}"));
     json!({
         "content": [{ "type": "text", "text": text }],
         "isError": is_error
     })
 }
 
-/// 序列化为 JSON 值（这些类型不会失败，降级为错误对象而非 panic）
+/// Serialize to a JSON value (these types cannot fail; degrades to an error object instead of panicking)
 fn to_json<T: serde::Serialize>(value: &T) -> Value {
     serde_json::to_value(value).unwrap_or_else(|e| json!({ "error": e.to_string() }))
 }
 
-/// 成功响应信封
+/// Success response envelope
 fn success_response(id: &Value, result: Value) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "result": result })
 }
 
-/// 错误响应信封
+/// Error response envelope
 fn error_response(id: &Value, code: i64, message: &str) -> Value {
     json!({
         "jsonrpc": "2.0",
@@ -298,7 +298,7 @@ mod tests {
         assert!(resp.get("error").is_none());
         assert_eq!(resp["result"]["isError"], true);
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("未知工具"));
+        assert!(text.contains("Unknown tool"));
     }
 
     #[test]
@@ -376,7 +376,7 @@ mod tests {
         assert_eq!(resp["id"], "req-9");
         assert_eq!(resp["result"]["isError"], false);
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains('\n'), "文本应为 pretty JSON");
+        assert!(text.contains('\n'), "text should be pretty JSON");
         assert!(text.contains("claude-sonnet-5"));
     }
 

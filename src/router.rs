@@ -1,8 +1,8 @@
-//! 模型路由 + 降级链 + token 节省（9router 式）
+//! Model routing + fallback chain + token savings (9router-style)
 //!
-//! - 主模型失败自动降级到 fallback_models 中的备选
-//! - 按 free 配额/成本选择最优模型
-//! - token 节省：压缩超长 tool_result（可选，默认关闭）
+//! - Automatically falls back to an alternate in fallback_models when the primary model fails
+//! - Picks the best model based on free quota/cost
+//! - Token savings: compress overly long tool_result (optional, off by default)
 
 use crate::models::ModelRegistry;
 use anyhow::Result;
@@ -10,9 +10,9 @@ use std::sync::Arc;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RouterConfig {
-    /// 冻结的降级链（用户自选）
+    /// The frozen fallback chain (user-selected)
     pub fallback_chain: Vec<String>,
-    /// 配额感知（按账号 rateLimitsByModel 剩余）
+    /// Quota-aware (based on the account's remaining rateLimitsByModel)
     pub quota_aware: bool,
 }
 
@@ -31,7 +31,7 @@ impl Default for RouterConfig {
 }
 
 impl RouterConfig {
-    /// 从全局配置构造：用户配置了 fallback_models 时优先使用（此前该配置解析后零消费）
+    /// Build from the global config: prefers the user's fallback_models when configured (previously that config was parsed but never consumed)
     pub fn from_app_config(cfg: &crate::config::Config) -> Self {
         let mut rc = Self::default();
         if !cfg.fallback_models.is_empty() {
@@ -51,12 +51,12 @@ impl ModelRouter {
         Self { config, registry }
     }
 
-    /// 解析请求模型 → 实际可用模型（含降级链；时间感知）
+    /// Resolve the requested model -> the actual model to use (including the fallback chain; time-aware)
     pub async fn resolve(&self, requested: &str) -> String {
         self.resolve_at(requested, chrono::Utc::now()).await
     }
 
-    /// 指定时刻解析：请求模型当时可用才直接选用；否则降级链取第一条当时可用
+    /// Resolve at a given time: use the requested model directly only if it's available then; otherwise take the first available entry in the fallback chain
     pub async fn resolve_at(&self, requested: &str, now: chrono::DateTime<chrono::Utc>) -> String {
         if self.registry.has_model(requested).await
             && self.registry.model_available_at(requested, now)
@@ -68,7 +68,7 @@ impl ModelRouter {
                 return m.clone();
             }
         }
-        // 审计 M2：兜底默认模型也须当时可用；不可用则取降级链第一个当时可用；全不可用才原样返回默认（让上游给可读错误）
+        // Audit M2: the fallback default model must also be available at that time; if not, take the first available entry in the fallback chain; only return the default as-is if none are available (let upstream produce a readable error)
         if self
             .registry
             .model_available_at(crate::models::DEFAULT_MODEL, now)
@@ -83,16 +83,16 @@ impl ModelRouter {
         crate::models::DEFAULT_MODEL.to_string()
     }
 
-    /// 检查某模型是否可直接用（杜绝幻觉）
+    /// Check whether a model can be used directly (prevents hallucination)
     pub fn is_available(&self, model: &str) -> bool {
         self.registry.models_sync().contains(&model.to_string())
     }
 
-    /// 模型是否支持 reasoning_effort（思考程度），逆向自上游 orchestrator.js efforts 字段
-    /// 支持清单（efforts 非空）：deepseek 系/glm 系/gpt-5.6/gemini-3.8/fable-5/ox-alpha/muse-spark
-    /// 不支持（无 efforts 字段）：solar-pro4 / minimax-m3 / mimo-v2.5 / kimi-k3
+    /// Whether a model supports reasoning_effort (thinking level), reverse-engineered from the upstream orchestrator.js efforts field
+    /// Supported (non-empty efforts): deepseek family/glm family/gpt-5.6/gemini-3.8/fable-5/ox-alpha/muse-spark
+    /// Unsupported (no efforts field): solar-pro4 / minimax-m3 / mimo-v2.5 / kimi-k3
     pub fn supports_reasoning(&self, model: &str) -> bool {
-        // 支持 efforts 的模型前缀
+        // Model prefixes that support efforts
         const SUPPORTED: &[&str] = &[
             "deepseek/",
             "z-ai/glm",
@@ -105,16 +105,16 @@ impl ModelRouter {
         SUPPORTED.iter().any(|p| model.starts_with(p))
     }
 
-    /// 模型支持的 efforts 范围；None = 不支持
+    /// The efforts range a model supports; None = unsupported
     ///
-    /// v0.9：以元数据权威表（`ModelRegistry` 静态表，对齐上游 freebuff-models.ts）优先；
-    /// 表内模型 efforts=None 即不支持（不再按前缀推测）；表外模型（上游动态新增）按前缀回退，
-    /// 避免 deepseek/glm 变体丢档位。
+    /// v0.9: prefers the authoritative metadata table (`ModelRegistry`'s static table, aligned with upstream freebuff-models.ts);
+    /// a model in the table with efforts=None is unsupported (no longer guessed by prefix); a model not in the table
+    /// (dynamically added upstream) falls back to prefix matching, so deepseek/glm variants don't lose their tier.
     pub fn reasoning_efforts(&self, model: &str) -> Option<Vec<&'static str>> {
         if self.registry.meta_for(model).is_some() {
             return self.registry.efforts_static(model).map(|e| e.to_vec());
         }
-        // 表外模型：前缀回退（兼容上游动态新增）
+        // Model not in the table: fall back to prefix matching (for upstream dynamic additions)
         if model.starts_with("deepseek/")
             || model.starts_with("z-ai/glm")
             || model.starts_with("stealth/ox-alpha")
@@ -132,17 +132,17 @@ impl ModelRouter {
         }
     }
 
-    /// 模型是否可免费使用（元数据；未知模型默认可用，不误伤上游动态新增）
+    /// Whether a model can be used for free (metadata; unknown models default to available, to avoid breaking upstream dynamic additions)
     pub fn model_available(&self, model: &str) -> bool {
         self.registry.model_available(model)
     }
 
-    /// 模型不可用且有回落时返回回落模型；可用 / 未知模型 → None（时间感知）
+    /// Returns the fallback model when the model is unavailable and has one; available / unknown model -> None (time-aware)
     pub fn resolve_available(&self, model: &str) -> Option<String> {
         self.resolve_available_at(model, chrono::Utc::now())
     }
 
-    /// 指定时刻：不可用且有回落 → 回落模型；可用 / 未知 → None
+    /// At a given time: unavailable with a fallback -> the fallback model; available / unknown -> None
     pub fn resolve_available_at(
         &self,
         model: &str,
@@ -155,12 +155,12 @@ impl ModelRouter {
         meta.fallback
     }
 
-    /// 不可用模型的可读原因（面板展示用）；可用 / 未知模型 → None
+    /// Human-readable reason an unavailable model is unavailable (for panel display); available / unknown model -> None
     pub fn unavailable_reason(&self, model: &str) -> Option<String> {
         self.unavailable_reason_at(model, chrono::Utc::now())
     }
 
-    /// 指定时刻的可读原因（含 availableAt 文本）
+    /// Human-readable reason at a given time (including the availableAt text)
     pub fn unavailable_reason_at(
         &self,
         model: &str,
@@ -170,7 +170,7 @@ impl ModelRouter {
             .map(|(reason, _)| reason)
     }
 
-    /// 指定时刻：不可用原因 + 预计恢复时刻（off_peak_only 窗口内 → Some(ISO)，其余 None）
+    /// At a given time: the unavailability reason + expected recovery time (Some(ISO) within an off_peak_only window, otherwise None)
     pub fn unavailable_detail_at(
         &self,
         model: &str,
@@ -182,27 +182,27 @@ impl ModelRouter {
         }
         let paused = meta.availability != "off_peak_only";
         let mut msg = if paused {
-            format!("模型 {model} 已被上游暂停/下架（免费模式不再提供）")
+            format!("Model {model} has been paused/discontinued upstream (no longer offered in free mode)")
         } else {
-            format!("模型 {model} 当前不在可用窗口（上游 DeepSeek 高价窗 00:00–10:00 UTC）")
+            format!("Model {model} is currently outside its available window (upstream DeepSeek peak-price window 00:00-10:00 UTC)")
         };
         if let Some(fb) = &meta.fallback {
-            msg.push_str(&format!("；建议改用 {fb}"));
+            msg.push_str(&format!("; consider switching to {fb}"));
         }
         if let Some(aa) = &meta.available_at {
-            msg.push_str(&format!("；预计恢复 {aa}（availableAt）"));
+            msg.push_str(&format!("; expected to resume at {aa} (availableAt)"));
         }
         Some((msg, meta.available_at))
     }
 
-    /// 校正 effort：不支持或超范围时降级到最近支持值
+    /// Clamp effort: falls back to the nearest supported value when unsupported or out of range
     pub fn clamp_effort(&self, model: &str, requested: &str) -> Option<String> {
         let efforts = self.reasoning_efforts(model)?;
         let requested = requested.to_lowercase();
         if efforts.contains(&requested.as_str()) {
             return Some(requested);
         }
-        // 超出范围：取 requests 同档 max → 支持上限
+        // Out of range: map requests in the same tier as max -> the supported ceiling
         if requested == "max" || requested == "xhigh" || requested == "high" {
             return Some(efforts.last().unwrap().to_string());
         }
@@ -213,25 +213,25 @@ impl ModelRouter {
     }
 }
 
-/// 超长 tool_result 压缩（token 节省核心）
-/// 注意：按字符边界切分——中文字符串上按字节切片会 panic（与 api.rs tail_keep 同类问题）
+/// Compress an overly long tool_result (the core of token savings)
+/// Note: split on character boundaries -- byte-slicing a Chinese string would panic (same issue class as api.rs tail_keep)
 pub fn compress_tool_result(content: &str, max_chars: usize) -> String {
     if content.len() <= max_chars {
         return content.to_string();
     }
     let keep = max_chars / 2;
-    // 头部：从 keep 处向前回退到字符边界
+    // Head: step back from `keep` to a character boundary
     let mut head_end = keep.min(content.len());
     while head_end > 0 && !content.is_char_boundary(head_end) {
         head_end -= 1;
     }
-    // 尾部：从 len-keep 处向后推进到字符边界
+    // Tail: step forward from `len-keep` to a character boundary
     let mut tail_start = content.len() - keep;
     while tail_start < content.len() && !content.is_char_boundary(tail_start) {
         tail_start += 1;
     }
     format!(
-        "{}\n\n[... 已压缩: 原始 {} 字符，保留首尾 {} 字符 ...]\n\n{}",
+        "{}\n\n[... compressed: original {} chars, kept {} head/tail chars ...]\n\n{}",
         &content[..head_end],
         content.len(),
         max_chars,
@@ -241,7 +241,7 @@ pub fn compress_tool_result(content: &str, max_chars: usize) -> String {
 
 #[allow(dead_code)]
 pub fn truncate_to_tokens(s: &str, approx_tokens: usize) -> String {
-    // 粗略估算：每 token ≈ 4 字符（英文）
+    // Rough estimate: 1 token ≈ 4 characters (English)
     let max_chars = approx_tokens * 4;
     compress_tool_result(s, max_chars)
 }
@@ -263,7 +263,7 @@ mod tests {
     #[test]
     fn clamp_effort_within_range_kept() {
         let r = router();
-        // glm 支持 low/high/max
+        // glm supports low/high/max
         assert_eq!(
             r.clamp_effort("z-ai/glm-5.3-flash", "high").as_deref(),
             Some("high")
@@ -277,17 +277,17 @@ mod tests {
     #[test]
     fn clamp_effort_over_range_downgrades() {
         let r = router();
-        // glm 上限是 max，请求 xhigh → 取上限 max；gpt 支持到 max
+        // glm's ceiling is max; requesting xhigh -> takes the ceiling max; gpt supports up to max
         assert_eq!(
             r.clamp_effort("z-ai/glm-5.3-flash", "xhigh").as_deref(),
             Some("max")
         );
-        // muse 上限 xhigh，请求 max → xhigh
+        // muse's ceiling is xhigh; requesting max -> xhigh
         assert_eq!(
             r.clamp_effort("meta/muse-spark-x", "max").as_deref(),
             Some("xhigh")
         );
-        // muse 下限 minimal，请求 low 有效但 minimal 是首项
+        // muse's floor is minimal; requesting low is valid but minimal is the first entry
         assert_eq!(
             r.clamp_effort("meta/muse-spark-x", "minimal").as_deref(),
             Some("minimal")
@@ -297,7 +297,7 @@ mod tests {
     #[test]
     fn clamp_effort_unsupported_model_returns_none() {
         let r = router();
-        // solar/minimax/mimo/kimi 不支持 effort
+        // solar/minimax/mimo/kimi do not support effort
         assert!(r.clamp_effort("upstage/solar-pro4", "max").is_none());
         assert!(r.clamp_effort("minimax/minimax-m3", "high").is_none());
     }
@@ -305,7 +305,7 @@ mod tests {
     #[test]
     fn clamp_effort_unknown_value_falls_back() {
         let r = router();
-        // 未知档位 → 取支持列表第一项
+        // Unknown tier -> take the first entry in the supported list
         assert_eq!(
             r.clamp_effort("z-ai/glm-5.3-flash", "bogus").as_deref(),
             Some("low")
@@ -331,21 +331,21 @@ mod tests {
         let s = "a".repeat(1000);
         let out = compress_tool_result(&s, 100);
         assert!(out.len() < 1000);
-        assert!(out.contains("已压缩"));
+        assert!(out.contains("compressed"));
         assert!(out.starts_with("aaa"));
     }
 
     #[test]
     fn compress_multibyte_content_does_not_panic() {
-        // 回归：中文内容按字节切片会触发 char boundary panic
+        // Regression: byte-slicing Chinese content would trigger a char boundary panic
         let s = "中文内容".repeat(500);
         let out = compress_tool_result(&s, 1000);
-        assert!(out.contains("已压缩"));
+        assert!(out.contains("compressed"));
         assert!(out.starts_with("中文"));
-        // emoji（4 字节字符）同样安全
+        // emoji (4-byte characters) are equally safe
         let e = "🎉".repeat(300);
         let out2 = compress_tool_result(&e, 500);
-        assert!(out2.contains("已压缩"));
+        assert!(out2.contains("compressed"));
     }
 
     #[test]
@@ -355,14 +355,14 @@ mod tests {
             let reg = Arc::new(ModelRegistry::new());
             reg.init().await;
             let r = ModelRouter::new(reg.clone(), RouterConfig::default());
-            // 暂停模型（gemini-3.8）→ 降级链第一条当时可用（glm-5.3）
+            // Paused model (gemini-3.8) -> falls back to the first entry in the chain that's available at the time (glm-5.3)
             assert_eq!(
                 r.resolve("google/gemini-3.8-flash").await,
                 "z-ai/glm-5.3-flash"
             );
-            // 可用模型原样返回
+            // Available model is returned as-is
             assert_eq!(r.resolve("z-ai/glm-5.3-flash").await, "z-ai/glm-5.3-flash");
-            // 未知模型 → 默认
+            // Unknown model -> default
             assert_eq!(
                 r.resolve("no/such-model").await,
                 crate::models::DEFAULT_MODEL
@@ -373,7 +373,7 @@ mod tests {
     #[test]
     fn resolve_available_at_window_fallback() {
         let reg = ModelRegistry::new();
-        // 快照覆盖：deepseek-v4-flash → off_peak_only（fallback 保留 gpt-5.6-luna）
+        // Snapshot override: deepseek-v4-flash -> off_peak_only (fallback keeps gpt-5.6-luna)
         let snap = r#"{"_source":"t","_vended_at":"2026-09-19","models":[{"id":"deepseek/deepseek-v4-flash","availability":"off_peak_only","catalog":true}]}"#;
         reg.refresh_strategy_from_snapshot(snap).unwrap();
         let r = ModelRouter::new(Arc::new(reg), RouterConfig::default());
@@ -392,7 +392,7 @@ mod tests {
             r.resolve_available_at("deepseek/deepseek-v4-flash", out_win),
             None
         );
-        // 未知模型不抖动
+        // Unknown model doesn't flap
         assert_eq!(r.resolve_available("no/such-model"), None);
     }
 
@@ -407,12 +407,12 @@ mod tests {
             .with_timezone(&chrono::Utc);
         let (reason, aa) = r
             .unavailable_detail_at("deepseek/deepseek-v4-flash", in_win)
-            .expect("窗口内应给原因");
-        assert!(reason.contains("窗口"), "窗口文案: {reason}");
-        let iso = aa.expect("窗口内应有 availableAt");
+            .expect("should give a reason inside the window");
+        assert!(reason.contains("window"), "window message: {reason}");
+        let iso = aa.expect("should have availableAt inside the window");
         assert!(
             chrono::DateTime::parse_from_rfc3339(&iso).is_ok(),
-            "ISO 可解析"
+            "ISO should be parseable"
         );
         assert!(reason.contains("availableAt"));
     }

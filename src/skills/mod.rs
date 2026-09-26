@@ -1,11 +1,12 @@
-//! 技能系统：文件为真相源 + SQLite 索引 + roster 按需注入 + 质量门。
+//! Skills system: files as the source of truth + SQLite index + on-demand roster injection + quality gate.
 //!
-//! 目录布局：
-//! - `<skills_dir>/<id>/SKILL.md` —— 技能全文（frontmatter + 正文），文件是唯一真相源
-//! - `<db_path>` —— SQLite 索引（启用状态/来源/内置标记/内容哈希）
+//! Directory layout:
+//! - `<skills_dir>/<id>/SKILL.md` -- full skill text (frontmatter + body); the file is the single source of truth
+//! - `<db_path>` -- SQLite index (enabled state / source / built-in flag / content hash)
 //!
-//! 与旧 `prompts.rs` 的差异：技能不再全量拼接进 system 前缀，改为只注入启用技能的
-//! roster（名称 + 描述），正文按需读取；自定义技能落盘落库，重启不丢失。
+//! Difference from the old `prompts.rs`: skills are no longer fully concatenated into the system prefix.
+//! Instead only the roster (name + description) of enabled skills is injected, and the body is read on demand;
+//! custom skills are persisted to disk and the database, so they survive a restart.
 
 pub mod frontmatter;
 pub mod gate;

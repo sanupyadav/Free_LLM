@@ -1,49 +1,49 @@
-# Testing — Freebuff2API 测试台账（v0.10）
+# Testing - Freebuff2API Test Ledger (v0.10)
 
-> 单一测试事实源：数量、命令、基线、环境限制。**先看这里再改代码。**
+> Single source of truth for testing: counts, commands, baselines, environment limitations. **Check here before changing code.**
 
-## 一、测试规模（v0.10.0 基线）
+## 1. Test Scale (v0.10.0 Baseline)
 
-| 层 | 数量 | 命令 |
+| Layer | Count | Command |
 |----|------|------|
-| 单元测试（src 内） | 275 | `cargo test --lib` |
-| Router 级集成（Mock TCP 上游） | 11 | `cargo test --test router_test` |
-| 核心集成 | 8 | `cargo test --test core_test` |
-| web Cookie 池集成 | 5 | `cargo test --test web_pool_test` |
-| 模型元数据契约 | 7 | `cargo test --test model_meta_test` |
-| 文档测试 | 环境受限 | `cargo test --doc`（CI 有 rust-docs 组件可跑；本机 chocolatey/rustup 缺 rustdoc 时跳过） |
-| 真实网关 E2E | 26+26 断言 | `node tests/e2e_phase_v0_8.cjs <port>` / `e2e_phase_v0_9.cjs <port>`（需先起网关） |
-| 面板 JS 语法 | 1 | `node tests/check_panel_js.cjs` |
-| 模型合同对齐 | 1 | `node scripts/check_model_contract.mjs` |
+| Unit tests (within src) | 275 | `cargo test --lib` |
+| Router-level integration (Mock TCP upstream) | 11 | `cargo test --test router_test` |
+| Core integration | 8 | `cargo test --test core_test` |
+| web Cookie pool integration | 5 | `cargo test --test web_pool_test` |
+| Model metadata contract | 7 | `cargo test --test model_meta_test` |
+| Doc tests | environment-limited | `cargo test --doc` (CI has the rust-docs component and can run this; skipped locally if chocolatey/rustup is missing rustdoc) |
+| Real gateway E2E | 26+26 assertions | `node tests/e2e_phase_v0_8.cjs <port>` / `e2e_phase_v0_9.cjs <port>` (requires starting the gateway first) |
+| Panel JS syntax | 1 | `node tests/check_panel_js.cjs` |
+| Model contract alignment | 1 | `node scripts/check_model_contract.mjs` |
 
-## 二、本地一键验证
+## 2. Local One-Click Verification
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/verify_release.ps1
 ```
 
-覆盖：fmt --check → clippy -D warnings → lib 单测 → 4 个集成测试 → 面板 JS → 模型合同 → release 冒烟（healthz/ui/models 200）。
+Coverage: fmt --check -> clippy -D warnings -> lib unit tests -> 4 integration tests -> panel JS -> model contract -> release smoke test (healthz/ui/models 200).
 
-## 三、E2E 手动跑法
+## 3. Running E2E Manually
 
 ```powershell
-# 1) 起网关（临时端口）
-target\release\freebuff2api.exe --config <临时 config（listen_addr 127.0.0.1:47980, skip_upstream_check=true）>
-# 2) 跑断言
+# 1) Start the gateway (temporary port)
+target\release\freebuff2api.exe --config <temp config (listen_addr 127.0.0.1:47980, skip_upstream_check=true)>
+# 2) Run the assertions
 node tests/e2e_phase_v0_8.cjs 47980 config.e2e.json
 node tests/e2e_phase_v0_9.cjs 47980 config.e2e.json
 ```
 
-## 四、覆盖率（v0.10.2 基线，2026-09-19 本机实测）
+## 4. Coverage (v0.10.2 Baseline, measured locally 2026-09-19)
 
-- 工具：`cargo-llvm-cov 0.9.1`（`cargo install cargo-llvm-cov --locked`；需 `rustup component add llvm-tools-preview`），跑：`cargo llvm-cov --fail-under-lines 70`
-- **TOTAL 行覆盖率 72.25%（v0.10.3）**；**CI 真门禁**：`--fail-under-lines 70` + `continue-on-error: false`
-- 本轮新增 22 个 Router 级用例后：**api.rs 30.6% -> 45.8%**；router_test 11 -> **33** 用例
-- 关键业务模块：errors 97.9 / redact 98.5 / mcp 98.6 / telemetry 94.4 / memory 93.9 / import 92.8 / router 89.0 / web_pool 84.6 / export 84.0 / models 83.2
-- 拉低总体：main.rs 0（启动路径）、upstream 51.6 / session 65.6 / web_protocol 76.9（网络层，需 Mock 上游）
-- **提升路径（backlog）**：api.rs 45.8 -> 60（鉴权/路由错误分支）→ 总体 75% → 80%
+- Tool: `cargo-llvm-cov 0.9.1` (`cargo install cargo-llvm-cov --locked`; requires `rustup component add llvm-tools-preview`), run with: `cargo llvm-cov --fail-under-lines 70`
+- **TOTAL line coverage 72.25% (v0.10.3)**; **CI real gate**: `--fail-under-lines 70` + `continue-on-error: false`
+- After adding 22 Router-level test cases this round: **api.rs 30.6% -> 45.8%**; router_test 11 -> **33** cases
+- Key business modules: errors 97.9 / redact 98.5 / mcp 98.6 / telemetry 94.4 / memory 93.9 / import 92.8 / router 89.0 / web_pool 84.6 / export 84.0 / models 83.2
+- Dragging the overall average down: main.rs 0 (startup path), upstream 51.6 / session 65.6 / web_protocol 76.9 (network layer, needs a mock upstream)
+- **Improvement path (backlog)**: api.rs 45.8 -> 60 (auth/routing error branches) -> overall 75% -> 80%
 
-## 五、环境限制（诚实披露）
+## 5. Environment Limitations (Honest Disclosure)
 
-- 本机 cargo 为 rustup 1.95.0 stable-msvc；`cargo test --doc` 需要 rust-docs 组件（CI 已装；本机若缺可 `rustup component add rust-docs`）。
-- E2E 需真实上游连通或空凭证配置；Mock 上游场景由 router_test 覆盖（不打真实付费 API）。
+- The local cargo is rustup 1.95.0 stable-msvc; `cargo test --doc` needs the rust-docs component (CI has it installed; locally, if missing, run `rustup component add rust-docs`).
+- E2E requires either genuine upstream connectivity or an empty-credentials config; the mock-upstream scenario is covered by router_test (does not hit the real paid API).

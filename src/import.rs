@@ -1,8 +1,8 @@
-//! Token 导入：解析 curl 命令 / HAR 文件，自动提取 Freebuff 鉴权 token 并入库
+//! Token import: parses curl commands / HAR files, auto-extracts Freebuff auth tokens and stores them
 //!
-//! 场景：用户在浏览器 DevTools 里把请求"Copy as cURL"或导出 HAR，粘到本网关
-//! 面板 → 自动提取 `authorization: Bearer <token>`（仅限 freebuff.com / codebuff.com
-//! 域名的请求）→ 追加到账号池并持久化。
+//! Scenario: the user "Copy as cURL"s a request from browser DevTools, or exports a HAR file,
+//! and pastes it into this gateway's control panel -> it auto-extracts `authorization: Bearer <token>`
+//! (only for requests to the freebuff.com / codebuff.com domains) -> appends it to the account pool and persists it.
 
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
@@ -12,30 +12,30 @@ pub const TARGET_HOSTS: &[&str] = &["freebuff.com", "codebuff.com", "www.codebuf
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExtractedAuth {
-    /// Bearer token（或回退为 session cookie 值）
+    /// Bearer token (or falls back to the session cookie value)
     pub token: String,
-    /// 提取来源：curl / har
+    /// Extraction source: curl / har
     pub source: String,
-    /// 关联请求的 host
+    /// Host of the associated request
     pub host: String,
-    /// 关联请求的 path
+    /// Path of the associated request
     pub path: String,
-    /// 关联请求的方法
+    /// Method of the associated request
     pub method: String,
-    /// 入库时间（RFC3339；旧数据无此字段时为 None）
+    /// Time added (RFC3339; None for old data that predates this field)
     #[serde(default)]
     pub added_at: Option<String>,
 }
 
-/// 从 curl 命令文本提取 Bearer token（仅限 freebuff/codebuff 目标域，防跨域凭据误导入）
+/// Extract a Bearer token from curl command text (freebuff/codebuff target domains only, to prevent importing cross-domain credentials)
 pub fn parse_curl(text: &str) -> Vec<ExtractedAuth> {
     let mut out = Vec::new();
-    // 提取所有 header：支持 `-H "name: value"`、`-H 'name: value'`（Chrome 复制格式）与 cmd 转义 `^"`
+    // Extract all headers: supports `-H "name: value"`, `-H 'name: value'` (Chrome copy format), and cmd escaping `^"`
     let header_re = regex::Regex::new(
         r#"-H\s*\^?['"](?:authorization|Authorization):\s*Bearer\s+([A-Za-z0-9._-]+)"#,
     )
     .unwrap();
-    // URL 提取：支持 `curl 'URL'` / `curl "URL"` / `curl --url "URL"` / `curl -url "URL"`
+    // URL extraction: supports `curl 'URL'` / `curl "URL"` / `curl --url "URL"` / `curl -url "URL"`
     let url_re = regex::Regex::new(r#"curl\s+(?:--?url\s+)?\^?['"]?(https?://[^\s'"^]+)"#).unwrap();
     let method_re = regex::Regex::new(r#"(?:-X\s+|--request\s+)\^?([A-Z]+)"#).unwrap();
 
@@ -64,10 +64,10 @@ pub fn parse_curl(text: &str) -> Vec<ExtractedAuth> {
         .captures(text)
         .map(|c| c[1].to_string())
         .unwrap_or_else(|| "GET".into());
-    // curl 文本无法可靠定位 host 时空缺放行（单机自用场景），但 host 明确为其他域时拒绝
+    // Let it through when the curl text can't reliably locate a host (single-user local scenario), but reject when the host is clearly a different domain
     let host_is_other_domain = !host.is_empty() && !TARGET_HOSTS.iter().any(|h| host.ends_with(h));
     if host_is_other_domain {
-        tracing::warn!("curl 导入拒绝：host={host} 不属于目标域名 {TARGET_HOSTS:?}");
+        tracing::warn!("curl import rejected: host={host} is not one of the target domains {TARGET_HOSTS:?}");
         return out;
     }
 
@@ -78,7 +78,7 @@ pub fn parse_curl(text: &str) -> Vec<ExtractedAuth> {
             host: host.clone(),
             path: path.clone(),
             method: method.clone(),
-            added_at: None, // persist 时补写入库时间
+            added_at: None, // filled in with the added time on persist
         });
     }
     out
@@ -118,14 +118,14 @@ struct HarHeader {
     value: String,
 }
 
-/// 从 HAR JSON 提取 Bearer token（仅收录 freebuff/codebuff 目标域的请求）
+/// Extract a Bearer token from HAR JSON (only requests to the freebuff/codebuff target domains are collected)
 pub fn parse_har(json_text: &str) -> Result<Vec<ExtractedAuth>> {
     let har: HarRoot = serde_json::from_str(json_text)?;
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     for entry in har.log.entries {
         let url_lower = entry.request.url.to_lowercase();
-        // 域名校验：非目标域的凭据一律跳过（防跨域 token 混淆）
+        // Domain check: credentials from non-target domains are always skipped (prevents cross-domain token mix-ups)
         let is_target = TARGET_HOSTS.iter().any(|h| url_lower.contains(h));
         if !is_target {
             continue;
@@ -157,10 +157,10 @@ pub fn parse_har(json_text: &str) -> Result<Vec<ExtractedAuth>> {
     Ok(out)
 }
 
-/// 凭证稳定标识：FNV-1a 64 位（纯本地计算，零依赖，跨 Rust 版本结果稳定）。
+/// Stable credential identifier: FNV-1a 64-bit (pure local computation, zero dependencies, stable across Rust versions).
 ///
-/// 不用 `DefaultHasher`——其输出 Rust 文档明确不保证跨版本/跨进程稳定，
-/// 而该 id 要落盘作为凭证的持久主键，必须可重现。
+/// Not `DefaultHasher` -- its output is explicitly not guaranteed stable across versions/processes per
+/// the Rust docs, but this id is persisted as the credential's durable primary key, so it must be reproducible.
 pub fn cred_id(token: &str) -> String {
     const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -169,11 +169,11 @@ pub fn cred_id(token: &str) -> String {
         h ^= *b as u64;
         h = h.wrapping_mul(PRIME);
     }
-    // 混入长度，进一步降低不同长度同哈希的碰撞概率
+    // Mix in the length to further reduce collision odds between different-length tokens with the same hash
     format!("{:016x}{:04x}", h, token.len().min(0xffff))
 }
 
-/// 凭证类型：web 版 Cookie 还是 Bearer token。
+/// Credential type: web Cookie or Bearer token.
 pub fn kind_of(token: &str) -> &'static str {
     if token.contains("session-token") {
         "web-cookie"
@@ -191,7 +191,7 @@ fn parse_host(url: &str) -> String {
 }
 
 fn parse_path(url: &str) -> String {
-    // 修正：先定位 "://" 之后的部分，再取其内第一个 '/' 起的路径
+    // Fix: locate the part after "://" first, then take the path starting at the first '/' within it
     let start = url.find("://").map(|p| p + 3).unwrap_or(0);
     let rest = &url[start..];
     rest.find('/')
@@ -199,12 +199,13 @@ fn parse_path(url: &str) -> String {
         .unwrap_or_default()
 }
 
-/// 凭证文件写锁：persist/delete/heal 都是"读-改-写整文件"，
-/// 并发时会互相覆盖（后写赢、先写丢），必须串行化。进程内锁足够（单进程软件）。
+/// Credential file write lock: persist/delete/heal are all "read-modify-write the whole file",
+/// which would clobber each other under concurrency (last write wins, earlier writes are lost); must be serialized.
+/// An in-process lock is sufficient (single-process software).
 static TOKENS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// 原子写：先写临时文件再 rename，避免写入中途崩溃留下截断的 tokens.json
-/// （截断 = load_tokens 解析失败 = 全部凭证不可用）。
+/// Atomic write: write to a temp file then rename, to avoid leaving a truncated tokens.json
+/// if the write crashes midway (truncated = load_tokens fails to parse = all credentials unavailable).
 fn atomic_write(path: &str, json: &str) -> Result<()> {
     let p = std::path::Path::new(path);
     if let Some(parent) = p.parent() {
@@ -212,7 +213,7 @@ fn atomic_write(path: &str, json: &str) -> Result<()> {
     }
     let tmp = p.with_extension("json.tmp");
     std::fs::write(&tmp, json)?;
-    // rename 覆盖已有目标在 Windows 上要求目标不存在，先移除
+    // On Windows, rename requires the target to not exist when overwriting; remove it first
     #[cfg(windows)]
     if p.exists() {
         let _ = std::fs::remove_file(p);
@@ -221,11 +222,11 @@ fn atomic_write(path: &str, json: &str) -> Result<()> {
     Ok(())
 }
 
-/// 持久化：追加到 data/tokens.json（dedupe）
+/// Persist: append to data/tokens.json (with dedupe)
 pub fn persist_tokens(path: &str, new_tokens: &[ExtractedAuth]) -> Result<Vec<ExtractedAuth>> {
     let _g = TOKENS_LOCK
         .lock()
-        .map_err(|_| anyhow::anyhow!("tokens 锁中毒"))?;
+        .map_err(|_| anyhow::anyhow!("tokens lock poisoned"))?;
     let existing = load_tokens(path)?;
     let mut all: Vec<ExtractedAuth> = existing;
     let existing_set: HashSet<String> = all.iter().map(|t| t.token.clone()).collect();
@@ -246,7 +247,7 @@ pub fn persist_tokens(path: &str, new_tokens: &[ExtractedAuth]) -> Result<Vec<Ex
     Ok(added)
 }
 
-/// 读取已持久化 token
+/// Read persisted tokens
 pub fn load_tokens(path: &str) -> Result<Vec<ExtractedAuth>> {
     if !std::path::Path::new(path).exists() {
         return Ok(Vec::new());
@@ -256,15 +257,16 @@ pub fn load_tokens(path: &str) -> Result<Vec<ExtractedAuth>> {
     Ok(parsed)
 }
 
-/// 读取 token 并**修复历史数据**：早于 `added_at` 字段引入的凭证没有入库时间，
-/// 面板上只能显示"—"，用户看不到"什么时候入的"。这里用文件修改时间回填并落盘（幂等）。
+/// Read tokens and **heal historical data**: credentials added before the `added_at` field existed
+/// have no stored time, so the panel can only show "-" and the user can't see "when it was added".
+/// This backfills using the file's modified time and persists it (idempotent).
 pub fn load_tokens_healed(path: &str) -> Result<Vec<ExtractedAuth>> {
     let mut tokens = load_tokens(path)?;
     if tokens.iter().all(|t| t.added_at.is_some()) {
         return Ok(tokens);
     }
-    // 回填来源：文件 mtime（最接近"首次入库"的可信时间）；取不到则用当前时间。
-    // 注意：多条历史凭证会得到同一个回填值（≈ 最后一次文件修改时间），这是可接受的下限保证。
+    // Backfill source: file mtime (the closest reliable approximation of "first added"); falls back to the current time.
+    // Note: multiple historical credentials will get the same backfilled value (roughly the last file-modified time) - an acceptable lower-bound guarantee.
     let fallback = std::fs::metadata(path)
         .and_then(|m| m.modified())
         .map(chrono::DateTime::<chrono::Utc>::from)
@@ -281,18 +283,18 @@ pub fn load_tokens_healed(path: &str) -> Result<Vec<ExtractedAuth>> {
         let json = serde_json::to_string_pretty(&tokens)?;
         let _g = TOKENS_LOCK
             .lock()
-            .map_err(|_| anyhow::anyhow!("tokens 锁中毒"))?;
+            .map_err(|_| anyhow::anyhow!("tokens lock poisoned"))?;
         atomic_write(path, &json)?;
-        tracing::info!("已为历史凭证回填入库时间（来源：tokens.json mtime）");
+        tracing::info!("Backfilled added time for historical credentials (source: tokens.json mtime)");
     }
     Ok(tokens)
 }
 
-/// 按稳定 id 删除一条凭证；返回是否删除成功。
+/// Delete a credential by its stable id; returns whether it was deleted.
 pub fn delete_token(path: &str, id: &str) -> Result<Option<ExtractedAuth>> {
     let _g = TOKENS_LOCK
         .lock()
-        .map_err(|_| anyhow::anyhow!("tokens 锁中毒"))?;
+        .map_err(|_| anyhow::anyhow!("tokens lock poisoned"))?;
     let mut tokens = load_tokens(path)?;
     let before = tokens.len();
     let removed = tokens.iter().find(|t| cred_id(&t.token) == id).cloned();
@@ -305,7 +307,7 @@ pub fn delete_token(path: &str, id: &str) -> Result<Option<ExtractedAuth>> {
     Ok(removed)
 }
 
-/// 从任意文本自动嗅探：优先按 curl，再按 HAR，再按 Cookie 串，最后按裸 "Bearer xxx"
+/// Auto-sniff from arbitrary text: try curl first, then HAR, then a Cookie string, then a bare "Bearer xxx"
 pub fn sniff_tokens(text: &str) -> Result<Vec<ExtractedAuth>> {
     if text.contains("curl") || text.contains("--url") {
         let v = parse_curl(text);
@@ -320,11 +322,11 @@ pub fn sniff_tokens(text: &str) -> Result<Vec<ExtractedAuth>> {
             }
         }
     }
-    // 完整 Cookie 串（含 __Secure-next-auth.session-token 等）
+    // Full Cookie string (containing __Secure-next-auth.session-token etc.)
     if let Some(v) = parse_cookie(text) {
         return Ok(v);
     }
-    // 裸 Bearer token
+    // Bare Bearer token
     let re = regex::Regex::new(r"(?i)bearer\s+([A-Za-z0-9._-]{16,})").unwrap();
     let mut out = Vec::new();
     let mut seen = HashSet::new();
@@ -343,22 +345,22 @@ pub fn sniff_tokens(text: &str) -> Result<Vec<ExtractedAuth>> {
         }
     }
     if out.is_empty() {
-        Err(anyhow!("未能从输入中提取到任何 Bearer token 或 Cookie"))
+        Err(anyhow!("Could not extract any Bearer token or Cookie from the input"))
     } else {
         Ok(out)
     }
 }
 
-/// 解析完整 Cookie 串（web 版鉴权凭证）：提取包含 session-token 的 Cookie 整体
+/// Parse a full Cookie string (web auth credential): extract the whole Cookie containing the session-token
 pub fn parse_cookie(text: &str) -> Option<Vec<ExtractedAuth>> {
-    // 提取第一个含 "__Secure-next-auth.session-token=" 的 Cookie 片段（可能是完整串或部分）
+    // Extract the first Cookie fragment containing "__Secure-next-auth.session-token=" (may be a full string or partial)
     let re = regex::Regex::new(r#"__Secure-next-auth\.session-token=[^; \t"']+"#).unwrap();
     let csrf_re = regex::Regex::new(r#"__Host-next-auth\.csrf-token=[^; \t"']+"#).unwrap();
     let cb_re = regex::Regex::new(r#"__Secure-next-auth\.callback-url=[^; \t"']+"#).unwrap();
 
     let st = re.find(text)?;
     let token = st.as_str().to_string();
-    // 组完整 Cookie 串：session-token + csrf + callback
+    // Assemble the full Cookie string: session-token + csrf + callback
     let mut parts = vec![token.clone()];
     if let Some(c) = csrf_re.find(text) {
         parts.push(c.as_str().to_string());
@@ -457,7 +459,7 @@ curl --url "https://www.codebuff.com/api/v1/freebuff/session" \
         };
         let added1 = persist_tokens(&path_str, &[t1.clone(), t2.clone()]).unwrap();
         assert_eq!(added1.len(), 2);
-        // 再次写入含 t1 应跳过
+        // Writing again with t1 included should skip it
         let added2 = persist_tokens(&path_str, &[t1, t2]).unwrap();
         assert_eq!(added2.len(), 0);
         assert_eq!(load_tokens(&path_str).unwrap().len(), 2);
@@ -465,7 +467,7 @@ curl --url "https://www.codebuff.com/api/v1/freebuff/session" \
 
     #[test]
     fn curl_cross_domain_rejected() {
-        // 非目标域名的 curl 不得导入（防跨域凭据混淆）
+        // curl for a non-target domain must not be imported (prevents cross-domain credential mix-ups)
         let curl = r#"
 curl --url "https://evil.example.com/api/steal" \
   -H "authorization: Bearer crossdomain1234567890" \
@@ -474,22 +476,22 @@ curl --url "https://evil.example.com/api/steal" \
         let out = parse_curl(curl);
         assert!(
             out.is_empty(),
-            "跨域 token 应被拒绝，实际导入 {} 个",
+            "cross-domain token should be rejected, but {} were imported",
             out.len()
         );
     }
 
     #[test]
     fn chrome_style_curl_imports_with_host() {
-        // Chrome DevTools「Copy as cURL」格式：单引号 + URL 位置参数 + 反斜杠换行
+        // Chrome DevTools "Copy as cURL" format: single quotes + positional URL argument + backslash line continuations
         let curl = r#"curl 'https://www.codebuff.com/api/v1/chat/completions' \
   -H 'authorization: Bearer chromestyle1234567890' \
   -X POST"#;
         let out = parse_curl(curl);
-        assert_eq!(out.len(), 1, "Chrome 格式应提取 1 个 token");
+        assert_eq!(out.len(), 1, "Chrome format should extract 1 token");
         assert_eq!(
             out[0].host, "www.codebuff.com",
-            "host 必须被正确解析（否则跨域校验失效）"
+            "host must be parsed correctly (otherwise cross-domain checking breaks)"
         );
         assert_eq!(out[0].path, "/api/v1/chat/completions");
         assert_eq!(out[0].method, "POST");
@@ -497,19 +499,19 @@ curl --url "https://evil.example.com/api/steal" \
 
     #[test]
     fn chrome_style_cross_domain_rejected() {
-        // 单引号格式下的跨域 token 同样必须被拒绝
+        // A cross-domain token in single-quote format must also be rejected
         let curl = "curl 'https://evil.example.com/steal' -H 'authorization: Bearer chromecross1234567890'";
         let out = parse_curl(curl);
         assert!(
             out.is_empty(),
-            "单引号格式跨域 token 应被拒绝，实际 {} 个",
+            "single-quote-format cross-domain token should be rejected, but {} were found",
             out.len()
         );
     }
 
     #[test]
     fn har_cross_domain_rejected() {
-        // HAR 中非目标域条目应跳过
+        // Non-target-domain entries in HAR should be skipped
         let har = r#"{
   "log": {
     "entries": [{
@@ -524,17 +526,17 @@ curl --url "https://evil.example.com/api/steal" \
   }
 }"#;
         let out = parse_har(har).unwrap();
-        assert!(out.is_empty(), "跨域 HAR token 应被拒绝");
+        assert!(out.is_empty(), "cross-domain HAR token should be rejected");
     }
 
     #[test]
     fn cred_id_is_stable_and_distinct() {
-        // 同一 token 必须每次得到同一 id（id 是落盘主键，不稳定会导致凭证列表错乱）
+        // The same token must get the same id every time (the id is the durable primary key; instability would corrupt the credential list)
         let a1 = cred_id("__Secure-next-auth.session-token=abc");
         let a2 = cred_id("__Secure-next-auth.session-token=abc");
         assert_eq!(a1, a2);
         assert_ne!(a1, cred_id("__Secure-next-auth.session-token=abd"));
-        // 长度不同但前缀相同也必须区分
+        // Different lengths with the same prefix must still be distinguished
         assert_ne!(cred_id("tok"), cred_id("tokx"));
     }
 
@@ -552,7 +554,7 @@ curl --url "https://evil.example.com/api/steal" \
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tokens.json");
         let path_str = path.to_str().unwrap().to_string();
-        // 模拟早期版本落盘的数据：没有 added_at 字段
+        // Simulate data persisted by an earlier version: no added_at field
         std::fs::write(
             &path,
             r#"[{"token":"legacy-token","source":"cookie","host":"freebuff.com","path":"/p","method":"GET"}]"#,
@@ -561,8 +563,8 @@ curl --url "https://evil.example.com/api/steal" \
 
         let healed = load_tokens_healed(&path_str).unwrap();
         assert_eq!(healed.len(), 1);
-        assert!(healed[0].added_at.is_some(), "历史凭证必须被回填入库时间");
-        // 已落盘（再次读取不再需要回填，且值保持稳定）
+        assert!(healed[0].added_at.is_some(), "historical credentials must have their added time backfilled");
+        // Already persisted (reading again should not need backfilling, and the value should stay stable)
         let again = load_tokens_healed(&path_str).unwrap();
         assert_eq!(again[0].added_at, healed[0].added_at);
     }
@@ -579,7 +581,7 @@ curl --url "https://evil.example.com/api/steal" \
             out[0].added_at.as_deref(),
             Some("2026-01-01T00:00:00+00:00")
         );
-        // 文件内容不应被改写
+        // File contents should not be rewritten
         assert_eq!(std::fs::read_to_string(&path).unwrap(), raw);
     }
 
@@ -607,11 +609,11 @@ curl --url "https://evil.example.com/api/steal" \
         persist_tokens(&path_str, &[t1, t2]).unwrap();
 
         let removed = delete_token(&path_str, &cred_id("del-me")).unwrap();
-        assert!(removed.is_some(), "应按 id 删除成功");
+        assert!(removed.is_some(), "should delete successfully by id");
         let left = load_tokens(&path_str).unwrap();
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].token, "keep-me");
-        // 再删同一条 → None（幂等）
+        // Deleting the same one again -> None (idempotent)
         assert!(delete_token(&path_str, &cred_id("del-me"))
             .unwrap()
             .is_none());

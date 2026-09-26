@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: freebuff2api
+    runtime: docker
+    dockerfilePath: ./docker/Dockerfile
+    dockerContext: .
+    plan: free
+    healthCheckPath: /healthz
+    envVars:
+      - key: LISTEN_ADDR
+        value: 0.0.0.0:10000
+      - key: API_KEYS
+        generateValue: true
+      - key: AUTH_TOKENS # full freebuff.com Cookie header; comma-separate multiple accounts
+        sync: false
+      - key: REDACT_LOGS
+        value: "true"

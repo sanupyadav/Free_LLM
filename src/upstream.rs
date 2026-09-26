@@ -1,14 +1,14 @@
-//! 上游 Codebuff HTTP 客户端（会话 / run / chat / 广告）
+//! Upstream Codebuff HTTP client (session / run / chat / ads)
 //!
-//! 逆向自 Freebuff-0.0.98 orchestrator.js：
-//! - POST /api/v1/freebuff/session  （x-freebuff-model, x-freebuff-instance-id, x-freebuff-multi-session）
-//! - GET  /api/v1/freebuff/session  （x-freebuff-instance-id 查状态，FREEBUFF_INCLUDE_UNUSED 拉 rateLimitsByModel）
-//! - DELETE /api/v1/freebuff/session（x-freebuff-instance-id, x-freebuff-multi-session）
-//! - POST /api/v1/agent-runs       （action=START/FINISH, ancestorRunIds）
-//! - POST /api/v1/chat/completions （OpenAI 兼容体，codebuff_metadata 注入 run_id/cost_mode/client_id）
-//! - POST /api/v1/ads|/api/ads     （广告拍卖 → impression 换取免费额度）
-//! - POST /api/v1/ads/impression   （first_party 模式确认展示）
-//! - GET  /api/v1/ads/policy       （广告策略）
+//! Reverse-engineered from Freebuff-0.0.98's orchestrator.js:
+//! - POST /api/v1/freebuff/session  (x-freebuff-model, x-freebuff-instance-id, x-freebuff-multi-session)
+//! - GET  /api/v1/freebuff/session  (x-freebuff-instance-id checks status, FREEBUFF_INCLUDE_UNUSED pulls rateLimitsByModel)
+//! - DELETE /api/v1/freebuff/session (x-freebuff-instance-id, x-freebuff-multi-session)
+//! - POST /api/v1/agent-runs       (action=START/FINISH, ancestorRunIds)
+//! - POST /api/v1/chat/completions (OpenAI-compatible body, codebuff_metadata injects run_id/cost_mode/client_id)
+//! - POST /api/v1/ads|/api/ads     (ad auction -> impression in exchange for free quota)
+//! - POST /api/v1/ads/impression   (confirms impression in first_party mode)
+//! - GET  /api/v1/ads/policy       (ad policy)
 
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
@@ -98,11 +98,12 @@ impl StartRunResponse {
 
 impl UpstreamClient {
     pub fn new(base_url: String, proxy: Option<String>, timeout: Duration) -> Result<Self> {
-        // 流式响应不受整体 timeout 影响：reqwest 的 .timeout() 是「总请求」超时，对流式会截断
-        // 所以用 read_timeout 代替：单次读块超时=长超时，但流可以持续很久（有几 K 大文档时）
-        let read_timeout = timeout.max(Duration::from_secs(900)); // 至少 15min，长文档够用
+        // Streaming responses aren't affected by the overall timeout: reqwest's .timeout() is a "whole request"
+        // timeout, which would cut a stream short. So use read_timeout instead: a single read chunk's timeout is
+        // long, but the stream itself can run for a long time (e.g. with a large multi-KB document).
+        let read_timeout = timeout.max(Duration::from_secs(900)); // At least 15min, enough for long documents
         let mut builder = reqwest::Client::builder()
-            .read_timeout(Duration::from_secs(300)) // 单次读块 5min 无数据才断（流式增量不断）
+            .read_timeout(Duration::from_secs(300)) // Only breaks if a single read chunk gets no data for 5min (streaming deltas keep it alive)
             .connect_timeout(Duration::from_secs(15))
             .pool_idle_timeout(Duration::from_secs(90));
         let _ = read_timeout;
@@ -110,7 +111,7 @@ impl UpstreamClient {
             builder = builder.proxy(reqwest::Proxy::all(p)?);
         }
         let http = builder.build()?;
-        // 规范化 host：codebuff.com → www.codebuff.com
+        // Normalize host: codebuff.com -> www.codebuff.com
         let base_url = if base_url == "https://codebuff.com" {
             "https://www.codebuff.com".to_string()
         } else {
@@ -135,7 +136,7 @@ impl UpstreamClient {
         h
     }
 
-    /// GET 会话状态（含 rateLimitsByModel）
+    /// GET session status (includes rateLimitsByModel)
     pub async fn get_session(
         &self,
         token: &str,
@@ -152,7 +153,7 @@ impl UpstreamClient {
         parse_json_err(resp).await
     }
 
-    /// POST 创建/刷新会话（x-freebuff-model 指定模型）
+    /// POST create/refresh session (x-freebuff-model specifies the model)
     pub async fn create_session(
         &self,
         token: &str,
@@ -180,7 +181,7 @@ impl UpstreamClient {
         parse_json_err(resp).await
     }
 
-    /// 心跳保活（GET + x-freebuff-heartbeat: 1）
+    /// Heartbeat keep-alive (GET + x-freebuff-heartbeat: 1)
     pub async fn heartbeat(&self, token: &str, instance_id: &str) -> Result<()> {
         let mut headers = self.auth_headers(token);
         headers.insert(FREEBUFF_MULTI_SESSION, HeaderValue::from_static("1"));
@@ -194,7 +195,7 @@ impl UpstreamClient {
         Ok(())
     }
 
-    /// DELETE 释放会话
+    /// DELETE release session
     pub async fn delete_session(&self, token: &str, instance_id: &str) -> Result<()> {
         let mut headers = self.auth_headers(token);
         headers.insert(
@@ -210,11 +211,11 @@ impl UpstreamClient {
         if resp.status().is_success() {
             Ok(())
         } else {
-            Err(anyhow!("删除会话失败: HTTP {}", resp.status()))
+            Err(anyhow!("failed to delete session: HTTP {}", resp.status()))
         }
     }
 
-    /// 启动 run
+    /// Start a run
     pub async fn start_run(
         &self,
         token: &str,
@@ -244,10 +245,10 @@ impl UpstreamClient {
         let parsed: StartRunResponse = resp.json().await?;
         parsed
             .run_id()
-            .ok_or_else(|| anyhow!("start run 响应缺 runId"))
+            .ok_or_else(|| anyhow!("start run response is missing runId"))
     }
 
-    /// 结束 run
+    /// Finish a run
     pub async fn finish_run(&self, token: &str, run_id: &str, total_steps: i64) -> Result<()> {
         let body = serde_json::json!({
             "action": "FINISH",
@@ -277,7 +278,7 @@ impl UpstreamClient {
         }
     }
 
-    /// 发送 chat 请求（返回原始响应，供调用方流式转发）— 带 codebuff_metadata 注入
+    /// Send a chat request (returns the raw response, for the caller to stream-forward) -- with codebuff_metadata injection
     pub async fn chat_completions(
         &self,
         token: &str,
@@ -285,7 +286,7 @@ impl UpstreamClient {
         run_id: &str,
         instance_id: Option<&str>,
     ) -> Result<reqwest::Response> {
-        // 注入 codebuff_metadata
+        // Inject codebuff_metadata
         let mut metadata = body
             .get("codebuff_metadata")
             .cloned()
@@ -314,7 +315,7 @@ impl UpstreamClient {
         Ok(resp)
     }
 
-    /// 广告拍卖（网关侧从用户消息触发，换取免费额度）
+    /// Ad auction (triggered gateway-side from the user's message, in exchange for free quota)
     pub async fn request_ad(&self, token: &str, ad_session: &AdRequest) -> Result<AdResponse> {
         let url = format!("{}/api/v1/ads", self.base_url);
         let resp = self
@@ -334,7 +335,7 @@ impl UpstreamClient {
         Ok(resp.json().await?)
     }
 
-    /// 确认广告展示（first_party）
+    /// Confirm ad impression (first_party)
     pub async fn confirm_impression(&self, token: &str, imp_url: &str) -> Result<()> {
         let body = serde_json::json!({ "impUrl": imp_url, "mode": "desktop", "userAgent": DESKTOP_UA, "os": "windows" });
         let url = format!("{}/api/v1/ads/impression", self.base_url);
@@ -432,7 +433,7 @@ async fn parse_json_err<T: for<'de> Deserialize<'de>>(resp: reqwest::Response) -
     }
     serde_json::from_str(&text).map_err(|e| {
         anyhow!(
-            "解析响应失败: {e} 原文: {}",
+            "failed to parse response: {e} raw text: {}",
             text.chars().take(300).collect::<String>()
         )
     })

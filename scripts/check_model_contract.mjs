@@ -1,6 +1,7 @@
 #!/usr/bin/env node
-// check_model_contract.mjs — 校验 src/models.rs MODEL_META_ROWS 与 tests/fixtures/freebuff-models.snapshot.json 的 id/availability 对齐
-// 用法: node scripts/check_model_contract.mjs [models.rs 路径] [fixture 路径]
+// check_model_contract.mjs - verifies id/availability alignment between src/models.rs
+// MODEL_META_ROWS and tests/fixtures/freebuff-models.snapshot.json
+// Usage: node scripts/check_model_contract.mjs [path to models.rs] [path to fixture]
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -8,13 +9,13 @@ const root = process.cwd();
 const modelsPath = process.argv[2] || path.join(root, 'src', 'models.rs');
 const fixturePath = process.argv[3] || path.join(root, 'tests', 'fixtures', 'freebuff-models.snapshot.json');
 
-if (!fs.existsSync(modelsPath)) { console.error('✗ 找不到 models.rs: ' + modelsPath); process.exit(2); }
-if (!fs.existsSync(fixturePath)) { console.error('✗ 找不到 fixture: ' + fixturePath); process.exit(2); }
+if (!fs.existsSync(modelsPath)) { console.error('✗ models.rs not found: ' + modelsPath); process.exit(2); }
+if (!fs.existsSync(fixturePath)) { console.error('✗ fixture not found: ' + fixturePath); process.exit(2); }
 
 const src = fs.readFileSync(modelsPath, 'utf8');
 const fixture = JSON.parse(fs.readFileSync(fixturePath, 'utf8'));
 
-// 提取 MODEL_META_ROWS 里每个 MetaRow 的 id / availability
+// Extracts id / availability for each MetaRow in MODEL_META_ROWS
 const rows = [];
 const blockRe = /MetaRow\s*\{([^}]*)\}/g;
 let m;
@@ -30,20 +31,20 @@ const metaById = new Map(rows.map((r) => [r.id, r]));
 
 for (const row of catalog) {
   const meta = metaById.get(row.id);
-  if (!meta) { errors.push(`fixture catalog 行在 models.rs 缺失: ${row.id}`); continue; }
+  if (!meta) { errors.push(`fixture catalog row missing from models.rs: ${row.id}`); continue; }
   if (meta.availability !== row.availability) {
-    errors.push(`availability 不一致: ${row.id}  fixture=${row.availability}  models.rs=${meta.availability}`);
+    errors.push(`availability mismatch: ${row.id}  fixture=${row.availability}  models.rs=${meta.availability}`);
   }
 }
 for (const r of rows) {
   if (!fixture.models.some((x) => x.id === r.id)) {
-    errors.push(`models.rs 元数据行不在 fixture 中: ${r.id}（请更新快照）`);
+    errors.push(`models.rs metadata row not in fixture: ${r.id} (please update the snapshot)`);
   }
 }
 
 if (errors.length) {
-  console.error('✗ 模型合同漂移 ' + errors.length + ' 处：');
+  console.error('✗ Model contract drift, ' + errors.length + ' issue(s):');
   for (const e of errors) console.error('  - ' + e);
   process.exit(1);
 }
-console.log(`✓ 模型合同一致：fixture catalog=${catalog.length} 行 / models.rs meta=${rows.length} 行（id+availability 全对齐）`);
+console.log(`✓ Model contract aligned: fixture catalog=${catalog.length} rows / models.rs meta=${rows.length} rows (id+availability fully aligned)`);

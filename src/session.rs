@@ -1,11 +1,11 @@
-//! 会话管理器：排队 → 活跃 → 心跳保活 → 广告换额度再保活
+//! Session manager: queued -> active -> heartbeat keep-alive -> ad-for-quota renewal, then keep-alive again
 //!
-//! 逆向自 Freebuff-0.0.98 SessionManager：
-//! - status=none → POST 创建
-//! - status=queued → GET 轮询（estimatedWaitMs 决定延迟）
-//! - status=active → 可用，过期前心跳 + 广告刷新
-//! - 调度 x-freebuff-heartbeat:1 每 45s
-//! - FREEBUFF_SESSION_GRACE_MS=1800000 宽限期
+//! Reverse-engineered from Freebuff-0.0.98's SessionManager:
+//! - status=none -> POST create
+//! - status=queued -> GET poll (estimatedWaitMs determines the delay)
+//! - status=active -> usable, heartbeat + ad refresh before expiry
+//! - schedules x-freebuff-heartbeat:1 every 45s
+//! - FREEBUFF_SESSION_GRACE_MS=1800000 grace period
 
 use crate::config::Config;
 use crate::upstream::{FreeSessionResponse, UpstreamClient};
@@ -107,12 +107,12 @@ impl SessionManager {
         }
     }
 
-    /// 确保会话活跃；无则创建/等待。返回 instance_id
+    /// Ensure the session is active; create/wait if not. Returns instance_id
     pub async fn ensure_session(&self, model: &str) -> Result<String> {
         loop {
             let mut inner = self.mu.lock().await;
 
-            // 已是活跃且未过期
+            // Already active and not expired
             if inner.status == SessionStatus::Active {
                 if let Some(id) = &inner.instance_id {
                     let expires = inner
@@ -122,17 +122,17 @@ impl SessionManager {
                         return Ok(id.clone());
                     }
                 }
-                // 过期则重置重创建
+                // Reset and recreate if expired
                 inner.status = SessionStatus::None;
                 inner.instance_id = None;
             }
 
-            // 等待室中：等待 poll_after 后重试
+            // In the waiting room: wait until poll_after, then retry
             if inner.status == SessionStatus::Queued {
                 if let Some(skip_until) = inner.poll_after {
                     if Utc::now() < skip_until {
                         return Err(anyhow!(
-                            "waiting_room_queued: position {}/{}，{} 秒后重试",
+                            "waiting_room_queued: position {}/{}, retrying in {} seconds",
                             inner.position.unwrap_or(0),
                             inner.queue_depth.unwrap_or(0),
                             (skip_until - Utc::now()).num_seconds().max(0)
@@ -144,7 +144,7 @@ impl SessionManager {
                 continue;
             }
 
-            // None/Active(过期) → 创建
+            // None/Active(expired) -> create
             inner.status = SessionStatus::None;
             let existing = inner.instance_id.clone();
             drop(inner);
@@ -162,11 +162,11 @@ impl SessionManager {
                             return Ok(id);
                         }
                     }
-                    // queued 继续循环等待
+                    // queued: keep looping to wait
                 }
                 Err(e) => {
                     self.note_error(&e).await;
-                    // 服务器 5xx/网络 → 短暂退避后重试
+                    // Server 5xx/network error -> back off briefly then retry
                     tokio::time::sleep(Duration::from_secs(2)).await;
                     return Err(e);
                 }
@@ -174,7 +174,7 @@ impl SessionManager {
         }
     }
 
-    /// 吸收会话响应，内部处理 queued/active 状态机
+    /// Absorb the session response, internally handling the queued/active state machine
     async fn absorb(&self, sess: FreeSessionResponse, model: &str) -> Result<()> {
         let mut inner = self.mu.lock().await;
         let status = SessionStatus::from(sess.status.as_str());
@@ -203,11 +203,11 @@ impl SessionManager {
                 inner.poll_after = Some(Utc::now() + Duration::from_millis(wait_ms as u64));
             }
             SessionStatus::Disabled => {
-                // 账号无免费资格
-                return Err(anyhow!("freebuff session disabled: 账号无可免费额度"));
+                // Account has no free-tier eligibility
+                return Err(anyhow!("freebuff session disabled: account has no free quota available"));
             }
             SessionStatus::None | SessionStatus::Ended | SessionStatus::Superseded => {
-                // 自动尝试重建会由上层 ensure_session 循环处理
+                // Automatic recreation is handled by the ensure_session loop above
             }
         }
         inner.last_poll_at = Some(Utc::now());
@@ -220,7 +220,7 @@ impl SessionManager {
         inner.last_error = Some(e.to_string());
     }
 
-    /// 供 pool 熔断记录错误
+    /// For the pool's circuit breaker to record an error
     #[allow(dead_code)]
     pub async fn record_error(&self, err: &str) {
         let mut inner = self.mu.lock().await;
@@ -254,7 +254,7 @@ impl SessionManager {
         }
     }
 
-    /// 后台保活循环：活跃时心跳 + 过期前广告刷新
+    /// Background keep-alive loop: heartbeat while active + ad refresh before expiry
     pub async fn run_keepalive(self: Arc<Self>, ads: Arc<crate::ads::AdRefresher>) {
         if self.running.swap(true, Ordering::SeqCst) {
             return;
@@ -266,11 +266,11 @@ impl SessionManager {
                 continue;
             }
             if let Some(id) = self.instance_id().await {
-                // 心跳
+                // Heartbeat
                 if self.client.heartbeat(&self.token, &id).await.is_ok() {
                     self.heartbeat_count.fetch_add(1, Ordering::Relaxed);
                 }
-                // 若临近过期，尝试广告刷新
+                // If close to expiry, try an ad refresh
                 let near_expiry = {
                     let inner = self.mu.lock().await;
                     match inner.expires_at {

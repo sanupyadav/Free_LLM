@@ -1,6 +1,6 @@
-//! 用量统计：SQLite 记录请求/模型/token/延迟/错误
+//! Usage stats: SQLite records of requests/models/tokens/latency/errors
 //!
-//! 表结构：
+//! Table schema:
 //! - requests: id, ts, account, model, prompt_tokens, completion_tokens, latency_ms, status, api_key, client_ip
 //! - daily_usage: date, model, requests, prompt_tokens, completion_tokens
 
@@ -22,7 +22,7 @@ pub struct UsageRecord {
     pub status: i64,
     pub api_key: String,
     pub client_ip: String,
-    /// 关联遥测事件链的请求 id（详情抽屉用）
+    /// Request id linking the telemetry event chain (used by the details drawer)
     #[serde(default)]
     pub req_id: String,
 }
@@ -74,7 +74,7 @@ impl UsageDb {
             );
             "#,
         )?;
-        // 迁移：为旧库补 req_id 列（幂等）
+        // Migration: add req_id column for old databases (idempotent)
         let has_req_id: bool = conn
             .prepare("SELECT name FROM pragma_table_info('requests') WHERE name='req_id'")
             .and_then(|mut s| s.exists([]))
@@ -113,7 +113,7 @@ impl UsageDb {
         )
     }
 
-    /// 带 req_id 的记录（供请求详情与事件链关联）
+    /// Record with req_id (links request details with the event chain)
     #[allow(clippy::too_many_arguments)]
     pub fn record_ex(
         &self,
@@ -158,7 +158,7 @@ impl UsageDb {
         Ok(())
     }
 
-    /// 按 id 查询单条请求（请求详情抽屉）
+    /// Query a single request by id (used by the request details drawer)
     pub fn request_by_id(&self, id: i64) -> Result<Option<UsageRecord>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(

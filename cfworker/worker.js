@@ -1,5 +1,6 @@
-// Freebuff2API — 极简无状态路由中转 Worker
-// 将 OpenAI/Claude 格式请求翻译为 Codebuff Freebuff 协议，直接使用传入的 Freebuff token 认证
+// Freebuff2API - minimal stateless routing relay Worker
+// Translates OpenAI/Claude-format requests into the Codebuff Freebuff protocol, authenticating
+// directly with the supplied Freebuff token
 
 const UPSTREAM_BASE = 'https://www.codebuff.com';
 const UA = 'Freebuff-CLI/0.0.105';

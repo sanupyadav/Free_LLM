@@ -1,13 +1,13 @@
-//! OpenAI ⇄ Anthropic 流式协议转换。
+//! OpenAI <-> Anthropic streaming protocol conversion.
 //!
-//! 分层：
-//! - [`stream`]：协议无关的 [`stream::CanonicalEvent`] 中间表示 + 通用 SSE 行解析器
-//! - [`openai_sse`]：上游 OpenAI 兼容 SSE chunk → canonical 事件
-//! - [`anthropic_sse`]：canonical 事件 → 下游 Anthropic SSE 事件行
+//! Layers:
+//! - [`stream`]: protocol-agnostic [`stream::CanonicalEvent`] intermediate representation + generic SSE line parser
+//! - [`openai_sse`]: upstream OpenAI-compatible SSE chunks -> canonical events
+//! - [`anthropic_sse`]: canonical events -> downstream Anthropic SSE event lines
 //!
-//! 接线方式：`OpenAiSseDecoder::feed` 消费上游字节流，输出 canonical 事件，
-//! 交给 `AnthropicSseRenderer::render` 渲染为可直接写入响应体的 SSE 帧；
-//! 上游异常断流时调用 `AnthropicSseRenderer::finish` 兜底收尾。
+//! Wiring: `OpenAiSseDecoder::feed` consumes the upstream byte stream and emits canonical events,
+//! which are handed to `AnthropicSseRenderer::render` to render SSE frames ready to write straight to the response body;
+//! `AnthropicSseRenderer::finish` is called as a fallback wrap-up when the upstream stream breaks unexpectedly.
 
 pub mod anthropic_sse;
 pub mod openai_sse;

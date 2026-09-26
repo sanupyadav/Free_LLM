@@ -30,7 +30,7 @@ type tokenPool struct {
 
 	mu               sync.Mutex
 	runs             map[string]*managedRun // agentID -> current run
-	rootRun          *managedRun            // 唯一根 run，所有 run 的直接祖先
+	rootRun          *managedRun            // the single root run, the direct ancestor of every run
 	draining         []*managedRun
 	session          *cachedSession
 	sessionRefreshCh chan struct{}
@@ -125,7 +125,7 @@ func NewRunManager(cfg Config, client *UpstreamClient, logger *log.Logger) *RunM
 }
 
 func (m *RunManager) Start(ctx context.Context, agentIDs []string) {
-	// 后台只预热根 run；子 run 随请求惰性创建。
+	// Only the root run is prewarmed in the background; sub-runs are created lazily per request.
 	go m.prewarm()
 
 	m.wg.Add(1)
@@ -159,7 +159,7 @@ func (m *RunManager) prewarm() {
 		if _, err := pool.ensureSession(ctx); err != nil {
 			m.logger.Printf("%s: free session prewarm failed: %v", pool.name, err)
 		}
-		// 只预热根 run；子 run 按请求惰性创建，祖先指向根。
+		// Only the root run is prewarmed; sub-runs are created lazily per request, with the ancestor pointing at the root.
 		if err := pool.rotateAgent(ctx, rootAgentID); err != nil {
 			m.logger.Printf("%s: prewarm root %s failed: %v", pool.name, rootAgentID, err)
 		} else {
@@ -260,7 +260,7 @@ func (p *tokenPool) acquire(ctx context.Context, agentID string) (*runLease, err
 	needsRotate := run == nil || time.Since(run.startedAt) >= p.cfg.RotationInterval
 	p.mu.Unlock()
 
-	// 先保活根 run（会话根），再轮换目标 agent。
+	// Keep the root run (the session root) alive first, then rotate the target agent.
 	if rootNeedsRotate {
 		if err := p.rotateAgent(ctx, rootAgentID); err != nil {
 			return nil, fmt.Errorf("rotate root agent: %w", err)
@@ -303,7 +303,7 @@ func (p *tokenPool) maintain(ctx context.Context) error {
 	draining := append([]*managedRun(nil), p.draining...)
 	p.mu.Unlock()
 
-	// 根 run 过期时优先轮换根，子 run 的祖先才能指向新根。
+	// If the root run has expired, rotate it first so sub-runs' ancestors can point at the new root.
 	if rootExpired {
 		if err := p.rotateAgent(ctx, rootAgentID); err != nil {
 			p.logger.Printf("%s: rotate root agent failed: %v", p.name, err)
@@ -360,7 +360,7 @@ func (p *tokenPool) rotateAgent(ctx context.Context, agentID string) error {
 		p.mu.Unlock()
 		return fmt.Errorf("token cooling down until %s", cooldownUntil.Format(time.RFC3339))
 	}
-	// 非根 run 的祖先只能是根 run；根 run 传空数组（上游不接受 null）。
+	// A non-root run's only allowed ancestor is the root run; the root run itself passes an empty array (upstream doesn't accept null).
 	ancestors := []string{}
 	if agentID != rootAgentID && p.rootRun != nil && p.rootRun.id != "" {
 		ancestors = []string{p.rootRun.id}
@@ -427,7 +427,7 @@ func (p *tokenPool) finishIfReady(run *managedRun) error {
 		p.mu.Unlock()
 		return nil
 	}
-	// 当前仍在服役的 run（子 run 在 runs 表、根 run 在 rootRun）不能提前结束。
+	// A run still in active service (sub-run in the runs map, root run in rootRun) can't be finished early.
 	if run.agentID == rootAgentID {
 		if p.rootRun == run {
 			p.mu.Unlock()

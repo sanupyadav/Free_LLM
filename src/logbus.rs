@@ -1,47 +1,47 @@
-//! 运行日志总线：广播订阅 + 环形缓冲
+//! Runtime log bus: broadcast subscription + ring buffer
 //!
-//! - [`LogBus::emit`] 同时写入广播通道（SSE 实时推送）与环形缓冲（历史回看）
-//! - [`LogBus::recent`] 支持 `after_id` 补发（SSE Last-Event-ID 断线重连）
-//! - 环形缓冲满时丢弃最旧事件；广播无订阅者时不阻塞
+//! - [`LogBus::emit`] writes to both the broadcast channel (SSE real-time push) and the ring buffer (history replay)
+//! - [`LogBus::recent`] supports `after_id` replay (SSE Last-Event-ID reconnect)
+//! - The ring buffer drops the oldest event when full; broadcasting never blocks when there are no subscribers
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 
-/// 单条运行日志事件
+/// A single runtime log event
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct LogEvent {
-    /// 全局递增 id（从 1 开始，可作为 SSE event id）
+    /// Globally increasing id (starts at 1, usable as the SSE event id)
     pub id: u64,
-    /// RFC3339 时间戳
+    /// RFC3339 timestamp
     pub ts: String,
-    /// 级别：debug/info/warn/error
+    /// Level: debug/info/warn/error
     pub level: String,
-    /// 事件类别：request/retry/account/system/...
+    /// Event category: request/retry/account/system/...
     pub kind: String,
-    /// 关联请求 id
+    /// Associated request id
     pub req_id: Option<String>,
     pub message: String,
 }
 
-/// 日志总线：广播 sender + 环形缓冲
+/// Log bus: broadcast sender + ring buffer
 pub struct LogBus {
     sender: broadcast::Sender<LogEvent>,
     ring: Arc<Mutex<VecDeque<LogEvent>>>,
     capacity: usize,
     next_id: AtomicU64,
-    /// 脱敏开关（v0.8）：写入前把 Cookie/Bearer/authorization 值替换为 ***
+    /// Redaction toggle (v0.8): replaces Cookie/Bearer/authorization values with *** before writing
     redact: bool,
 }
 
 impl LogBus {
-    /// `capacity` 同时作为环形缓冲与广播缓冲容量（至少 1）
+    /// `capacity` is used for both the ring buffer and the broadcast buffer capacity (at least 1)
     pub fn new(capacity: usize) -> Self {
         Self::new_with_redact(capacity, true)
     }
 
-    /// 带脱敏开关的构造（默认脱敏开；配置 redact_logs=false 可关）
+    /// Constructor with a redaction toggle (redaction is on by default; set redact_logs=false to disable)
     pub fn new_with_redact(capacity: usize, redact: bool) -> Self {
         let cap = capacity.clamp(1, 1 << 20);
         let (sender, _) = broadcast::channel(cap);
@@ -54,7 +54,7 @@ impl LogBus {
         }
     }
 
-    /// 广播并写入环形缓冲（无订阅者时静默丢弃广播）
+    /// Broadcasts and writes to the ring buffer (silently drops the broadcast when there are no subscribers)
     pub fn emit(&self, level: &str, kind: &str, req_id: Option<&str>, message: impl Into<String>) {
         let raw: String = message.into();
         let message = if self.redact {
@@ -72,19 +72,19 @@ impl LogBus {
             message,
         };
         self.push_ring(event.clone());
-        // 无订阅者时 send 返回 Err，忽略即可
+        // send returns Err when there are no subscribers; safe to ignore
         let _ = self.sender.send(event);
     }
 
-    /// 订阅实时事件流
+    /// Subscribes to the real-time event stream
     pub fn subscribe(&self) -> broadcast::Receiver<LogEvent> {
         self.sender.subscribe()
     }
 
-    /// 读取历史事件（按时间正序返回）
+    /// Reads historical events (returned in chronological order)
     ///
-    /// - `after_id = None`：返回最新 `limit` 条
-    /// - `after_id = Some(x)`：从 `x` 之后最早的未读事件开始补发最多 `limit` 条
+    /// - `after_id = None`: returns the latest `limit` entries
+    /// - `after_id = Some(x)`: replays up to `limit` entries starting from the earliest unread event after `x`
     pub fn recent(&self, limit: usize, after_id: Option<u64>) -> Vec<LogEvent> {
         let ring = self.ring.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(after) = after_id {
@@ -99,12 +99,12 @@ impl LogBus {
         ring.iter().skip(start).cloned().collect()
     }
 
-    /// 已产生的事件总数（含已淘汰的历史）
+    /// Total number of events produced so far (including evicted history)
     pub fn count(&self) -> u64 {
         self.next_id.load(Ordering::Relaxed)
     }
 
-    /// 写入环形缓冲，超容量丢弃最旧
+    /// Writes to the ring buffer, dropping the oldest entry when over capacity
     fn push_ring(&self, event: LogEvent) {
         let mut ring = self.ring.lock().unwrap_or_else(|e| e.into_inner());
         if ring.len() >= self.capacity {
@@ -122,12 +122,12 @@ mod tests {
     fn emit_then_recent_returns_chronological_newest() {
         let bus = LogBus::new(16);
         for i in 0..5 {
-            bus.emit("info", "request", Some("r1"), format!("消息 {i}"));
+            bus.emit("info", "request", Some("r1"), format!("message {i}"));
         }
         let recent = bus.recent(3, None);
         assert_eq!(recent.len(), 3);
-        assert_eq!(recent[0].message, "消息 2");
-        assert_eq!(recent[2].message, "消息 4");
+        assert_eq!(recent[0].message, "message 2");
+        assert_eq!(recent[2].message, "message 4");
         assert_eq!(recent[2].req_id.as_deref(), Some("r1"));
         assert_eq!(recent[2].kind, "request");
         assert_eq!(recent[2].level, "info");
@@ -157,12 +157,12 @@ mod tests {
         assert_eq!(replay.len(), 3);
         assert_eq!(replay[0].id, 4);
         assert_eq!(replay[2].id, 6);
-        // limit 截断：从 3 之后最早未读开始
+        // limit truncation: starts from the earliest unread event after 3
         let limited = bus.recent(2, Some(3));
         assert_eq!(limited.len(), 2);
         assert_eq!(limited[0].id, 4);
         assert_eq!(limited[1].id, 5);
-        // after_id 超出最新 id：无补发
+        // after_id beyond the latest id: nothing to replay
         assert!(bus.recent(10, Some(999)).is_empty());
     }
 
@@ -183,12 +183,12 @@ mod tests {
     async fn subscribe_receives_broadcast_events() {
         let bus = LogBus::new(8);
         let mut rx = bus.subscribe();
-        bus.emit("info", "system", None, "上线");
+        bus.emit("info", "system", None, "online");
         let ev = match rx.recv().await {
             Ok(e) => e,
-            Err(e) => panic!("应收到广播事件: {e}"),
+            Err(e) => panic!("should have received a broadcast event: {e}"),
         };
-        assert_eq!(ev.message, "上线");
+        assert_eq!(ev.message, "online");
         assert_eq!(ev.id, 1);
     }
 }

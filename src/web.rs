@@ -1,35 +1,35 @@
-//! 内置 Web 控制面板（总览 / 账号 / 技能 / 日志 / 体检 / 接入指南）
+//! Built-in web control panel (Overview / Accounts / Skills / Logs / Diagnostics / Integration Guide)
 //!
-//! 轻量无构建：单 HTML + 原生 JS + CSS，Rust 直接内嵌字符串。
-//! 设计要点：
-//! - 固定容器 + innerHTML 重建（避免 DOM 堆积）
-//! - Tab 内切换（不再跳转裸 JSON 页）
-//! - 空态有引导，失败有提示（不含糊）
-//! - SSE 实时日志 + 请求详情抽屉 + 系统体检
+//! Lightweight, no build step: single HTML + vanilla JS + CSS, embedded directly as a Rust string.
+//! Design principles:
+//! - Fixed container + innerHTML rebuild (avoids DOM buildup)
+//! - In-tab switching (no more jumping to raw JSON pages)
+//! - Empty states have guidance, failures have clear messages (no ambiguity)
+//! - SSE live logs + request detail drawer + system diagnostics
 
 pub const INDEX_HTML: &str = r##"<!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Freebuff2API 控制台</title>
+<title>Freebuff2API Control Panel</title>
 <style>
 :root {
-  /* 色板（品牌化暗色：主色 #4f8cff 系 + 状态语义色） */
+  /* Color palette (branded dark theme: primary color #4f8cff family + semantic status colors) */
   --bg:#0d1117; --card:#161b22; --border:#30363d; --text:#e6edf3; --muted:#8b949e;
   --accent:#4f8cff; --accent-soft:#132a4a; --ok:#3fb950; --warn:#d29922; --err:#f85149;
-  /* 间距 token */
+  /* Spacing tokens */
   --sp-1:4px; --sp-2:8px; --sp-3:12px; --sp-4:16px; --sp-5:20px; --sp-6:24px;
-  /* 圆角 token */
+  /* Radius tokens */
   --r-sm:6px; --r-md:10px; --r-lg:14px;
-  /* 阴影 token */
+  /* Shadow tokens */
   --sh-card:0 1px 2px rgba(0,0,0,.4); --sh-float:0 8px 24px rgba(0,0,0,.5);
-  /* 动效 token */
+  /* Motion tokens */
   --dur-fast:120ms; --dur-norm:200ms; --ease-out:cubic-bezier(.16,1,.3,1);
 }
 * { box-sizing:border-box; margin:0; padding:0; }
 body { background:var(--bg); color:var(--text); font-family:-apple-system,'Segoe UI',Roboto,'Microsoft YaHei',sans-serif; min-height:100vh; }
-/* 尊重减少动效偏好 */
+/* Respect reduced-motion preference */
 @media (prefers-reduced-motion: reduce) {
   * { animation:none !important; transition:none !important; }
 }
@@ -37,7 +37,7 @@ header { display:flex; align-items:center; justify-content:space-between; paddin
 header h1 { font-size:17px; font-weight:600; }
 header .dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:var(--muted); margin-right:var(--sp-2); vertical-align:middle; }
 header .dot.ok { background:var(--ok); } header .dot.err { background:var(--err); }
-/* 记忆层总开关（toggle switch） */
+/* Memory layer master toggle (toggle switch) */
 .switch { position:relative; display:inline-block; width:42px; height:24px; flex:none; }
 .switch input { opacity:0; width:0; height:0; }
 .switch .slider { position:absolute; cursor:pointer; inset:0; background:#2d333b; border-radius:24px; transition:var(--dur-fast) var(--ease-out); }
@@ -51,7 +51,7 @@ nav { display:flex; gap:var(--sp-1); margin-bottom:var(--sp-5); border-bottom:1p
 nav button { background:transparent; border:none; color:var(--muted); padding:10px 16px; cursor:pointer; font-size:14px; border-bottom:2px solid transparent; border-radius:0; }
 nav button.active { color:var(--text); border-bottom-color:var(--accent); }
 nav button:hover { color:var(--text); }
-/* 焦点可见环（可访问性） */
+/* Focus visible ring (accessibility) */
 button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible, a:focus-visible, [tabindex]:focus-visible { outline:2px solid #79b8ff; outline-offset:2px; }
 .sr-only { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0 0 0 0); white-space:nowrap; border:0; }
 .seg { display:inline-flex; border:1px solid var(--border); border-radius:var(--r-sm); overflow:hidden; }
@@ -96,6 +96,22 @@ label { display:block; color:var(--muted); font-size:12px; margin:var(--sp-2) 0 
 @keyframes toastIn { from { opacity:0; transform:translate(-50%,8px); } to { opacity:1; transform:translate(-50%,0); } }
 .logs { max-height:460px; overflow:auto; font-family:ui-monospace,Consolas,monospace; font-size:12px; background:#0a0d12; border:1px solid var(--border); border-radius:var(--r-md); padding:var(--sp-2); }
 .logs div { padding:2px 4px; border-bottom:1px dashed #1c2129; white-space:pre-wrap; word-break:break-all; }
+.chat { height:min(62vh,600px); overflow:auto; background:#0a0d12; border:1px solid var(--border); border-radius:var(--r-md); padding:var(--sp-3); display:flex; flex-direction:column; gap:var(--sp-3); }
+.chat .empty { margin:auto; color:var(--muted); text-align:center; font-size:13px; }
+.msg { max-width:85%; padding:10px 12px; border-radius:var(--r-lg); line-height:1.55; font-size:14px; overflow-wrap:anywhere; }
+.msg.user { align-self:flex-end; background:var(--accent-soft); border:1px solid #1f4a80; white-space:pre-wrap; }
+.msg.assistant { align-self:flex-start; background:var(--card); border:1px solid var(--border); }
+.msg.error { align-self:stretch; max-width:100%; border:1px solid var(--err); color:var(--err); }
+.msg .who { font-size:11px; color:var(--muted); margin-bottom:4px; display:flex; align-items:center; gap:8px; }
+.msg .who button { margin-left:auto; padding:0 6px; font-size:11px; }
+.msg pre { background:var(--bg); border:1px solid var(--border); border-radius:var(--r-sm); padding:8px 10px; overflow:auto; margin:6px 0; white-space:pre; }
+.msg code { font-family:ui-monospace,Consolas,monospace; font-size:12.5px; background:var(--bg); padding:1px 4px; border-radius:4px; }
+.msg pre code { background:none; padding:0; }
+.msg.typing::after { content:'\25CF\25CF\25CF'; letter-spacing:3px; color:var(--muted); animation:typing 1s infinite; }
+@keyframes typing { 50% { opacity:.3; } }
+@media (prefers-reduced-motion: reduce) { .msg.typing::after { animation:none; } }
+.composer { display:flex; gap:8px; align-items:flex-end; margin-top:10px; }
+.composer textarea { flex:1; min-height:44px; max-height:200px; resize:none; }
 .logs .lv-warn { color:var(--warn); } .logs .lv-error { color:var(--err); } .logs .lv-info { color:var(--muted); }
 #drawer { position:fixed; top:0; right:-560px; width:560px; max-width:92vw; height:100vh; background:var(--card); border-left:1px solid var(--border); transition:right var(--dur-norm) var(--ease-out); overflow:auto; padding:var(--sp-5); z-index:50; box-shadow:var(--sh-float); }
 #drawer.open { right:0; }
@@ -113,227 +129,227 @@ details { margin:6px 0; } summary { cursor:pointer; color:var(--muted); font-siz
 #login-wizard { scroll-margin-top:70px; }
 @keyframes wizardFlash { 0%,100% { box-shadow:0 0 0 0 rgba(79,140,255,0); } 50% { box-shadow:0 0 0 4px rgba(79,140,255,.5); } }
 .wizard-flash { animation:wizardFlash .8s ease-in-out 2; }
-/* 窄屏导航横向滚动（v0.8 可访问性） */
+/* Narrow-screen nav horizontal scroll (v0.8 accessibility) */
 @media(max-width:640px){ nav{ flex-wrap:nowrap; overflow-x:auto; } nav button{ flex:none; min-height:44px; } button:not(.sm), input, select, textarea { min-height:44px; } }
 </style>
 </head>
 <body>
 <header>
-  <h1><span class="dot" id="dot"></span>Freebuff2API 控制台 <span style="color:var(--muted);font-size:12px" id="ver"></span></h1>
+  <h1><span class="dot" id="dot"></span>Freebuff2API Control Panel <span style="color:var(--muted);font-size:12px" id="ver"></span></h1>
   <div class="hstat" id="hstat"></div>
-  <input id="api-key-input" type="password" placeholder="API Key（配了 api_keys 才需要）" title="配置了 api_keys 时，面板请求需带此 Key；仅存本机浏览器" style="width:200px;font-size:12px" onchange="setApiKey(this.value)">
+  <input id="api-key-input" type="password" placeholder="API Key (only needed if api_keys is configured)" title="When api_keys is configured, panel requests must include this key; stored only in this browser" style="width:200px;font-size:12px" onchange="setApiKey(this.value)">
 </header>
 <main>
   <div id="cred-warn" role="status" aria-live="polite"></div>
   <div id="banner"></div>
   <div class="cards" id="cards"></div>
   <div id="cost-line" style="font-size:13px;color:var(--muted);margin:-8px 0 16px 2px"></div>
-  <nav role="tablist" aria-label="面板导航">
-    <button role="tab" id="tab-btn-overview" data-tab="overview" class="active" aria-selected="true" aria-controls="tab-overview" tabindex="0" onclick="showTab('overview')">总览</button>
-    <button role="tab" id="tab-btn-play" data-tab="play" aria-selected="false" aria-controls="tab-play" tabindex="-1" onclick="showTab('play')">测试台</button>
-    <button role="tab" id="tab-btn-account" data-tab="account" aria-selected="false" aria-controls="tab-account" tabindex="-1" onclick="showTab('account')">账号</button>
-    <button role="tab" id="tab-btn-skills" data-tab="skills" aria-selected="false" aria-controls="tab-skills" tabindex="-1" onclick="showTab('skills')">技能</button>
-    <button role="tab" id="tab-btn-memory" data-tab="memory" aria-selected="false" aria-controls="tab-memory" tabindex="-1" onclick="showTab('memory')">记忆</button>
-    <button role="tab" id="tab-btn-logs" data-tab="logs" aria-selected="false" aria-controls="tab-logs" tabindex="-1" onclick="showTab('logs')">实时日志</button>
-    <button role="tab" id="tab-btn-teach" data-tab="teach" aria-selected="false" aria-controls="tab-teach" tabindex="-1" onclick="showTab('teach')">原理</button>
-    <button role="tab" id="tab-btn-doctor" data-tab="doctor" aria-selected="false" aria-controls="tab-doctor" tabindex="-1" onclick="showTab('doctor')">系统体检</button>
-    <button role="tab" id="tab-btn-guide" data-tab="guide" aria-selected="false" aria-controls="tab-guide" tabindex="-1" onclick="showTab('guide')">接入指南</button>
-    <button role="tab" id="tab-btn-settings" data-tab="settings" aria-selected="false" aria-controls="tab-settings" tabindex="-1" onclick="showTab('settings')">设置</button>
-    <button role="tab" id="tab-btn-about" data-tab="about" aria-selected="false" aria-controls="tab-about" tabindex="-1" onclick="showTab('about')">关于</button>
+  <nav role="tablist" aria-label="Panel navigation">
+    <button role="tab" id="tab-btn-overview" data-tab="overview" class="active" aria-selected="true" aria-controls="tab-overview" tabindex="0" onclick="showTab('overview')">Overview</button>
+    <button role="tab" id="tab-btn-play" data-tab="play" aria-selected="false" aria-controls="tab-play" tabindex="-1" onclick="showTab('play')">Playground</button>
+    <button role="tab" id="tab-btn-account" data-tab="account" aria-selected="false" aria-controls="tab-account" tabindex="-1" onclick="showTab('account')">Accounts</button>
+    <button role="tab" id="tab-btn-skills" data-tab="skills" aria-selected="false" aria-controls="tab-skills" tabindex="-1" onclick="showTab('skills')">Skills</button>
+    <button role="tab" id="tab-btn-memory" data-tab="memory" aria-selected="false" aria-controls="tab-memory" tabindex="-1" onclick="showTab('memory')">Memory</button>
+    <button role="tab" id="tab-btn-logs" data-tab="logs" aria-selected="false" aria-controls="tab-logs" tabindex="-1" onclick="showTab('logs')">Live Logs</button>
+    <button role="tab" id="tab-btn-teach" data-tab="teach" aria-selected="false" aria-controls="tab-teach" tabindex="-1" onclick="showTab('teach')">How it works</button>
+    <button role="tab" id="tab-btn-doctor" data-tab="doctor" aria-selected="false" aria-controls="tab-doctor" tabindex="-1" onclick="showTab('doctor')">Diagnostics</button>
+    <button role="tab" id="tab-btn-guide" data-tab="guide" aria-selected="false" aria-controls="tab-guide" tabindex="-1" onclick="showTab('guide')">Integration Guide</button>
+    <button role="tab" id="tab-btn-settings" data-tab="settings" aria-selected="false" aria-controls="tab-settings" tabindex="-1" onclick="showTab('settings')">Settings</button>
+    <button role="tab" id="tab-btn-about" data-tab="about" aria-selected="false" aria-controls="tab-about" tabindex="-1" onclick="showTab('about')">About</button>
   </nav>
 
   <section role="tabpanel" aria-labelledby="tab-btn-overview" id="tab-overview" tabindex="0">
-    <!-- 立刻开始请求：地址 + Key + 一键复制（回答"导入凭证之后呢？"） -->
+    <!-- Start making requests immediately: address + key + one-click copy (answers "what after importing credentials?") -->
     <div class="panel" id="connect-panel">
       <div class="row" style="margin-bottom:10px">
-        <h2 style="margin:0">🚀 立刻开始请求</h2>
+        <h2 style="margin:0">Start making requests now</h2>
         <span style="flex:1"></span>
         <span id="connect-ready" style="font-size:12px;color:var(--muted)"></span>
       </div>
       <div class="grid" style="gap:16px">
         <div>
-          <label>接口地址（Base URL）</label>
-          <div class="row"><input id="c-base" readonly style="flex:1"><button class="ghost sm" onclick="copyText(document.getElementById('c-base').value)">复制</button></div>
-          <label style="margin-top:8px">OpenAI 协议地址（Cursor / LobeChat / SDK）</label>
-          <div class="row"><input id="c-openai" readonly style="flex:1"><button class="ghost sm" onclick="copyText(document.getElementById('c-openai').value)">复制</button></div>
-          <label style="margin-top:8px">Anthropic 协议地址（Claude Code）</label>
-          <div class="row"><input id="c-anthropic" readonly style="flex:1"><button class="ghost sm" onclick="copyText(document.getElementById('c-anthropic').value)">复制</button></div>
+          <label>Endpoint address (Base URL)</label>
+          <div class="row"><input id="c-base" readonly style="flex:1"><button class="ghost sm" onclick="copyText(document.getElementById('c-base').value)">Copy</button></div>
+          <label style="margin-top:8px">OpenAI protocol address (Cursor / LobeChat / SDK)</label>
+          <div class="row"><input id="c-openai" readonly style="flex:1"><button class="ghost sm" onclick="copyText(document.getElementById('c-openai').value)">Copy</button></div>
+          <label style="margin-top:8px">Anthropic protocol address (Claude Code)</label>
+          <div class="row"><input id="c-anthropic" readonly style="flex:1"><button class="ghost sm" onclick="copyText(document.getElementById('c-anthropic').value)">Copy</button></div>
         </div>
         <div>
           <label>API Key</label>
-          <div class="row"><input id="c-key" readonly style="flex:1"><button class="ghost sm" onclick="copyText(document.getElementById('c-key').value)">复制</button></div>
+          <div class="row"><input id="c-key" readonly style="flex:1"><button class="ghost sm" onclick="copyText(document.getElementById('c-key').value)">Copy</button></div>
           <div class="row" style="margin-top:8px">
-            <button class="sm" onclick="genApiKey()">生成并启用 Key</button>
-            <button class="ghost sm" onclick="clearApiKey()">清除 Key</button>
+            <button class="sm" onclick="genApiKey()">Generate and enable key</button>
+            <button class="ghost sm" onclick="clearApiKey()">Clear key</button>
           </div>
           <div id="c-key-hint" style="font-size:12px;color:var(--muted);margin-top:8px"></div>
           <div id="c-model-hint" style="font-size:12px;color:var(--muted);margin-top:6px"></div>
         </div>
       </div>
-      <div style="margin-top:12px;font-size:13px;color:var(--muted)">把上面两项填进客户端就能用了 —— 现成配置片段见
-        <a href="#" onclick="showTab('guide');return false" style="color:var(--accent)">接入指南</a>。</div>
+      <div style="margin-top:12px;font-size:13px;color:var(--muted)">Fill the two fields above into your client to get started -- ready-made config snippets are in the
+        <a href="#" onclick="showTab('guide');return false" style="color:var(--accent)">Integration Guide</a>.</div>
     </div>
 
     <div class="grid">
-      <div class="panel"><h2>账号健康度</h2><div id="acc-wrap"></div></div>
-      <div class="panel"><h2>近 7 天用量</h2><div id="daily-wrap"></div></div>
+      <div class="panel"><h2>Account health</h2><div id="acc-wrap"></div></div>
+      <div class="panel"><h2>Usage over the last 7 days</h2><div id="daily-wrap"></div></div>
     </div>
-    <div class="panel"><h2>最近请求 <span style="font-weight:400">（点击行查看详情）</span></h2><div id="reqs-wrap"></div></div>
-    <div class="panel"><h2>可用模型（<span id="model-count">…</span>）</h2><div id="models-wrap"></div></div>
-    <div class="panel" id="balance-panel" style="display:none"><h2>账号积分</h2><div id="balance-wrap"></div></div>
-    <div class="panel" id="recommend-panel" style="display:none"><h2>🎯 今日推荐</h2><div id="recommend-wrap"><div class="empty">加载中…</div></div></div>
+    <div class="panel"><h2>Recent requests <span style="font-weight:400">(click a row for details)</span></h2><div id="reqs-wrap"></div></div>
+    <div class="panel"><h2>Available models (<span id="model-count">...</span>)</h2><div id="models-wrap"></div></div>
+    <div class="panel" id="balance-panel" style="display:none"><h2>Account credits</h2><div id="balance-wrap"></div></div>
+    <div class="panel" id="recommend-panel" style="display:none"><h2>Today's recommendations</h2><div id="recommend-wrap"><div class="empty">Loading...</div></div></div>
   </section>
 
   <section role="tabpanel" aria-labelledby="tab-btn-account" id="tab-account" tabindex="0" style="display:none">
-    <!-- 账号全貌（身份 / 用量 / 套餐 / 积分） -->
+    <!-- Account overview (identity / usage / plan / credits) -->
     <div class="panel">
       <div class="row" style="margin-bottom:10px">
-        <h2 style="margin:0">账号全貌</h2>
+        <h2 style="margin:0">Account overview</h2>
         <span style="flex:1"></span>
-        <button class="ghost sm" onclick="refreshAccountOverview()">刷新</button>
-        <button class="ghost sm" onclick="refreshCredential()">🔄 保活检查</button>
+        <button class="ghost sm" onclick="refreshAccountOverview()">Refresh</button>
+        <button class="ghost sm" onclick="refreshCredential()">Keep-alive check</button>
       </div>
-      <div id="overview-wrap"><div class="empty">点「刷新」拉取账号信息（身份 / 连续使用天数 / token 消耗 / 套餐 / 今日剩余积分）</div></div>
+      <div id="overview-wrap"><div class="empty">Click "Refresh" to fetch account info (identity / consecutive usage days / token consumption / plan / credits remaining today)</div></div>
     </div>
 
-    <!-- 凭证健康看板（v0.9 §2.1） -->
+    <!-- Credential health dashboard (v0.9 section 2.1) -->
     <div class="panel">
-      <div class="row" style="margin-bottom:8px"><h2 style="margin:0">🩺 凭证健康看板</h2><span style="flex:1"></span><button class="ghost sm" onclick="refreshHealth()">刷新</button></div>
-      <div id="health-wrap"><div class="empty">加载中…</div></div>
+      <div class="row" style="margin-bottom:8px"><h2 style="margin:0">Credential health dashboard</h2><span style="flex:1"></span><button class="ghost sm" onclick="refreshHealth()">Refresh</button></div>
+      <div id="health-wrap"><div class="empty">Loading...</div></div>
     </div>
 
-    <!-- 添加账号（一键登录向导 / 粘贴导入） -->
+    <!-- Add account (one-click login wizard / paste import) -->
     <div class="panel">
-      <h2>添加账号</h2>
+      <h2>Add account</h2>
       <div class="row" style="margin-bottom:10px">
-        <button onclick="oneClickLogin()">🔑 一键登录</button>
-        <span id="ext-status" class="badge dim">检测扩展中…</span>
-        <button class="ghost sm" onclick="downloadExtension()">⬇ 下载扩展</button>
-        <button class="ghost sm" onclick="pingExtension(true)">重新检测</button>
+        <button onclick="oneClickLogin()">One-click login</button>
+        <span id="ext-status" class="badge dim">Detecting extension...</span>
+        <button class="ghost sm" onclick="downloadExtension()">Download extension</button>
+        <button class="ghost sm" onclick="pingExtension(true)">Re-detect</button>
       </div>
 
       <div id="login-wizard" style="display:none;border:1px solid var(--accent);border-radius:8px;padding:14px;margin-bottom:12px;background:linear-gradient(135deg,#132a4a,#161b22)">
-        <div class="row" style="margin-bottom:8px"><b>浏览器版一键登录</b><span style="flex:1"></span><button class="ghost sm" onclick="document.getElementById('login-wizard').style.display='none'">收起</button></div>
+        <div class="row" style="margin-bottom:8px"><b>Browser one-click login</b><span style="flex:1"></span><button class="ghost sm" onclick="document.getElementById('login-wizard').style.display='none'">Collapse</button></div>
         <div id="wizard-embed" style="font-size:13px;margin-bottom:10px;padding:8px;background:#0d1117;border-radius:6px">
-          <b>方案 A（最推荐 · 零安装零复制）：内嵌登录窗口</b> <span class="badge ok">登录完即完事</span>
-          <div style="margin:6px 0;color:var(--muted);line-height:1.9">点下面的按钮会弹出一个内置浏览器窗口（系统自带的 WebView2 组件）→ 在窗口里正常完成 GitHub 登录 → 网关<b>自动</b>抓取凭证入库并关闭窗口。全程无需装扩展、无需复制任何东西。</div>
-          <button onclick="openEmbedLogin()">🪟 弹出内嵌登录窗口</button>
+          <b>Option A (recommended - zero install, zero copying): embedded login window</b> <span class="badge ok">Done once you log in</span>
+          <div style="margin:6px 0;color:var(--muted);line-height:1.9">Clicking the button below opens a built-in browser window (the system's WebView2 component) -> log in to GitHub normally inside that window -> the gateway <b>automatically</b> captures the credentials, stores them, and closes the window. No extension install or copying required at all.</div>
+          <button onclick="openEmbedLogin()">Open embedded login window</button>
           <span id="embed-status" style="font-size:12px;color:var(--muted);margin-left:8px"></span>
         </div>
         <div id="wizard-clip" style="font-size:13px;margin-bottom:10px;padding:8px;background:#0d1117;border-radius:6px">
-          <b>方案 B（推荐 · 无需安装）：剪贴板自动检测</b> <span class="badge ok">约 30 秒</span>
-          <div style="margin:6px 0;color:var(--muted);line-height:1.9">去 freebuff.com 登录 → 按 <b>F12</b> → <b>Network</b> → 点任意请求 → 在 <b>Headers</b> 里找到 <code>Cookie:</code> 开头那一行并整行复制（Ctrl+C）→ 回来点下面这个按钮，剩下的自动完成。</div>
-          <button onclick="importFromClipboard()">📋 自动检测剪贴板</button>
+          <b>Option B (recommended - no install needed): clipboard auto-detect</b> <span class="badge ok">About 30 seconds</span>
+          <div style="margin:6px 0;color:var(--muted);line-height:1.9">Go to freebuff.com and log in -> press <b>F12</b> -> <b>Network</b> -> click any request -> find the line starting with <code>Cookie:</code> under <b>Headers</b> and copy the whole line (Ctrl+C) -> come back and click the button below, the rest happens automatically.</div>
+          <button onclick="importFromClipboard()">Auto-detect clipboard</button>
           <span id="clip-status" style="font-size:12px;color:var(--muted);margin-left:8px"></span>
         </div>
         <div id="wizard-ext" style="font-size:13px;margin-bottom:10px;padding:8px;background:#0d1117;border-radius:6px">
-          <b>方案 C（全自动 · 装一次以后都不用管）：Chrome / Edge 扩展</b> <span class="badge dim">首次约 2 分钟</span>
+          <b>Option C (fully automatic - install once, never think about it again): Chrome / Edge extension</b> <span class="badge dim">About 2 minutes the first time</span>
           <ol style="margin:6px 0 0 20px;color:var(--muted);line-height:1.9">
-            <li>点上方「⬇ 下载扩展」得到 zip → 解压到任意目录（也可直接用项目里的 <code>browser-extension/</code> 目录）</li>
-            <li>打开 <code>chrome://extensions</code>（Edge 为 <code>edge://extensions</code>）→ 打开「开发者模式」→「加载已解压的扩展程序」→ 选中刚解压的目录</li>
-            <li>回到本页点「重新检测」→ 状态变成 <span class="badge ok">已就绪</span> 后，再点「一键登录」即可<b>全自动</b>：自动打开 freebuff.com → 你完成 GitHub 登录 → 凭证自动入库（含 HttpOnly Cookie，网页 JS 读不到，只有扩展能读）</li>
+            <li>Click "Download extension" above to get a zip -> extract it to any directory (or use the <code>browser-extension/</code> directory in the project directly)</li>
+            <li>Open <code>chrome://extensions</code> (<code>edge://extensions</code> for Edge) -> turn on "Developer mode" -> "Load unpacked" -> select the directory you just extracted</li>
+            <li>Come back to this page and click "Re-detect" -> once the status becomes <span class="badge ok">Ready</span>, click "One-click login" for a <b>fully automatic</b> flow: it opens freebuff.com automatically -> you complete the GitHub login -> credentials are stored automatically (including the HttpOnly cookie, which page JS can't read but the extension can)</li>
           </ol>
         </div>
-        <b style="font-size:13px">手动粘贴（兜底）：<span style="color:var(--muted);font-weight:400">支持 Cookie 串 / cURL / HAR</span></b> <span class="badge dim">约 1 分钟</span>
+        <b style="font-size:13px">Manual paste (fallback): <span style="color:var(--muted);font-weight:400">supports cookie string / cURL / HAR</span></b> <span class="badge dim">About 1 minute</span>
         <ol style="margin:6px 0 10px 20px;font-size:13px;color:var(--muted);line-height:2">
-          <li><button class="ghost sm" onclick="window.open('https://freebuff.com/','_blank','noopener')">① 打开 freebuff.com 并登录</button>（GitHub 登录即可）</li>
-          <li>按 <b>F12</b> → <b>Network</b> → 刷新 → 点任意请求 → <b>Headers</b> 里找 <code>Cookie:</code> 整行复制（或 Application → Cookies 里复制 <code>__Secure-next-auth.session-token</code> 的值）</li>
-          <li>回到本页面粘贴到下方输入框 → 点「导入」（导入后会自动验证凭证是否有效）</li>
+          <li><button class="ghost sm" onclick="window.open('https://freebuff.com/','_blank','noopener')">Open freebuff.com and log in</button> (GitHub login works)</li>
+          <li>Press <b>F12</b> -> <b>Network</b> -> refresh -> click any request -> find <code>Cookie:</code> under <b>Headers</b> and copy the whole line (or copy the value of <code>__Secure-next-auth.session-token</code> from Application -> Cookies)</li>
+          <li>Come back to this page, paste it into the input box below -> click "Import" (validity is verified automatically after import)</li>
         </ol>
-        <div style="font-size:12px;color:var(--muted)">💡 为什么网页不能全自动？上游登录 Cookie 标记为 HttpOnly（浏览器禁止网页脚本读取）——方案 B 的"复制"动作由你亲手完成（Ctrl+C 什么都能复制，HttpOnly 也拦不住剪贴板），网页脚本只负责读剪贴板和导入；扩展可以合法直接读 Cookie；桌面版由 Electron 主进程读取，因此桌面版是托盘一键全自动。</div>
+        <div style="font-size:12px;color:var(--muted)">Why can't this be fully automatic on the web? The upstream login cookie is marked HttpOnly (browsers block page scripts from reading it) -- the "copy" step in Option B is done by your own hand (Ctrl+C can copy anything, HttpOnly doesn't block the clipboard), the page script only reads the clipboard and imports; the extension can legitimately read the cookie directly; the desktop version is read by the Electron main process, so the desktop version is a fully-automatic one-click tray action.</div>
       </div>
 
-      <textarea id="import-text" placeholder="粘贴以下任意一种：
-1) 浏览器 Cookie 串（含 __Secure-next-auth.session-token=...）
-2) 从 DevTools 复制的 cURL (bash) 命令
-3) HAR 导出文件的 JSON 内容
-提示：也可以在 DevTools 里复制 Cookie 整行后，用向导里的「📋 自动检测剪贴板」一步完成"></textarea>
+      <textarea id="import-text" placeholder="Paste any of the following:
+1) Browser cookie string (including __Secure-next-auth.session-token=...)
+2) cURL (bash) command copied from DevTools
+3) JSON content from an exported HAR file
+Tip: you can also copy the whole Cookie line in DevTools, then use 'Auto-detect clipboard' in the wizard to finish in one step"></textarea>
       <div class="row" style="margin-top:10px">
-        <button onclick="doImport()">导入</button>
+        <button onclick="doImport()">Import</button>
         <span id="import-result" style="font-size:13px;color:var(--muted)"></span>
       </div>
       <div id="import-verify" style="display:none;margin-top:10px;font-size:13px"></div>
-      <details style="margin-top:12px"><summary>怎么获取 Cookie？（点击展开详细图文说明）</summary>
+      <details style="margin-top:12px"><summary>How do I get the cookie? (click to expand detailed instructions)</summary>
         <ol style="margin:10px 0 0 20px;font-size:13px;color:var(--muted);line-height:1.9">
-          <li>浏览器登录 freebuff.com</li>
-          <li>按 F12 打开开发者工具 → Network 标签</li>
-          <li>刷新页面，点任意请求 → Headers → 找到 <code>Cookie:</code> 开头那一整行</li>
-          <li>整行复制，粘贴到上面的框里，点「导入」</li>
-          <li>也可以在 Application → Cookies → https://freebuff.com 里逐项复制（需要包含 <code>__Secure-next-auth.session-token</code>）</li>
+          <li>Log in to freebuff.com in your browser</li>
+          <li>Press F12 to open DevTools -> Network tab</li>
+          <li>Refresh the page, click any request -> Headers -> find the line starting with <code>Cookie:</code></li>
+          <li>Copy the whole line, paste it into the box above, click "Import"</li>
+          <li>You can also copy items individually from Application -> Cookies -> https://freebuff.com (must include <code>__Secure-next-auth.session-token</code>)</li>
         </ol>
       </details>
     </div>
 
-    <!-- 凭证列表 -->
+    <!-- Credential list -->
     <div class="panel">
-      <h2>已入库凭证 <span id="cred-count" style="font-weight:400;color:var(--muted);font-size:12px"></span></h2>
+      <h2>Stored credentials <span id="cred-count" style="font-weight:400;color:var(--muted);font-size:12px"></span></h2>
       <div id="tokens-wrap"></div>
     </div>
 
-    <!-- 使用记录（每个账号的额度/消耗快照，可查历史） -->
+    <!-- Usage history (quota/consumption snapshot per account, browsable history) -->
     <div class="panel">
       <div class="row" style="margin-bottom:10px">
-        <h2 style="margin:0">使用记录</h2>
+        <h2 style="margin:0">Usage history</h2>
         <span style="flex:1"></span>
-        <select id="hist-cred" style="width:auto" onchange="loadHistory()"><option value="">全部账号</option></select>
-        <button class="ghost sm" onclick="loadHistory()">刷新</button>
+        <select id="hist-cred" style="width:auto" onchange="loadHistory()"><option value="">All accounts</option></select>
+        <button class="ghost sm" onclick="loadHistory()">Refresh</button>
       </div>
-      <div id="hist-wrap"><div class="empty">每次「刷新账号全貌」或「检查」都会记录一条 —— 点「刷新」查看</div></div>
+      <div id="hist-wrap"><div class="empty">Every "Refresh account overview" or "Check" records an entry -- click "Refresh" to view</div></div>
     </div>
   </section>
 
   <section role="tabpanel" aria-labelledby="tab-btn-skills" id="tab-skills" tabindex="0" style="display:none">
     <div class="panel">
-      <h2>技能库 <span style="font-weight:400;color:var(--muted);font-size:12px">（启用后注入对话 system 前缀；roster 模式只注入名称与描述）</span></h2>
+      <h2>Skill library <span style="font-weight:400;color:var(--muted);font-size:12px">(when enabled, injected as a system prefix into the conversation; roster mode only injects name and description)</span></h2>
       <div class="row" style="margin-bottom:10px">
-        <button onclick="newSkill()">＋ 新建技能</button>
+        <button onclick="newSkill()">+ New skill</button>
         <span id="roster-info" style="font-size:12px;color:var(--muted)"></span>
       </div>
       <div id="skills-wrap"></div>
     </div>
     <div class="panel" id="skill-editor" style="display:none">
-      <h2 id="skill-editor-title">编辑技能</h2>
-      <label>名称</label><input id="sk-name" placeholder="例如：周报助手">
-      <label>描述（写给 AI 的触发说明：什么时候用这个技能）</label><input id="sk-desc" placeholder="Use when the user wants to write a weekly report...">
-      <label>指令正文（Markdown）</label><textarea id="sk-body" style="min-height:200px" placeholder="技能的完整指令内容…"></textarea>
+      <h2 id="skill-editor-title">Edit skill</h2>
+      <label>Name</label><input id="sk-name" placeholder="e.g. Weekly report assistant">
+      <label>Description (trigger instructions for the AI: when to use this skill)</label><input id="sk-desc" placeholder="Use when the user wants to write a weekly report...">
+      <label>Instruction body (Markdown)</label><textarea id="sk-body" style="min-height:200px" placeholder="Full instruction content for the skill..."></textarea>
       <div class="row" style="margin-top:10px">
-        <button onclick="saveSkill()">保存</button>
-        <button class="ghost" onclick="document.getElementById('skill-editor').style.display='none'">取消</button>
+        <button onclick="saveSkill()">Save</button>
+        <button class="ghost" onclick="document.getElementById('skill-editor').style.display='none'">Cancel</button>
         <span id="skill-save-result" style="font-size:13px;color:var(--muted)"></span>
       </div>
-      <details style="margin-top:10px"><summary>质量门检查（保存前会提示问题）</summary><div id="gate-result" style="font-size:13px;color:var(--muted);margin-top:6px"></div></details>
+      <details style="margin-top:10px"><summary>Quality gate check (flags issues before saving)</summary><div id="gate-result" style="font-size:13px;color:var(--muted);margin-top:6px"></div></details>
     </div>
   </section>
 
   <section role="tabpanel" aria-labelledby="tab-btn-memory" id="tab-memory" tabindex="0" style="display:none">
     <div class="panel">
-      <h2>记忆库 <span style="font-weight:400;color:var(--muted);font-size:12px">（AI 从这里学习你的偏好与纠正；零 LLM 规则记录，纯本地）</span></h2>
+      <h2>Memory store <span style="font-weight:400;color:var(--muted);font-size:12px">(the AI learns your preferences and corrections from here; zero-LLM rule-based recording, fully local)</span></h2>
       <div id="mem-toggle-row" style="display:flex;align-items:center;gap:10px;margin-bottom:10px;padding:10px 12px;border:1px solid var(--border);border-radius:8px;background:#161b22">
         <div style="flex:1">
-          <div style="font-size:14px;font-weight:600">记忆层 <span id="mem-toggle-state" style="font-size:12px;font-weight:400;color:var(--muted)"></span></div>
-          <div style="font-size:12px;color:var(--muted);margin-top:2px">开启后自动记录常用模型/推理档位/你的纠正，并在相关对话时注入（默认关闭，适合不需要记忆的用户）</div>
+          <div style="font-size:14px;font-weight:600">Memory layer <span id="mem-toggle-state" style="font-size:12px;font-weight:400;color:var(--muted)"></span></div>
+          <div style="font-size:12px;color:var(--muted);margin-top:2px">When enabled, automatically records frequently used models / reasoning effort / your corrections, and injects them into relevant conversations (disabled by default, suitable for users who don't need memory)</div>
         </div>
-        <label class="switch" title="记忆层总开关（写回 config.json，立即生效，无需重启）">
+        <label class="switch" title="Memory layer master toggle (written back to config.json, takes effect immediately, no restart needed)">
           <input type="checkbox" id="mem-toggle" onchange="toggleMemoryEnabled()">
           <span class="slider"></span>
         </label>
       </div>
       <div id="mem-stats" style="margin-bottom:10px;font-size:13px;color:var(--muted)"></div>
       <div class="row" style="margin-bottom:10px">
-        <button onclick="newMemory()">＋ 手动添加</button>
-        <span style="font-size:12px;color:var(--muted)">自动记录：常用模型 / 推理档位降级 / 你的纠正（"记住…"、"别再…"、"always/never"）</span>
+        <button onclick="newMemory()">+ Add manually</button>
+        <span style="font-size:12px;color:var(--muted)">Auto-recorded: frequently used models / reasoning effort downgrades / your corrections ("remember...", "don't...again", "always/never")</span>
       </div>
       <div id="mem-editor" style="display:none;border:1px solid var(--border);border-radius:8px;padding:12px;margin-bottom:12px">
-        <label>类型</label>
+        <label>Type</label>
         <select id="mem-kind">
-          <option value="preference">偏好</option><option value="correction">纠正</option>
-          <option value="habit">习惯</option><option value="project">项目</option><option value="feedback">反馈</option>
+          <option value="preference">Preference</option><option value="correction">Correction</option>
+          <option value="habit">Habit</option><option value="project">Project</option><option value="feedback">Feedback</option>
         </select>
-        <label>标题</label><input id="mem-title" placeholder="例如：偏好中文回答 / 常用模型 glm-5.3-flash">
-        <label>内容</label><textarea id="mem-content" style="min-height:80px" placeholder="具体内容（相关对话时会注入 system 前缀，低权威）"></textarea>
+        <label>Title</label><input id="mem-title" placeholder="e.g. Prefer Chinese answers / frequently used model glm-5.3-flash">
+        <label>Content</label><textarea id="mem-content" style="min-height:80px" placeholder="Specific content (injected as a low-authority system prefix during relevant conversations)"></textarea>
         <div class="row" style="margin-top:10px">
-          <button onclick="saveMemory()">保存</button>
-          <button class="ghost" onclick="document.getElementById('mem-editor').style.display='none'">取消</button>
+          <button onclick="saveMemory()">Save</button>
+          <button class="ghost" onclick="document.getElementById('mem-editor').style.display='none'">Cancel</button>
           <span id="mem-save-result" style="font-size:13px;color:var(--muted)"></span>
         </div>
       </div>
@@ -343,178 +359,180 @@ details { margin:6px 0; } summary { cursor:pointer; color:var(--muted); font-siz
 
   <section role="tabpanel" aria-labelledby="tab-btn-teach" id="tab-teach" tabindex="0" style="display:none">
     <div class="panel">
-      <h2>原理速览 <span style="font-weight:400;color:var(--muted);font-size:12px">（这个网关背后发生了什么）</span></h2>
-      <details open><summary><b>① 请求进来之后</b></summary>
+      <h2>How it works at a glance <span style="font-weight:400;color:var(--muted);font-size:12px">(what happens behind this gateway)</span></h2>
+      <details open><summary><b>1. After a request comes in</b></summary>
         <p style="font-size:13px;color:var(--muted);line-height:1.9;margin-top:6px">
-        客户端（Claude Code / Cursor）把 OpenAI 或 Claude 格式的请求发到本地 <code>47821</code> 端口。
-        网关先解析模型名 → 从账号池挑健康账号（评分 + 熔断状态）→ 确保该账号在上游有活跃会话
-        → 把请求改写为上游格式（注入 run 元数据、按模型校正思考档位、拼上提示词/技能/记忆）
-        → 转发上游，再把响应（流式）实时转回客户端格式。</p></details>
-      <details><summary><b>② 多账号是怎么"轮询"的</b></summary>
+        The client (Claude Code / Cursor) sends an OpenAI- or Claude-format request to the local port <code>47821</code>.
+        The gateway first parses the model name -> picks a healthy account from the account pool (score + circuit-breaker state) -> ensures that account has an active session upstream
+        -> rewrites the request into upstream format (injects run metadata, adjusts the reasoning effort per model, appends prompts/skills/memory)
+        -> forwards it upstream, then streams the response back in real time in the client's format.</p></details>
+      <details><summary><b>2. How multi-account "rotation" works</b></summary>
         <p style="font-size:13px;color:var(--muted);line-height:1.9;margin-top:6px">
-        每个账号有独立的健康分与熔断器（Closed / Open / HalfOpen 三态）：连续失败 4 次自动断开，
-        冷却随断开次数指数增长（封顶 10 分钟）；冷却结束进入半开状态放行探测，连续成功 2 次恢复。
-        请求失败会自动换号重试（最多 3 次）——但只在"尚未向客户端写出任何字节"之前重试，
-        绝不会把半截响应写给你。</p></details>
-      <details><summary><b>③ 提示词 / 技能 / 记忆是怎么注入的</b></summary>
+        Each account has its own health score and circuit breaker (three states: Closed / Open / HalfOpen): 4 consecutive failures trips it automatically,
+        the cooldown grows exponentially with trip count (capped at 10 minutes); once cooldown ends it enters half-open state to allow probe requests, and recovers after 2 consecutive successes.
+        A failed request automatically retries with a different account (up to 3 times) -- but only retries before any bytes have been written to the client,
+        it will never write you a half-finished response.</p></details>
+      <details><summary><b>3. How prompts / skills / memory get injected</b></summary>
         <p style="font-size:13px;color:var(--muted);line-height:1.9;margin-top:6px">
-        注入顺序：基础提示词 → 启用的提示词 → 技能 roster（名称+描述）→ 记忆块（低权威），
-        拼成一条 system 消息放最前面。技能与记忆有严格预算（默认 2000 / 512 token），超出整条丢弃，
-        避免"越装越贵"。记忆按你当前的问题检索（本地 trigram 全文索引，支持中文）。</p></details>
-      <details><summary><b>④ 黑匣子：为什么这次慢 / 为什么失败</b></summary>
+        Injection order: base prompt -> enabled prompts -> skill roster (name + description) -> memory block (low authority),
+        concatenated into one system message placed at the front. Skills and memory have strict budgets (2000 / 512 tokens by default); anything over budget is dropped entirely,
+        to avoid "the more you add, the more it costs". Memory is retrieved based on your current question (local trigram full-text index, supports Chinese).</p></details>
+      <details><summary><b>4. Black box: why was this slow / why did it fail</b></summary>
         <p style="font-size:13px;color:var(--muted);line-height:1.9;margin-top:6px">
-        每次请求都记录：路由决策（请求模型→实际模型→账号）、上游状态码、首字节时间、总耗时、token 用量、
-        错误类型与片段。在「总览 → 最近请求」点任意一行看细节与人话解释；「实时日志」页实时推送
-        正在发生的事（断线自动补发）。</p></details>
-      <details><summary><b>⑤ 免费额度与广告保活</b></summary>
+        Every request is recorded: routing decision (requested model -> actual model -> account), upstream status code, time to first byte, total duration, token usage,
+        error type and snippet. Click any row under "Overview -> Recent requests" to see details and a plain-language explanation; the "Live Logs" page streams
+        what's happening in real time (auto-resumes after disconnects).</p></details>
+      <details><summary><b>5. Free quota and ad-based keep-alive</b></summary>
         <p style="font-size:13px;color:var(--muted);line-height:1.9;margin-top:6px">
-        上游免费层通过"会话 + 广告刷新"维持额度：网关每 45 秒心跳，会话剩余不足时触发广告刷新延长。
-        出现 <code>waiting_room_queued</code> 表示上游在排队——不是网关故障，稍等重试或多加账号提升并发。</p></details>
-      <details><summary><b>⑥ 上游会话自动清理</b></summary>
+        The upstream free tier maintains quota through "session + ad refresh": the gateway sends a heartbeat every 45 seconds, and triggers an ad refresh to extend the session when it's running low.
+        Seeing <code>waiting_room_queued</code> means upstream is queuing -- not a gateway failure; wait and retry, or add more accounts to increase concurrency.</p></details>
+      <details><summary><b>6. Automatic upstream session cleanup</b></summary>
         <p style="font-size:13px;color:var(--muted);line-height:1.9;margin-top:6px">
-        每次对话在上游都会生成一个 thread。网关记录自己创建的 thread，并<b>每小时</b>清理超过
-        <b>24 小时</b>的旧会话（<code class="ok">thread_cleanup_interval_sec</code> /
-        <code class="ok">thread_max_age_hours</code> 可调，间隔设 0 关闭）——避免反代长期堆积给上游制造压力。
-        也可在「原理」页对应的 API 手动预演：<code>POST /api/threads/cleanup {"dry_run":true}</code>。</p></details>
-      <details><summary><b>⑦ 数据都存在哪</b></summary>
+        Every conversation generates a thread upstream. The gateway records the threads it creates itself, and cleans up sessions older than
+        <b>24 hours</b> every <b>hour</b> (<code class="ok">thread_cleanup_interval_sec</code> /
+        <code class="ok">thread_max_age_hours</code> are configurable; set the interval to 0 to disable) -- this avoids the proxy piling up long-lived sessions and putting pressure on upstream.
+        You can also dry-run this manually via the API described on the "How it works" page: <code>POST /api/threads/cleanup {"dry_run":true}</code>.</p></details>
+      <details><summary><b>7. Where is the data stored</b></summary>
         <p style="font-size:13px;color:var(--muted);line-height:1.9;margin-top:6px">
-        全部本地：<code>data/freebuff2api.sqlite</code>（用量）、<code>data/telemetry.sqlite</code>（请求详情）、
-        <code>data/memory.sqlite</code>（记忆）、<code>data/skills/</code>（技能 Markdown，真相源）、
-        <code>data/tokens.json</code>（凭证）。备份或整体删除即可重置。</p></details>
+        All local: <code>data/freebuff2api.sqlite</code> (usage), <code>data/telemetry.sqlite</code> (request details),
+        <code>data/memory.sqlite</code> (memory), <code>data/skills/</code> (skill Markdown, source of truth),
+        <code>data/tokens.json</code> (credentials). Back up or delete entirely to reset.</p></details>
     </div>
   </section>
 
   <section role="tabpanel" aria-labelledby="tab-btn-logs" id="tab-logs" tabindex="0" style="display:none">
     <div class="panel">
       <div class="row" style="margin-bottom:10px">
-        <h2 style="margin:0">实时日志 <span id="log-err-count" class="badge err" style="display:none" title="当前缓冲中 error 级日志数">0</span></h2>
+        <h2 style="margin:0">Live logs <span id="log-err-count" class="badge err" style="display:none" title="Number of error-level log entries currently buffered">0</span></h2>
         <span style="flex:1"></span>
         <span role="status" aria-live="polite" class="sr-only" id="log-sr"></span>
-        <div class="seg" id="log-level-seg" role="group" aria-label="日志级别筛选">
-          <button class="active" data-level="" onclick="setLogLevel(this)">全部</button>
+        <div class="seg" id="log-level-seg" role="group" aria-label="Log level filter">
+          <button class="active" data-level="" onclick="setLogLevel(this)">All</button>
           <button data-level="info" onclick="setLogLevel(this)">info</button>
           <button data-level="warn" onclick="setLogLevel(this)">warn</button>
           <button data-level="error" onclick="setLogLevel(this)">error</button>
         </div>
-        <select id="log-filter" style="width:auto" onchange="renderLogs()" aria-label="日志级别选择">
-          <option value="">全部级别</option><option value="info">info</option><option value="warn">warn</option><option value="error">error</option>
+        <select id="log-filter" style="width:auto" onchange="renderLogs()" aria-label="Log level selector">
+          <option value="">All levels</option><option value="info">info</option><option value="warn">warn</option><option value="error">error</option>
         </select>
-        <button class="ghost sm" id="log-pause-btn" onclick="toggleLogPause()">⏸ 暂停滚动</button>
-        <button class="ghost sm" onclick="exportLogs()">⬇ 导出当前</button>
-        <button class="ghost sm" onclick="clearLogs()">清空显示</button>
+        <button class="ghost sm" id="log-pause-btn" onclick="toggleLogPause()">Pause scrolling</button>
+        <button class="ghost sm" onclick="exportLogs()">Export current</button>
+        <button class="ghost sm" onclick="clearLogs()">Clear display</button>
       </div>
-      <div class="logs" id="logbox" aria-live="polite" aria-relevant="additions"><div class="empty">等待日志…（发起一次对话即可看到请求链路）</div></div>
+      <div class="logs" id="logbox" aria-live="polite" aria-relevant="additions"><div class="empty">Waiting for logs... (start a conversation to see the request flow)</div></div>
     </div>
   </section>
 
   <section role="tabpanel" aria-labelledby="tab-btn-doctor" id="tab-doctor" tabindex="0" style="display:none">
     <div class="panel">
-      <h2>系统体检 <span style="font-weight:400;color:var(--muted);font-size:12px">（检查结果只是信号，不是判决；"未检查"就是未检查）</span></h2>
-      <button class="ghost sm" onclick="refreshDoctor()">重新检查</button>
-      <div id="doctor-wrap" style="margin-top:10px"><div class="empty">点击「重新检查」开始</div></div>
+      <h2>System diagnostics <span style="font-weight:400;color:var(--muted);font-size:12px">(results are signals, not verdicts; "not checked" just means not checked)</span></h2>
+      <button class="ghost sm" onclick="refreshDoctor()">Re-check</button>
+      <div id="doctor-wrap" style="margin-top:10px"><div class="empty">Click "Re-check" to start</div></div>
     </div>
   </section>
 
   <section role="tabpanel" aria-labelledby="tab-btn-guide" id="tab-guide" tabindex="0" style="display:none">
     <div class="panel">
-      <h2>把这个网关接入你的 AI 客户端</h2>
+      <h2>Connect this gateway to your AI client</h2>
       <div style="background:#0d1117;border:1px solid var(--border);border-radius:8px;padding:12px;margin:10px 0 16px;font-size:13px;line-height:2">
-        <b>三步走：</b>
-        ① 在「账号」页导入凭证（或一键登录）→
-        ② 确认上方状态灯为绿色（网关运行中）→
-        ③ 按下面任意一种方式配置你的客户端即可开始对话。
+        <b>Three steps:</b>
+        1. Import credentials on the "Accounts" page (or one-click login) ->
+        2. Confirm the status light above is green (gateway running) ->
+        3. Configure your client using any of the methods below to start chatting.
       </div>
-      <p style="font-size:13px;color:var(--muted);margin-bottom:10px">网关地址：<code id="guide-base">http://127.0.0.1:47821</code>（OpenAI 协议加 <code>/v1</code> 后缀；Anthropic 协议不加）</p>
-      <p style="font-size:13px;color:var(--muted);margin-bottom:10px"><b>API Key 填什么？</b> <span id="guide-key-hint">config.json 未配置 api_keys 时，任意字符串即可（如 <code>sk-local</code>）</span></p>
+      <p style="font-size:13px;color:var(--muted);margin-bottom:10px">Gateway address: <code id="guide-base">http://127.0.0.1:47821</code> (append <code>/v1</code> for the OpenAI protocol; not needed for the Anthropic protocol)</p>
+      <p style="font-size:13px;color:var(--muted);margin-bottom:10px"><b>What do I put for API Key?</b> <span id="guide-key-hint">If api_keys isn't configured in config.json, any string works (e.g. <code>sk-local</code>)</span></p>
 
-      <h2 style="margin-top:16px">Claude Code（Anthropic 协议）</h2>
-      <pre id="g-claude"></pre><button class="ghost sm" onclick="copyText(document.getElementById('g-claude').textContent)">复制</button>
+      <h2 style="margin-top:16px">Claude Code (Anthropic protocol)</h2>
+      <pre id="g-claude"></pre><button class="ghost sm" onclick="copyText(document.getElementById('g-claude').textContent)">Copy</button>
 
-      <h2 style="margin-top:16px">Cursor / Continue / 通用 OpenAI 客户端</h2>
-      <pre id="g-openai"></pre><button class="ghost sm" onclick="copyText(document.getElementById('g-openai').textContent)">复制</button>
+      <h2 style="margin-top:16px">Cursor / Continue / generic OpenAI client</h2>
+      <pre id="g-openai"></pre><button class="ghost sm" onclick="copyText(document.getElementById('g-openai').textContent)">Copy</button>
 
       <h2 style="margin-top:16px">OpenAI SDK (Python)</h2>
-      <pre id="g-py"></pre><button class="ghost sm" onclick="copyText(document.getElementById('g-py').textContent)">复制</button>
+      <pre id="g-py"></pre><button class="ghost sm" onclick="copyText(document.getElementById('g-py').textContent)">Copy</button>
 
       <h2 style="margin-top:16px">OpenAI SDK (Node.js)</h2>
-      <pre id="g-node"></pre><button class="ghost sm" onclick="copyText(document.getElementById('g-node').textContent)">复制</button>
+      <pre id="g-node"></pre><button class="ghost sm" onclick="copyText(document.getElementById('g-node').textContent)">Copy</button>
 
-      <h2 style="margin-top:16px">curl 快速验证</h2>
-      <pre id="g-curl"></pre><button class="ghost sm" onclick="copyText(document.getElementById('g-curl').textContent)">复制</button>
+      <h2 style="margin-top:16px">curl quick test</h2>
+      <pre id="g-curl"></pre><button class="ghost sm" onclick="copyText(document.getElementById('g-curl').textContent)">Copy</button>
 
       <h2 style="margin-top:16px">LobeChat / NextChat / Cherry Studio</h2>
-      <pre id="g-lobe"></pre><button class="ghost sm" onclick="copyText(document.getElementById('g-lobe').textContent)">复制</button>
+      <pre id="g-lobe"></pre><button class="ghost sm" onclick="copyText(document.getElementById('g-lobe').textContent)">Copy</button>
     </div>
   </section>
 
-  <!-- 对话测试台（v0.8 新增 / v0.9：多轮 + 图片 + effort） -->
+  <!-- Chat playground (added in v0.8 / v0.9: multi-turn + images + effort) -->
   <section role="tabpanel" aria-labelledby="tab-btn-play" id="tab-play" tabindex="0" style="display:none">
     <div class="panel">
-      <h2>💬 对话测试台</h2>
-      <p style="font-size:13px;color:var(--muted);margin-bottom:10px">不发请求到上游就验证网关链路：选模型（可调思考档位）→ 输入消息（支持粘贴/拖拽图片）→ 流式渲染回复。支持多轮上下文（会话历史留在本页）。</p>
+      <h2>Chat playground</h2>
       <div class="row" style="margin-bottom:10px;flex-wrap:wrap;gap:8px">
-        <select id="play-model" style="max-width:280px;flex:1;min-width:160px"></select>
-        <select id="play-effort" style="max-width:180px;display:none" title="思考档位（按模型阶梯）"></select>
-        <button class="ghost sm" onclick="loadModelsIntoPlay()">刷新模型</button>
+        <select id="play-model" style="max-width:280px;flex:1;min-width:160px" aria-label="Model"></select>
+        <select id="play-effort" style="max-width:180px;display:none" title="Reasoning effort (tiered per model)" aria-label="Reasoning effort"></select>
+        <button class="ghost sm" onclick="loadModelsIntoPlay()">Refresh models</button>
+        <span style="flex:1"></span>
+        <button class="ghost sm" onclick="playNewSession()">New chat</button>
+        <button class="ghost sm" onclick="playCopyOut()">Copy last reply</button>
+        <button class="ghost sm" onclick="playExportMd()">Export Markdown</button>
       </div>
-      <textarea id="play-system" placeholder="（可选）System 提示词，例如：你是资深 Rust 工程师" style="min-height:40px"></textarea>
+      <details style="margin-bottom:10px"><summary style="cursor:pointer;font-size:13px;color:var(--muted)">System prompt (optional)</summary>
+        <textarea id="play-system" placeholder="e.g.: You are a senior Rust engineer" style="min-height:40px;margin-top:6px"></textarea>
+      </details>
+      <div id="play-output" class="chat" aria-live="polite" ondragover="event.preventDefault()" ondrop="playDrop(event)"><div class="empty">Send a message to start chatting.<br>Multi-turn context is kept on this page.</div></div>
       <div id="play-images" class="row" style="gap:6px;margin:8px 0 0"></div>
-      <div id="play-drop" style="border:1px dashed var(--border);border-radius:8px;padding:10px 12px;margin-top:8px;font-size:12px;color:var(--muted);cursor:pointer" onclick="document.getElementById('play-file').click()" ondragover="event.preventDefault()" ondrop="playDrop(event)">🖼 点击 / 拖拽 / 粘贴添加图片（上传到上游换取 storageId；需 web Cookie，失败自动降级 base64）</div>
-      <input type="file" id="play-file" accept="image/*" multiple style="display:none" onchange="playAddFiles(this.files)">
-      <textarea id="play-input" placeholder="输入一条消息，例如：用一句话介绍你自己（Ctrl+Enter 发送）" style="min-height:64px" onkeydown="if((event.ctrlKey||event.metaKey)&&event.key==='Enter'){event.preventDefault();playSend();}" onpaste="playPaste(event)"></textarea>
-      <div class="row" style="margin-top:8px;flex-wrap:wrap;gap:8px">
-        <button onclick="playSend()">🚀 发送</button>
-        <button class="ghost sm" onclick="playStop()">停止</button>
-        <button class="ghost sm" onclick="playNewSession()">新会话</button>
-        <button class="ghost sm" onclick="playCopyOut()">复制回复</button>
-        <button class="ghost sm" onclick="playExportMd()">导出 Markdown</button>
-        <span id="play-status" style="font-size:12px;color:var(--muted)"></span>
+      <div id="play-drop" class="composer" ondragover="event.preventDefault()" ondrop="playDrop(event)">
+        <button class="ghost" title="Attach images (or paste / drag them here)" aria-label="Attach images" onclick="document.getElementById('play-file').click()">&#128206;</button>
+        <input type="file" id="play-file" accept="image/*" multiple style="display:none" onchange="playAddFiles(this.files)">
+        <textarea id="play-input" rows="1" placeholder="Message the model..." aria-label="Message" onkeydown="if(event.key==='Enter'&&!event.shiftKey&&!event.isComposing){event.preventDefault();playSend();}" oninput="this.style.height='auto';this.style.height=Math.min(this.scrollHeight,200)+'px'" onpaste="playPaste(event)"></textarea>
+        <button onclick="playSend()">Send</button>
+        <button id="play-stop" class="ghost" onclick="playStop()" style="display:none">Stop</button>
       </div>
-      <div id="play-output" class="logs" style="margin-top:10px;max-height:400px;font-size:13px"><div class="empty">回复会实时显示在这里</div></div>
+      <div class="row" style="margin-top:6px;font-size:12px;color:var(--muted)"><span id="play-status"></span><span style="flex:1"></span><span>Enter to send &middot; Shift+Enter for a new line &middot; paste or drag images</span></div>
     </div>
   </section>
 
   </section>
 
-  <!-- 设置页（v0.8 新增） -->
+  <!-- Settings page (added in v0.8) -->
   <section role="tabpanel" aria-labelledby="tab-btn-settings" id="tab-settings" tabindex="0" style="display:none">
     <div class="panel">
-      <h2>⚙️ 设置</h2>
-      <p style="font-size:13px;color:var(--muted);margin-bottom:12px">修改后写回 <code>config.json</code>（原子写，不覆盖其他配置）。<b>监听地址与部分项需重启生效</b>。</p>
-      <div id="settings-wrap"><div class="empty">加载中…</div></div>
+      <h2>Settings</h2>
+      <p style="font-size:13px;color:var(--muted);margin-bottom:12px">Changes are written back to <code>config.json</code> (atomic write, doesn't overwrite other settings). <b>The listen address and some other settings require a restart to take effect.</b></p>
+      <div id="settings-wrap"><div class="empty">Loading...</div></div>
     </div>
-    <div class="panel" style="margin-top:14px">
-      <h2>📦 数据迁移（导出 / 导入）</h2>
-      <p style="font-size:13px;color:var(--muted);margin-bottom:10px">一键打包 config（脱敏，不含 api_keys/auth_tokens 明文）+ 凭证 + 技能启用态 + 记忆开关，换机迁移。导入前自动备份到 <code>data/backup-&lt;时间戳&gt;/</code>。</p>
+      <h2>Data migration (export / import)</h2>
+      <h2>Data migration (export / import)</h2>
+      <p style="font-size:13px;color:var(--muted);margin-bottom:10px">One click packages config (sanitized, no plaintext api_keys/auth_tokens) + credentials + skill enable states + memory toggle, for migrating to a new machine. Automatically backed up to <code>data/backup-&lt;timestamp&gt;/</code> before import.</p>
       <div class="row" style="gap:8px;flex-wrap:wrap">
-        <button onclick="exportConfig()">⬇ 导出配置</button>
-        <button onclick="document.getElementById('import-file').click()">⬆ 导入配置</button>
+        <button onclick="exportConfig()">Export config</button>
+        <button onclick="document.getElementById('import-file').click()">Import config</button>
         <input type="file" id="import-file" accept=".json,application/json" style="display:none" onchange="importConfig(this.files)">
         <span id="migrate-status" style="font-size:12px;color:var(--muted)"></span>
       </div>
     </div>
   </section>
 
-  <!-- 关于页（v0.8 新增） -->
+  <!-- About page (added in v0.8) -->
   <section role="tabpanel" aria-labelledby="tab-btn-about" id="tab-about" tabindex="0" style="display:none">
     <div class="panel">
-      <h2>ℹ️ 关于 Freebuff2API</h2>
-      <div id="about-wrap"><div class="empty">加载中…</div></div>
+      <h2>ℹ️ About Freebuff2API</h2>
+      <div id="about-wrap"><div class="empty">Loading…</div></div>
     </div>
   </section>
 </main>
 
-<div id="drawer"><div class="row"><h3 id="dr-title">请求详情</h3><span style="flex:1"></span><button class="ghost sm" onclick="closeDrawer()">关闭</button></div><div id="dr-body"></div></div>
+<div id="drawer"><div class="row"><h3 id="dr-title">Request Details</h3><span style="flex:1"></span><button class="ghost sm" onclick="closeDrawer()">Close</button></div><div id="dr-body"></div></div>
 <div id="toast"></div>
 <script>
-// ---------- 基础工具 ----------
+// ---------- Basic utilities ----------
 const $ = (id) => document.getElementById(id);
-// 可选 API Key（配置了 api_keys 时，面板请求需带 Authorization）
+// Optional API Key (when api_keys is configured, panel requests must include Authorization)
 function apiKey() { try { return localStorage.getItem('freebuff_api_key') || ''; } catch (e) { return ''; } }
 function setApiKey(v) {
   try {
     localStorage.setItem('freebuff_api_key', v.trim());
-    toast(v.trim() ? 'API Key 已保存，正在重新加载…' : 'API Key 已清除，正在重新加载…');
+    toast(v.trim() ? 'API Key saved, reloading…' : 'API Key cleared, reloading…');
     authWarned = false;
     loadGuide();
     refreshOverview();
@@ -533,8 +551,8 @@ async function api(url, opt) {
 function toast(msg, ms) { const t = $('toast'); t.textContent = msg; t.style.display = 'block'; clearTimeout(t._h); t._h = setTimeout(() => t.style.display = 'none', ms || 2600); }
 function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function badge(text, cls) { return `<span class="badge ${cls || 'dim'}">${esc(text)}</span>`; }
-function copyText(t) { navigator.clipboard?.writeText(t).then(() => toast('已复制')).catch(() => toast('复制失败，请手动选择')); }
-function fmtTime(ts) { try { return new Date(ts).toLocaleTimeString('zh-CN', { hour12: false }); } catch (e) { return ts || '—'; } }
+function copyText(t) { navigator.clipboard?.writeText(t).then(() => toast('Copied')).catch(() => toast('Copy failed, please select manually')); }
+function fmtTime(ts) { try { return new Date(ts).toLocaleTimeString('en-GB', { hour12: false }); } catch (e) { return ts || '—'; } }
 
 // ---------- Tab ----------
 function showTab(name) {
@@ -554,7 +572,7 @@ function showTab(name) {
   if (name === 'about') loadAbout();
 }
 
-// ---------- 键盘 tab 导航（可访问性） ----------
+// ---------- Keyboard tab navigation (accessibility) ----------
 function initTabKeyboard() {
   const nav = document.querySelector('nav[role="tablist"]');
   if (!nav) return;
@@ -576,7 +594,7 @@ function initTabKeyboard() {
   });
 }
 
-// ---------- 对话测试台（v0.8；v0.9：多轮 + 图片 + effort + 复制/导出） ----------
+// ---------- Chat playground (v0.8; v0.9: multi-turn + images + effort + copy/export) ----------
 let playAbort = null;
 let playHistory = [];      // [{role:'user'|'assistant', content}]
 let playImages = [];       // {name, dataUrl}
@@ -586,12 +604,12 @@ const PLAY_IMG_TYPES = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/w
 function playAddFiles(files, fromPaste) {
   for (const f of Array.from(files || [])) {
     if (!f) continue;
-    if (!f.size) { toast('已拦截空文件：' + (f.name || '未知文件'), 3000); continue; }
+    if (!f.size) { toast('Blocked empty file: ' + (f.name || 'unknown file'), 3000); continue; }
     if (!PLAY_IMG_TYPES.has(String(f.type || '').toLowerCase())) {
-      const msg = '仅支持 JPEG/PNG/GIF/WebP 图片：' + (f.name || '未知文件') + '（' + (f.type || '未知类型') + '）';
+      const msg = 'Only JPEG/PNG/GIF/WebP images supported: ' + (f.name || 'unknown file') + ' (' + (f.type || 'unknown type') + ')';
       if (!fromPaste) toast(msg, 3500); continue;
     }
-    if (f.size > 20 * 1024 * 1024) { toast('图片超过 20MB 上限，已跳过：' + f.name, 3500); continue; }
+    if (f.size > 20 * 1024 * 1024) { toast('Image exceeds 20MB limit, skipped: ' + f.name, 3500); continue; }
     const reader = new FileReader();
     reader.onload = () => { playImages.push({ name: f.name || 'paste-' + playImages.length + '.png', dataUrl: String(reader.result) }); renderPlayImages(); };
     reader.readAsDataURL(f);
@@ -607,7 +625,7 @@ function renderPlayImages() {
   if (!playImages.length) { w.innerHTML = ''; return; }
   w.innerHTML = playImages.map((im, i) =>
     `<span style="position:relative;display:inline-block"><img src="${esc(im.dataUrl)}" style="width:56px;height:56px;border-radius:8px;object-fit:cover;border:1px solid var(--border)" alt=""><button class="sm" style="position:absolute;top:-8px;right:-8px;padding:1px 6px" onclick="playRemoveImage(${i})">✕</button></span>`
-  ).join('') + `<span style="font-size:12px;color:var(--muted)">${playImages.length} 张</span>`;
+  ).join('') + `<span style="font-size:12px;color:var(--muted)">${playImages.length} image(s)</span>`;
 }
 function playRemoveImage(i) { playImages.splice(i, 1); renderPlayImages(); }
 async function loadModelsIntoPlay() {
@@ -618,10 +636,10 @@ async function loadModelsIntoPlay() {
     if (Array.isArray(m.meta)) m.meta.forEach(mm => { if (mm && mm.id) playModelMeta[mm.id] = mm; });
     const cur = sel.value;
     sel.innerHTML = list.length ? list.map(id => `<option value="${esc(id)}" ${id===cur?'selected':''}>${esc(id)}</option>`).join('')
-      : '<option value="">（无模型）</option>';
+      : '<option value="">(no models)</option>';
     if (!list.includes(cur)) sel.value = list[0] || '';
     renderPlayEffort();
-  } catch (e) { sel.innerHTML = `<option value="z-ai/glm-5.3-flash">z-ai/glm-5.3-flash（读取失败，用默认）</option>`; }
+  } catch (e) { sel.innerHTML = `<option value="z-ai/glm-5.3-flash">z-ai/glm-5.3-flash (failed to load, using default)</option>`; }
 }
 function renderPlayEffort() {
   const sel = $('play-effort'); if (!sel) return;
@@ -629,29 +647,59 @@ function renderPlayEffort() {
   const meta = playModelMeta[model];
   const efforts = meta && Array.isArray(meta.efforts) && meta.efforts.length ? meta.efforts : null;
   const cur = sel.value;
-  sel.innerHTML = efforts ? ['<option value="">思考档位（默认）</option>'].concat(efforts.map(e => `<option value="${esc(e)}">${esc(e)}</option>`)).join('') : '';
+  sel.innerHTML = efforts ? ['<option value="">Reasoning effort (default)</option>'].concat(efforts.map(e => `<option value="${esc(e)}">${esc(e)}</option>`)).join('') : '';
   sel.style.display = efforts ? '' : 'none';
   if (cur && efforts && efforts.includes(cur)) sel.value = cur;
   if ($('play-model')) $('play-model').onchange = renderPlayEffort;
 }
+// Minimal markdown: fenced code blocks, inline code, bold. Input is escaped first, so it stays XSS-safe.
+function mdLite(src) {
+  return String(src).split('```').map((part, i) => {
+    if (i % 2) {
+      const nl = part.indexOf('\n');
+      const code = nl >= 0 && /^[\w+#.-]*$/.test(part.slice(0, nl).trim()) ? part.slice(nl + 1) : part;
+      return '<pre><code>' + esc(code.replace(/\n$/, '')) + '</code></pre>';
+    }
+    // blank lines next to a code block would add big gaps (the <pre> already has margins)
+    return esc(part.replace(/^\n+|\n+$/g, '')).replace(/`([^`\n]+)`/g, '<code>$1</code>').replace(/\*\*([^*\n]+)\*\*/g, '<b>$1</b>').replace(/\n/g, '<br>');
+  }).join('');
+}
+function msgHtml(role, content, idx) {
+  if (role === 'user') return `<div class="msg user">${esc(content)}</div>`;
+  const copy = idx == null ? '' : `<button class="ghost sm" onclick="playCopyMsg(${idx})">Copy</button>`;
+  return `<div class="msg assistant"><div class="who">${esc($('play-model') ? $('play-model').value : 'assistant')}${copy}</div>${mdLite(content)}</div>`;
+}
 function renderConversation() {
-  const msgs = playHistory.map(h => `<div class="kv" style="border-bottom:1px solid var(--border);padding:6px 0"><b>${h.role === 'user' ? '🧑 user' : '🤖 assistant'}</b><div style="white-space:pre-wrap;margin-top:2px">${esc(h.content)}</div></div>`).join('');
-  return msgs || '<div class="empty">回复会实时显示在这里</div>';
+  return playHistory.map((h, i) => msgHtml(h.role, h.content, i)).join('') || '<div class="empty">Send a message to start chatting.<br>Multi-turn context is kept on this page.</div>';
+}
+function playCopyMsg(i) {
+  const h = playHistory[i]; if (!h) return;
+  navigator.clipboard?.writeText(h.content).then(() => toast('Copied')).catch(() => toast('Copy failed, please select manually'));
+}
+function playBusy(on) {
+  const send = document.querySelector('#tab-play button[onclick="playSend()"]');
+  if (send) send.style.display = on ? 'none' : '';
+  if ($('play-stop')) $('play-stop').style.display = on ? '' : 'none';
 }
 async function playSend() {
   const out = $('play-output'); if (!out) return;
   const model = $('play-model').value || 'z-ai/glm-5.3-flash';
   const text = $('play-input').value.trim();
   const sys = $('play-system').value.trim();
-  if (!text && !playImages.length) { toast('请输入消息', 3000); return; }
+  if (!text && !playImages.length) { toast('Please enter a message', 3000); return; }
   if (playAbort) playAbort.abort();
   playAbort = new AbortController();
   const effort = $('play-effort') ? $('play-effort').value : '';
-  const btn = document.querySelector('#tab-play button[onclick="playSend()"]'); const btnLabel = btn ? btn.textContent : ''; if (btn) { btn.disabled = true; btn.textContent = playImages.length ? '上传中…' : '发送中…'; }
-  $('play-status').textContent = '请求中…';
+  playBusy(true);
+  // Show the user's message and a typing indicator right away; restore the input if the request fails
+  const shown = text + (playImages.length ? `${text ? '\n' : ''}[${playImages.length} image(s)]` : '');
+  out.innerHTML = renderConversation().replace(/<div class="empty">[\s\S]*<\/div>$/, '') + msgHtml('user', shown) + '<div class="msg assistant typing"></div>';
+  out.scrollTop = out.scrollHeight;
+  $('play-input').value = ''; $('play-input').style.height = '';
+  $('play-status').textContent = playImages.length ? 'Uploading images…' : 'Waiting for the model…';
   const started = Date.now();
   try {
-    // 图片：优先 POST /v1/uploads 换 storageId（多模态链路），失败降级 base64 文本
+    // Images: try POST /v1/uploads for storageId first (multimodal path), fall back to base64 text on failure
     const imgRefs = [];
     for (const im of playImages) {
       try {
@@ -663,10 +711,10 @@ async function playSend() {
           body: bytes, signal: playAbort.signal,
         });
         if (r.ok) { const j = await r.json().catch(() => ({})); imgRefs.push(j.storageId || j.url || j.data || j.data_url || j.path || im.dataUrl); }
-        else { imgRefs.push(im.dataUrl); toast('图片上传失败，已降级 base64', 3000); }
+        else { imgRefs.push(im.dataUrl); toast('Image upload failed, falling back to base64', 3000); }
       } catch (e2) { imgRefs.push(im.dataUrl); }
     }
-    const userContent = imgRefs.length ? `${text ? text + '\n' : ''}[图片] ${imgRefs.join(' ')}` : text;
+    const userContent = imgRefs.length ? `${text ? text + '\n' : ''}[Image] ${imgRefs.join(' ')}` : text;
     const msgs = [];
     if (sys) msgs.push({ role: 'system', content: sys });
     playHistory.forEach(h => msgs.push(h));
@@ -684,7 +732,7 @@ async function playSend() {
       try { msg = JSON.parse(err).error?.message || msg; } catch (e3) {}
       throw new Error(msg);
     }
-    out.innerHTML = renderConversation();
+    $('play-status').textContent = 'Streaming…';
     const reader = resp.body.getReader();
     const dec = new TextDecoder();
     let buf = '', content = '', asstEl = null;
@@ -703,45 +751,46 @@ async function playSend() {
           const delta = (j.choices && j.choices[0] && j.choices[0].delta && (j.choices[0].delta.content || '')) || '';
           if (delta) {
             content += delta;
-            if (!asstEl) { out.insertAdjacentHTML('beforeend', `<div class="kv" style="border-bottom:1px solid var(--border);padding:6px 0"><b>🤖 assistant</b><div style="white-space:pre-wrap;margin-top:2px">${esc(content)}</div></div>`); asstEl = out.lastElementChild; }
-            else { out.lastElementChild.lastElementChild.textContent = content; }
+            if (!asstEl) { asstEl = out.querySelector('.msg.typing'); if (asstEl) asstEl.classList.remove('typing'); }
+            if (asstEl) asstEl.innerHTML = mdLite(content);
             out.scrollTop = out.scrollHeight;
           }
-        } catch (e4) { /* 忽略中间块 */ }
+        } catch (e4) { /* ignore intermediate chunk */ }
       }
     }
     playHistory.push({ role: 'user', content: userContent });
     if (content) playHistory.push({ role: 'assistant', content });
-    $('play-status').textContent = content ? `完成（${Date.now()-started}ms，${content.length} 字符）` : '完成（无内容）';
-    $('play-input').value = '';
+    out.innerHTML = renderConversation(); out.scrollTop = out.scrollHeight;
+    $('play-status').textContent = content ? `Done in ${((Date.now()-started)/1000).toFixed(1)}s · ${content.length} characters` : 'Done (no content)';
     playImages = []; renderPlayImages();
   } catch (e) {
-    if (e.name === 'AbortError') { $('play-status').textContent = '已停止'; }
-    else { out.innerHTML = renderConversation() + `<div class="lv-error">❌ 请求失败：${esc(e.message)}</div>`; $('play-status').textContent = '失败（' + (Date.now()-started) + 'ms）'; }
-  } finally { if (playAbort) playAbort = null; const btn2 = document.querySelector('#tab-play button[onclick="playSend()"]'); if (btn2) { btn2.disabled = false; if (btnLabel) btn2.textContent = btnLabel; } }
+    if (!$('play-input').value) $('play-input').value = text;
+    if (e.name === 'AbortError') { out.innerHTML = renderConversation(); $('play-status').textContent = 'Stopped'; }
+    else { out.innerHTML = renderConversation().replace(/<div class="empty">[\s\S]*<\/div>$/, '') + `<div class="msg error">Request failed: ${esc(e.message)}</div>`; $('play-status').textContent = 'Failed after ' + ((Date.now()-started)/1000).toFixed(1) + 's'; }
+    out.scrollTop = out.scrollHeight;
+  } finally { if (playAbort) playAbort = null; playBusy(false); }
 }
 function playStop() { if (playAbort) playAbort.abort(); }
 function playNewSession() {
   if (playAbort) playAbort.abort();
   playHistory = []; playImages = [];
-  $('play-output').innerHTML = '<div class="empty">回复会实时显示在这里</div>';
+  $('play-output').innerHTML = renderConversation();
   $('play-status').textContent = ''; $('play-input').value = ''; $('play-system').value = '';
   renderPlayImages();
 }
 function playClear() { playNewSession(); }
 function playCopyOut() {
-  const out = $('play-output');
-  const txt = out ? out.innerText.replace(/^回复会实时显示在这里\n?/, '') : '';
-  if (!txt.trim()) { toast('没有可复制的内容', 2500); return; }
-  navigator.clipboard?.writeText(txt.trim()).then(() => toast('已复制')).catch(() => toast('复制失败，请手动选择'));
+  const last = [...playHistory].reverse().find(h => h.role === 'assistant');
+  if (!last) { toast('Nothing to copy', 2500); return; }
+  navigator.clipboard?.writeText(last.content).then(() => toast('Copied')).catch(() => toast('Copy failed, please select manually'));
 }
 function playExportMd() {
   const md = playHistory.map(h => `**${h.role}**\n\n${h.content}`).join('\n\n---\n\n');
-  if (!md.trim()) { toast('会话为空，无可导出', 2500); return; }
+  if (!md.trim()) { toast('Conversation is empty, nothing to export', 2500); return; }
   const blob = new Blob([md], { type: 'text/markdown' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob); a.download = 'freebuff2api-chat.md'; a.click();
-  URL.revokeObjectURL(a.href); toast('已导出 Markdown');
+  URL.revokeObjectURL(a.href); toast('Markdown exported');
 }
 function base64ToBytes(b64) {
   const bin = atob(b64);
@@ -749,22 +798,22 @@ function base64ToBytes(b64) {
   for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
   return arr;
 }
-// ---------- 设置页（v0.8） ----------
-// 设置项渲染规格（key → label/type/hint）
+// ---------- Settings page (v0.8) ----------
+// Settings item render spec (key -> label/type/hint)
 const SETTINGS_SPEC = [
-  { key: 'listen_addr', label: '监听地址', type: 'text', hint: '改后需重启网关生效（如 127.0.0.1:47821）' },
-  { key: 'memory_enabled', label: '记忆层（默认关）', type: 'switch', hint: '开启后自动记录常用模型/纠正并注入 system 前缀' },
-  { key: 'token_saver', label: 'Token 节省（压缩超长 tool_result）', type: 'switch', hint: '' },
-  { key: 'redact_logs', label: '日志/遥测脱敏', type: 'switch', hint: '把 Cookie/Bearer/authorization 值替换为 ***' },
-  { key: 'skills_inject_mode', label: '技能注入模式', type: 'select', options: ['roster', 'full'], hint: 'roster=只注入名称+描述；full=全量拼接' },
-  { key: 'max_roster_tokens', label: 'Roster 注入 token 预算', type: 'number', hint: '' },
-  { key: 'http_proxy', label: 'HTTP 代理', type: 'text', hint: 'http(s):// 或 socks5:// 开头，留空 = 直连' },
-  { key: 'thread_cleanup_interval_sec', label: '上游会话清理间隔（秒）', type: 'number', hint: '0 = 关闭自动清理' },
-  { key: 'thread_max_age_hours', label: '会话最大保留时长（小时）', type: 'number', hint: '' },
-  { key: 'concurrency_free_slots', label: '免费层并发槽位', type: 'number', hint: '双桶信号量：免费 {槽,普通}' },
-  { key: 'concurrency_free_multi', label: '免费层并发（普通）', type: 'number', hint: '' },
-  { key: 'concurrency_sub_slots', label: '订阅层并发槽位', type: 'number', hint: '订阅 {槽,普通}' },
-  { key: 'concurrency_sub_multi', label: '订阅层并发（普通）', type: 'number', hint: '' },
+  { key: 'listen_addr', label: 'Listen address', type: 'text', hint: 'Requires gateway restart to take effect (e.g. 127.0.0.1:47821)' },
+  { key: 'memory_enabled', label: 'Memory layer (off by default)', type: 'switch', hint: 'When enabled, automatically records frequently used models/corrections and injects a system prefix' },
+  { key: 'token_saver', label: 'Token saver (compress overly long tool_result)', type: 'switch', hint: '' },
+  { key: 'redact_logs', label: 'Log/telemetry redaction', type: 'switch', hint: 'Replaces Cookie/Bearer/authorization values with ***' },
+  { key: 'skills_inject_mode', label: 'Skill injection mode', type: 'select', options: ['roster', 'full'], hint: 'roster = inject name+description only; full = concatenate everything' },
+  { key: 'max_roster_tokens', label: 'Roster injection token budget', type: 'number', hint: '' },
+  { key: 'http_proxy', label: 'HTTP proxy', type: 'text', hint: 'Starts with http(s):// or socks5://, leave empty = direct connection' },
+  { key: 'thread_cleanup_interval_sec', label: 'Upstream session cleanup interval (seconds)', type: 'number', hint: '0 = disable automatic cleanup' },
+  { key: 'thread_max_age_hours', label: 'Maximum session retention time (hours)', type: 'number', hint: '' },
+  { key: 'concurrency_free_slots', label: 'Free tier concurrency slots', type: 'number', hint: 'Dual-bucket semaphore: free {slots, normal}' },
+  { key: 'concurrency_free_multi', label: 'Free tier concurrency (normal)', type: 'number', hint: '' },
+  { key: 'concurrency_sub_slots', label: 'Subscription tier concurrency slots', type: 'number', hint: 'Subscription {slots, normal}' },
+  { key: 'concurrency_sub_multi', label: 'Subscription tier concurrency (normal)', type: 'number', hint: '' },
 ];
 async function loadSettings() {
   const w = $('settings-wrap'); if (!w) return;
@@ -785,52 +834,52 @@ async function loadSettings() {
       }
       return `<div class="panel" style="margin:0"><div class="row"><div style="flex:1"><div style="font-size:13px">${esc(s.label)}</div>${s.hint ? `<div style="font-size:12px;color:var(--muted);margin-top:2px">${esc(s.hint)}</div>` : ''}</div>${ctrl}</div></div>`;
     }).join('') + '</div>';
-  } catch (e) { w.innerHTML = `<div class="empty">设置加载失败：${esc(e.message)}</div>`; }
+  } catch (e) { w.innerHTML = `<div class="empty">Settings failed to load: ${esc(e.message)}</div>`; }
 }
 async function saveSetting(key, value) {
   try {
     const r = await api('/api/config', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ key, value }) });
-    toast((r.message || '已保存') + (r.persisted === false ? '（未找到 config.json，仅本次运行生效）' : ''), 4000);
-    if (key === 'memory_enabled') loadSettings(); // 刷新开关态
-  } catch (e) { toast('保存失败：' + e.message, 5000); }
+    toast((r.message || 'Saved') + (r.persisted === false ? ' (config.json not found, effective for this run only)' : ''), 4000);
+    if (key === 'memory_enabled') loadSettings(); // refresh toggle state
+  } catch (e) { toast('Save failed: ' + e.message, 5000); }
 }
 
-// ---------- 关于页（v0.8） ----------
+// ---------- About page (v0.8) ----------
 async function loadAbout() {
   const w = $('about-wrap'); if (!w) return;
   try {
     const h = await api('/healthz');
-    const ver = h.version || '未知';
+    const ver = h.version || 'unknown';
     w.innerHTML = `
-      <div class="kv"><b>版本</b><span id="about-ver">v${esc(ver)}</span></div>
-      <div class="kv"><b>运行时长</b><span>${fmtUp(h.uptime_sec || 0)}</span></div>
-      <div class="kv"><b>监听地址</b><span>${esc(location.host)}</span></div>
-      <div class="kv"><b>上游</b><span>freebuff.com（逆向免费层）</span></div>
-      <div class="kv"><b>模型数</b><span>${h.model_count ?? '—'}</span></div>
+      <div class="kv"><b>Version</b><span id="about-ver">v${esc(ver)}</span></div>
+      <div class="kv"><b>Uptime</b><span>${fmtUp(h.uptime_sec || 0)}</span></div>
+      <div class="kv"><b>Listen address</b><span>${esc(location.host)}</span></div>
+      <div class="kv"><b>Upstream</b><span>freebuff.com (reverse-engineered free tier)</span></div>
+      <div class="kv"><b>Model count</b><span>${h.model_count ?? '—'}</span></div>
       <div style="margin-top:14px;padding-top:12px;border-top:1px solid var(--border);font-size:13px;color:var(--muted);line-height:1.8">
-        Freebuff2API 将 Freebuff 免费层逆向为 OpenAI/Anthropic 兼容的本地 API 网关。
-        本项目与 OpenAI、Codebuff、Freebuff 无官方关联，仅供交流、实验与学习使用，按"原样"提供，使用者自行承担风险（MIT 协议）。
+        Freebuff2API reverse-engineers Freebuff's free tier into a local OpenAI/Anthropic-compatible API gateway.
+        This project has no official affiliation with OpenAI, Codebuff, or Freebuff. Provided for discussion, experimentation, and learning only, "as is", at the user's own risk (MIT license).
       </div>
-      <div style="margin-top:10px;font-size:12px;color:var(--muted)">安全提示：日志/遥测脱敏默认开启；凭证仅存本机。请勿将监听地址暴露到公网（除非配置 api_keys）。</div>`;
-  } catch (e) { w.innerHTML = `<div class="empty">关于信息加载失败：${esc(e.message)}</div>`; }
+      <div style="margin-top:10px;font-size:12px;color:var(--muted)">Security note: log/telemetry redaction is enabled by default; credentials are stored locally only. Do not expose the listen address to the public internet (unless api_keys is configured).</div>`;
+  } catch (e) { w.innerHTML = `<div class="empty">About info failed to load: ${esc(e.message)}</div>`; }
 }
 function fmtUp(secs) {
-  if (secs < 60) return secs + ' 秒';
-  if (secs < 3600) return Math.floor(secs/60) + ' 分钟';
-  if (secs < 86400) return Math.floor(secs/3600) + ' 小时 ' + Math.floor((secs%3600)/60) + ' 分';
-  return Math.floor(secs/86400) + ' 天';
+  if (secs < 60) return secs + ' sec';
+  if (secs < 3600) return Math.floor(secs/60) + ' min';
+  if (secs < 86400) return Math.floor(secs/3600) + ' hr ' + Math.floor((secs%3600)/60) + ' min';
+  return Math.floor(secs/86400) + ' days';
 }
 
-// ---------- 接入信息（地址 / Key / 客户端配置） ----------
+// ---------- Connection info (address / key / client config) ----------
 let guideCache = null;
 /**
- * 拉取 /api/guide 并渲染「立刻开始请求」卡 + 接入指南。
- * 地址与 Key 都由服务端给出，避免前端硬编码与实际监听地址不一致。
+ * Fetches /api/guide and renders the "Start requesting now" card + connection guide.
+ * Both address and key are provided by the server, to avoid frontend hardcoding mismatching the actual listen address.
  */
 async function loadGuide() {
   let g = null;
   try { g = await api('/api/guide'); } catch (e) { g = null; }
-  // 区分两种"拿不到"：接口明确回了未配置 vs 请求本身失败（后者最常见的原因是已启用 Key 但本地没存）
+  // Distinguish two kinds of "can't get it": the API explicitly says not configured vs the request itself failed (the latter is most commonly because a key is enabled but not stored locally)
   const unknown = !g || !g.ok;
   if (unknown) {
     g = { listen_addr: location.host, openai_base_url: '/v1', anthropic_base_url: '/', api_keys: null, api_key_hint: '', models_count: null, models_sample: [], data_plane_ready: null };
@@ -844,65 +893,65 @@ async function loadGuide() {
     const configured = !!(g.api_keys && g.api_keys.configured);
     const local = apiKey();
     $('c-key').value = unknown
-      ? (local || '（无法读取接入信息 —— 请在页面右上角填入 API Key）')
+      ? (local || '(Failed to load connection info -- please fill in the API Key at the top right of the page)')
       : (configured
-        ? (local || '（已启用校验 — 点「生成并启用 Key」或把已有 Key 粘到右上角输入框）')
+        ? (local || '(Validation enabled -- click "Generate & Enable Key" or paste an existing key into the top-right input box)')
         : 'sk-local');
     $('c-key-hint').innerHTML = unknown
-      ? `⚠️ 读取接入信息失败${local ? '（本地已存 Key，若仍失败说明 Key 不正确）' : ''} —— 若你在 config.json 配置了 api_keys，请把它粘到页面右上角的输入框。`
+      ? `⚠️ Failed to load connection info${local ? ' (a key is stored locally; if it still fails, the key is incorrect)' : ''} -- if you configured api_keys in config.json, please paste it into the input box at the top right of the page.`
       : (configured
-        ? `🔒 已启用 API Key 校验（${g.api_keys.count} 个：${(g.api_keys.masked || []).map(esc).join('、')}）。客户端必须填对 Key。`
-        : `🔓 未配置 API Key —— 仅本机可访问，客户端随便填一个非空字符串（如 <code>sk-local</code>）即可。`);
+        ? `🔒 API Key validation enabled (${g.api_keys.count}: ${(g.api_keys.masked || []).map(esc).join(', ')}). Clients must supply the correct key.`
+        : `🔓 No API Key configured -- accessible only from this machine, clients can fill in any non-empty string (e.g. <code>sk-local</code>).`);
     $('c-model-hint').innerHTML = unknown
-      ? '模型列表与可用数量需要鉴权后才能读取。'
-      : `可用模型 <b>${g.models_count}</b> 个${(g.models_sample || []).length ? '，例如 ' + g.models_sample.slice(0, 3).map(esc).join('、') + ' …' : ''}（完整列表：<code>${esc(base)}/v1/models</code>）`;
+      ? 'The model list and count require authentication to read.'
+      : `<b>${g.models_count}</b> models available${(g.models_sample || []).length ? ', e.g. ' + g.models_sample.slice(0, 3).map(esc).join(', ') + ' ...' : ''} (full list: <code>${esc(base)}/v1/models</code>)`;
     $('connect-ready').innerHTML = g.data_plane_ready === true
-      ? '<span class="tok">✅ 凭证已就绪，可以开始请求</span>'
+      ? '<span class="tok">✅ Credentials ready, you can start making requests</span>'
       : g.data_plane_ready === false
-        ? '<span class="twarn">⚠️ 还没有凭证 —— 先去「账号」页一键登录</span>'
-        : '<span style="color:var(--muted)">状态未知（需要鉴权）</span>';
+        ? '<span class="twarn">⚠️ No credentials yet -- go to the "Account" tab and one-click login first</span>'
+        : '<span style="color:var(--muted)">Status unknown (authentication required)</span>';
   }
   fillGuide(g);
 }
 async function genApiKey() {
-  if (!confirm('生成新的 API Key 并立即生效？\n\n生成后你的客户端需要填这个新 Key（本面板会自动记住）。')) return;
+  if (!confirm('Generate a new API Key and apply it immediately?\n\nAfter generating, your client must use this new key (this panel will remember it automatically).')) return;
   try {
     const r = await api('/api/config/api-key', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ action: 'generate' }) });
     if (r.key) { try { localStorage.setItem('freebuff_api_key', r.key); } catch (e) {} }
-    toast(r.message || '已生成', 6000);
+    toast(r.message || 'Generated', 6000);
     loadGuide();
-  } catch (e) { toast('生成失败：' + e.message, 7000); }
+  } catch (e) { toast('Generation failed: ' + e.message, 7000); }
 }
 async function clearApiKey() {
-  if (!confirm('清除 API Key？\n\n清除后网关变回「仅本机可访问、Key 随便填」模式。')) return;
+  if (!confirm('Clear the API Key?\n\nAfter clearing, the gateway reverts to "local access only, any key accepted" mode.')) return;
   try {
     const r = await api('/api/config/api-key', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ action: 'clear' }) });
     try { localStorage.removeItem('freebuff_api_key'); } catch (e) {}
-    toast(r.message || '已清除', 6000);
+    toast(r.message || 'Cleared', 6000);
     loadGuide();
-  } catch (e) { toast('清除失败：' + e.message, 7000); }
+  } catch (e) { toast('Clear failed: ' + e.message, 7000); }
 }
 function fillGuide(g) {
   const base = location.origin;
-  const key = (g && g.api_keys && g.api_keys.configured) ? (apiKey() || '<你在面板生成的 Key>') : 'sk-local';
+  const key = (g && g.api_keys && g.api_keys.configured) ? (apiKey() || '<the key you generated in the panel>') : 'sk-local';
   const model = (g && (g.models_sample || [])[0]) || 'z-ai/glm-5.3-flash';
   const gb = $('guide-base'); if (gb) gb.textContent = base;
   const gk = $('guide-key-hint');
   if (gk) gk.innerHTML = (g && g.api_keys && g.api_keys.configured)
-    ? '已在面板生成并启用了 API Key —— 客户端必须填这个 Key（本页面右上角已自动记住）'
-    : 'config.json 未配置 api_keys 时，任意字符串即可（如 <code>sk-local</code>）';
-  $('g-claude').textContent = `# macOS / Linux\nexport ANTHROPIC_BASE_URL=${base}\nexport ANTHROPIC_API_KEY=${key}\n\n# Windows PowerShell\n$env:ANTHROPIC_BASE_URL="${base}"\n$env:ANTHROPIC_API_KEY="${key}"\n\n# 然后正常启动 Claude Code 即可（claude 命令）`;
-  $('g-openai').textContent = `Base URL: ${base}/v1\nAPI Key:  ${key}\n模型:     在 ${base}/v1/models 中选一个（共 ${(g && g.models_count) || '?'} 个）`;
-  $('g-py').textContent = `from openai import OpenAI\nclient = OpenAI(base_url="${base}/v1", api_key="${key}")\nresp = client.chat.completions.create(model="${model}", messages=[{"role":"user","content":"你好"}])\nprint(resp.choices[0].message.content)`;
-  $('g-node').textContent = `import OpenAI from "openai";\nconst client = new OpenAI({ baseURL: "${base}/v1", apiKey: "${key}" });\nconst r = await client.chat.completions.create({ model: "${model}", messages: [{ role: "user", content: "你好" }] });\nconsole.log(r.choices[0].message.content);`;
-  $('g-curl').textContent = `curl ${base}/v1/chat/completions \\\n  -H "content-type: application/json" \\\n  -H "authorization: Bearer ${key}" \\\n  -d "{\\"model\\":\\"${model}\\",\\"messages\\":[{\\"role\\":\\"user\\",\\"content\\":\\"说句话证明通啦\\"}]}"`;
-  $('g-lobe').textContent = `接口地址: ${base}/v1\nAPI Key:  ${key}\n模型名:   手动填 /v1/models 列表中的值（如 ${model}）`;
+    ? 'API Key generated and enabled in the panel -- clients must supply this key (already remembered at the top right of this page)'
+    : 'When api_keys is not configured in config.json, any string works (e.g. <code>sk-local</code>)';
+  $('g-claude').textContent = `# macOS / Linux\nexport ANTHROPIC_BASE_URL=${base}\nexport ANTHROPIC_API_KEY=${key}\n\n# Windows PowerShell\n$env:ANTHROPIC_BASE_URL="${base}"\n$env:ANTHROPIC_API_KEY="${key}"\n\n# Then start Claude Code as usual (the claude command)`;
+  $('g-openai').textContent = `Base URL: ${base}/v1\nAPI Key:  ${key}\nModel:    pick one from ${base}/v1/models (${(g && g.models_count) || '?'} total)`;
+  $('g-py').textContent = `from openai import OpenAI\nclient = OpenAI(base_url="${base}/v1", api_key="${key}")\nresp = client.chat.completions.create(model="${model}", messages=[{"role":"user","content":"Hello"}])\nprint(resp.choices[0].message.content)`;
+  $('g-node').textContent = `import OpenAI from "openai";\nconst client = new OpenAI({ baseURL: "${base}/v1", apiKey: "${key}" });\nconst r = await client.chat.completions.create({ model: "${model}", messages: [{ role: "user", content: "Hello" }] });\nconsole.log(r.choices[0].message.content);`;
+  $('g-curl').textContent = `curl ${base}/v1/chat/completions \\\n  -H "content-type: application/json" \\\n  -H "authorization: Bearer ${key}" \\\n  -d "{\\"model\\":\\"${model}\\",\\"messages\\":[{\\"role\\":\\"user\\",\\"content\\":\\"Say something to prove the connection works\\"}]}"`;
+  $('g-lobe').textContent = `Endpoint: ${base}/v1\nAPI Key:  ${key}\nModel:    manually enter a value from the /v1/models list (e.g. ${model})`;
 }
 
-// ---------- 总览 ----------
+// ---------- Overview ----------
 let lastHealth = null;
-let authWarned = false;      // 鉴权失败只提示一次，不狂闪
-let overviewTimer = null;    // 总览自动刷新句柄（鉴权失败时暂停，填 Key 后恢复）
+let authWarned = false;      // only warn once on auth failure, avoid flashing repeatedly
+let overviewTimer = null;    // overview auto-refresh handle (paused on auth failure, resumed after key is filled in)
 async function refreshOverview() {
   try {
     const health = await api('/healthz');
@@ -911,21 +960,21 @@ async function refreshOverview() {
     $('ver').textContent = 'v' + (health.version || '');
     const accs = health.accounts || [];
     const alive = accs.filter(a => a.healthy).length;
-    $('hstat').innerHTML = `账号 <b>${alive}/${accs.length}</b> · 运行 <b>${Math.floor((health.uptime_sec || 0) / 60)}m</b>`;
+    $('hstat').innerHTML = `Accounts <b>${alive}/${accs.length}</b> · Uptime <b>${Math.floor((health.uptime_sec || 0) / 60)}m</b>`;
     const totals = await api('/api/usage/totals');
     const cards = [
-      ['总请求', totals.total_requests ?? 0],
-      ['总 Token', (totals.total_tokens ?? 0).toLocaleString()],
-      ['错误', totals.errors ?? 0],
-      ['账号', `${alive}/${accs.length}`],
+      ['Total requests', totals.total_requests ?? 0],
+      ['Total tokens', (totals.total_tokens ?? 0).toLocaleString()],
+      ['Errors', totals.errors ?? 0],
+      ['Accounts', `${alive}/${accs.length}`],
     ];
     $('cards').innerHTML = cards.map(([l, n]) => `<div class="card"><div class="lbl">${l}</div><div class="num">${n}</div></div>`).join('');
-    // 速率与错误率（免费层无货币成本，诚实标注来源）
+    // Rate and error rate (free tier has no monetary cost, honestly label the source)
     try {
       const cost = await api('/api/usage/cost');
-      $('cost-line').innerHTML = `近 ${cost.window_minutes} 分钟：<b>${cost.requests_30m}</b> 请求 · 错误率 <b>${((cost.error_rate_30m || 0) * 100).toFixed(0)}%</b> · 平均延迟 <b>${((cost.avg_latency_ms_30m || 0) / 1000).toFixed(1)}s</b> · 约 <b>${cost.requests_per_hour}</b> 请求/小时 <span style="opacity:.7">（${esc(cost.cost_source || '')}）</span>`;
+      $('cost-line').innerHTML = `Last ${cost.window_minutes} min: <b>${cost.requests_30m}</b> requests · error rate <b>${((cost.error_rate_30m || 0) * 100).toFixed(0)}%</b> · avg latency <b>${((cost.avg_latency_ms_30m || 0) / 1000).toFixed(1)}s</b> · approx. <b>${cost.requests_per_hour}</b> requests/hour <span style="opacity:.7">(${esc(cost.cost_source || '')})</span>`;
     } catch (e) { $('cost-line').textContent = ''; }
-    // 凭证冷却警告（v0.10 §2.2）：熔断账号提示 + 一键去账号页
+    // Credential cooldown warning (v0.10 §2.2): circuit-broken account notice + one-click jump to account page
     const cw = $('cred-warn');
     if (cw) {
       try {
@@ -933,57 +982,57 @@ async function refreshOverview() {
         const cooling = (h.accounts || []).filter(a => a.circuit_state === 'open' || a.circuit_state === 'half_open');
         if (cooling.length) {
           const secs = cooling.map(a => parseCooldownSec(a.cooldown_until)).filter(n => n >= 0);
-          const secText = secs.length ? `，最快约 ${Math.round(Math.min(...secs))} 秒后恢复` : '';
-          cw.innerHTML = `<div class="banner"><b>⚠️ ${cooling.length} 个账号冷却中${secText}</b> <span style="font-size:12px;color:var(--muted)">（401/403 或连续失败触发；到期自动恢复）</span> <button class="ghost sm" onclick="showTab('account')">去账号页</button></div>`;
+          const secText = secs.length ? `, fastest recovery in about ${Math.round(Math.min(...secs))}s` : '';
+          cw.innerHTML = `<div class="banner"><b>⚠️ ${cooling.length} account(s) cooling down${secText}</b> <span style="font-size:12px;color:var(--muted)">(triggered by 401/403 or repeated failures; recovers automatically on expiry)</span> <button class="ghost sm" onclick="showTab('account')">Go to Account tab</button></div>`;
         } else { cw.innerHTML = ''; }
       } catch (e5) { cw.innerHTML = ''; }
     }
-    // 无账号引导
+    // No-account onboarding
     if (accs.length === 0) {
-      $('banner').innerHTML = `<div class="banner"><h2>👋 三步开始使用</h2><ol>
-        <li><b>添加账号</b>：切到「账号」页粘贴 Cookie，或桌面版托盘「一键登录」</li>
-        <li><b>接入客户端</b>：切到「接入指南」页，复制配置到 Claude Code / Cursor 等</li>
-        <li><b>开始对话</b>：回来这里就能看到请求、Token、日志与体检</li></ol></div>`;
+      $('banner').innerHTML = `<div class="banner"><h2>👋 Get started in three steps</h2><ol>
+        <li><b>Add an account</b>: switch to the "Account" tab and paste a Cookie, or use "One-click login" in the desktop tray app</li>
+        <li><b>Connect a client</b>: switch to the "Connection Guide" tab and copy the config into Claude Code / Cursor, etc.</li>
+        <li><b>Start chatting</b>: come back here to see requests, tokens, logs, and health</li></ol></div>`;
     } else { $('banner').innerHTML = ''; }
-    // 账号表
-    $('acc-wrap').innerHTML = accs.length ? `<table><thead><tr><th>账号</th><th>状态</th><th>评分</th><th>会话</th><th>错误</th></tr></thead><tbody>${
+    // Account table
+    $('acc-wrap').innerHTML = accs.length ? `<table><thead><tr><th>Account</th><th>Status</th><th>Score</th><th>Session</th><th>Error</th></tr></thead><tbody>${
       accs.map(a => {
         const st = a.session?.status || 'unknown';
         const cls = (st === 'active' || a.healthy) ? 'ok' : (st === 'queued' ? 'warn' : 'err');
         return `<tr><td>${esc(a.name)}</td><td>${badge(st, cls)}</td><td>${Math.round(a.score ?? 0)}</td><td>${a.session?.instance_id ? esc(String(a.session.instance_id).slice(0, 8)) + '…' : '—'}</td><td>${esc(a.last_error || a.session?.last_error || '')}</td></tr>`;
-      }).join('')}</tbody></table>` : '<div class="empty">还没有账号 — 去「账号」页添加</div>';
-    // 用量
+      }).join('')}</tbody></table>` : '<div class="empty">No accounts yet -- add one on the "Account" tab</div>';
+    // Usage
     const daily = await api('/api/usage/daily');
-    $('daily-wrap').innerHTML = (daily && daily.length) ? `<table><thead><tr><th>日期</th><th>模型</th><th>请求</th><th>输入tok</th><th>输出tok</th><th>错误</th></tr></thead><tbody>${
-      daily.slice(0, 30).map(d => `<tr><td>${esc(d.date)}</td><td>${esc(d.model)}</td><td>${d.requests}</td><td>${d.prompt_tokens}</td><td>${d.completion_tokens}</td><td>${d.errors}</td></tr>`).join('')}</tbody></table>` : '<div class="empty">暂无用量 — 发起一次对话后这里会有数据</div>';
-    // 请求
+    $('daily-wrap').innerHTML = (daily && daily.length) ? `<table><thead><tr><th>Date</th><th>Model</th><th>Requests</th><th>Input tok</th><th>Output tok</th><th>Errors</th></tr></thead><tbody>${
+      daily.slice(0, 30).map(d => `<tr><td>${esc(d.date)}</td><td>${esc(d.model)}</td><td>${d.requests}</td><td>${d.prompt_tokens}</td><td>${d.completion_tokens}</td><td>${d.errors}</td></tr>`).join('')}</tbody></table>` : '<div class="empty">No usage yet -- data will appear here after your first conversation</div>';
+    // Requests
     const reqs = await api('/api/usage/requests');
-    $('reqs-wrap').innerHTML = (reqs && reqs.length) ? `<table><thead><tr><th>时间</th><th>账号</th><th>模型</th><th>状态</th><th>延迟</th><th>Tokens</th></tr></thead><tbody>${
+    $('reqs-wrap').innerHTML = (reqs && reqs.length) ? `<table><thead><tr><th>Time</th><th>Account</th><th>Model</th><th>Status</th><th>Latency</th><th>Tokens</th></tr></thead><tbody>${
       reqs.slice(0, 20).map(r => {
         const cls = r.status < 400 ? 'ok' : (r.status < 500 ? 'warn' : 'err');
         const tk = (r.prompt_tokens || 0) + (r.completion_tokens || 0);
         return `<tr class="click" onclick="openDrawer(${r.id})"><td>${fmtTime(r.ts)}</td><td>${esc(r.account)}</td><td>${esc(r.model)}</td><td>${badge(r.status, cls)}</td><td>${(r.latency_ms / 1000).toFixed(2)}s</td><td>${tk || '—'}</td></tr>`;
-      }).join('')}</tbody></table>` : '<div class="empty">暂无请求记录</div>';
-    // 模型
+      }).join('')}</tbody></table>` : '<div class="empty">No request records yet</div>';
+    // Models
     const models = await api('/api/usage/models');
     $('model-count').textContent = (models || []).length;
-    $('models-wrap').innerHTML = (models || []).map(m => `<span class="chip">${esc(m)}</span>`).join('') || '<div class="empty">模型列表为空（检查上游连通性）</div>';
+    $('models-wrap').innerHTML = (models || []).map(m => `<span class="chip">${esc(m)}</span>`).join('') || '<div class="empty">Model list is empty (check upstream connectivity)</div>';
     if (authWarned) { authWarned = false; $('banner').innerHTML = ''; }
     if (!overviewTimer) startOverviewTimer();
   } catch (e) {
     $('dot').className = 'dot err';
     const m = String(e.message || '');
-    // 网关启用了 API Key 而浏览器还没填：给一次性引导，并暂停自动刷新（否则红灯 + toast 每 6 秒狂闪）
+    // The gateway has API Key enabled but the browser hasn't filled it in yet: show a one-time hint and pause auto-refresh (otherwise the red dot + toast would flash every 6 seconds)
     if (/unauthorized|api key|鉴权|认证/i.test(m)) {
       if (!authWarned) {
         authWarned = true;
-        toast('该网关已启用 API Key 校验 —— 请在页面右上角输入框填入 Key', 8000);
-        $('banner').innerHTML = `<div class="banner"><h2>🔑 需要鉴权</h2>
-          <p style="font-size:13px;color:var(--muted);margin-top:6px">网关配置了 <code>api_keys</code>。在<b>页面右上角的输入框</b>填入 Key（只存本机浏览器），填完这里会自动恢复。</p></div>`;
+        toast('This gateway has API Key validation enabled -- please fill in the key in the input box at the top right of the page', 8000);
+        $('banner').innerHTML = `<div class="banner"><h2>🔑 Authentication required</h2>
+          <p style="font-size:13px;color:var(--muted);margin-top:6px">The gateway has <code>api_keys</code> configured. Fill in the key in the <b>input box at the top right of the page</b> (stored only in this browser); this will resume automatically once done.</p></div>`;
         if (overviewTimer) { clearInterval(overviewTimer); overviewTimer = null; }
       }
     } else {
-      toast('加载失败: ' + m);
+      toast('Load failed: ' + m);
     }
   }
 }
@@ -1005,80 +1054,80 @@ async function loadBalance() {
     const r = await fetch('/api/account/balance', { headers: apiKey() ? { authorization: 'Bearer ' + apiKey() } : {} });
     if (!r.ok) {
       $('balance-panel').style.display = '';
-      $('balance-wrap').innerHTML = '<div class="empty">需要 web Cookie 凭证才能查询积分（先在「添加账号」导入 Cookie）</div>';
+      $('balance-wrap').innerHTML = '<div class="empty">A web Cookie credential is required to check balance (import a Cookie under "Add Account" first)</div>';
       return;
     }
     const bal = await r.json();
     if (bal && bal.ok !== false) {
       $('balance-panel').style.display = '';
       const d = bal.freebucks?.daily || {};
-      let html = `<p style="font-size:13px;color:var(--muted)">套餐 <b>${esc(bal.subscription?.tierId || '免费')}</b> · 层级 ${esc(bal.access_tier || '—')}${bal.country_block_reason ? ' · ⚠️ 地区受限(' + esc(bal.country_block_reason) + ')' : ''}</p>`;
-      if (d.limit != null) html += `<p style="font-size:13px;color:var(--muted)">今日积分 <b class="tok">${d.remaining ?? '—'}</b> / ${d.limit ?? '—'}（已用 ${d.spent ?? 0}）</p>`;
+      let html = `<p style="font-size:13px;color:var(--muted)">Plan <b>${esc(bal.subscription?.tierId || 'Free')}</b> · Tier ${esc(bal.access_tier || '—')}${bal.country_block_reason ? ' · ⚠️ Region restricted(' + esc(bal.country_block_reason) + ')' : ''}</p>`;
+      if (d.limit != null) html += `<p style="font-size:13px;color:var(--muted)">Today's credits <b class="tok">${d.remaining ?? '—'}</b> / ${d.limit ?? '—'} (used ${d.spent ?? 0})</p>`;
       const mr = bal.model_remaining || {};
-      const rows = Object.entries(mr).slice(0, 30).map(([m, v]) => `<tr><td>${esc(m)}</td><td>${v.price === 0 ? '<b class="tok">免费</b>' : v.price}</td><td>${v.usable_today === -1 ? '不限' : v.usable_today}</td></tr>`).join('');
-      if (rows) html += `<table style="margin-top:8px"><thead><tr><th>模型</th><th>积分价</th><th>今日剩余</th></tr></thead><tbody>${rows}</tbody></table>`;
+      const rows = Object.entries(mr).slice(0, 30).map(([m, v]) => `<tr><td>${esc(m)}</td><td>${v.price === 0 ? '<b class="tok">Free</b>' : v.price}</td><td>${v.usable_today === -1 ? 'Unlimited' : v.usable_today}</td></tr>`).join('');
+      if (rows) html += `<table style="margin-top:8px"><thead><tr><th>Model</th><th>Credit price</th><th>Remaining today</th></tr></thead><tbody>${rows}</tbody></table>`;
       $('balance-wrap').innerHTML = html;
     } else {
       $('balance-panel').style.display = '';
-      $('balance-wrap').innerHTML = '<div class="empty">需要 web Cookie 凭证才能查询积分（先在「添加账号」导入 Cookie）</div>';
+      $('balance-wrap').innerHTML = '<div class="empty">A web Cookie credential is required to check balance (import a Cookie under "Add Account" first)</div>';
     }
-  } catch (e) { /* 无 Cookie 时静默 */ }
+  } catch (e) { /* Silent when there's no Cookie */ }
 }
 
-// ---------- 请求详情 ----------
+// ---------- Request details ----------
 async function openDrawer(id) {
   $('drawer').classList.add('open');
-  $('dr-title').textContent = '请求 #' + id;
-  $('dr-body').innerHTML = '<div class="empty">加载中…</div>';
+  $('dr-title').textContent = 'Request #' + id;
+  $('dr-body').innerHTML = '<div class="empty">Loading…</div>';
   try {
     const d = await api('/api/usage/requests/' + id);
     const r = d.request || {};
     const events = d.events || [];
     let html = '';
-    html += `<div class="kv"><b>时间</b>${esc(r.ts)}</div>`;
-    html += `<div class="kv"><b>端点</b>${esc(r.endpoint || '—')}</div>`;
-    html += `<div class="kv"><b>账号</b>${esc(r.account)}</div>`;
-    html += `<div class="kv"><b>请求模型</b>${esc(r.requested_model || r.model)}</div>`;
-    html += `<div class="kv"><b>实际模型</b>${esc(r.resolved_model || r.model)}</div>`;
-    html += `<div class="kv"><b>状态</b>${r.status} ${esc(r.error_kind ? '(' + r.error_kind + ')' : '')}</div>`;
-    html += `<div class="kv"><b>延迟</b>${(r.latency_ms / 1000).toFixed(2)}s${r.ttft_ms ? '（首字节 ' + r.ttft_ms + 'ms）' : ''}</div>`;
+    html += `<div class="kv"><b>Time</b>${esc(r.ts)}</div>`;
+    html += `<div class="kv"><b>Endpoint</b>${esc(r.endpoint || '—')}</div>`;
+    html += `<div class="kv"><b>Account</b>${esc(r.account)}</div>`;
+    html += `<div class="kv"><b>Requested model</b>${esc(r.requested_model || r.model)}</div>`;
+    html += `<div class="kv"><b>Resolved model</b>${esc(r.resolved_model || r.model)}</div>`;
+    html += `<div class="kv"><b>Status</b>${r.status} ${esc(r.error_kind ? '(' + r.error_kind + ')' : '')}</div>`;
+    html += `<div class="kv"><b>Latency</b>${(r.latency_ms / 1000).toFixed(2)}s${r.ttft_ms ? ' (first byte ' + r.ttft_ms + 'ms)' : ''}</div>`;
     if (r.latency_ms) {
       const ttftPct = r.ttft_ms != null ? Math.max(0, Math.min(100, Math.round(r.ttft_ms / r.latency_ms * 100))) : null;
-      html += `<div style="margin-top:10px"><b style="font-size:12px">⏱ 耗时时间线</b>` +
+      html += `<div style="margin-top:10px"><b style="font-size:12px">⏱ Timing timeline</b>` +
         `<div style="position:relative;height:8px;background:#21262d;border-radius:4px;margin-top:6px">` +
         `<div style="position:absolute;left:0;top:0;height:8px;border-radius:4px;background:var(--accent);width:${ttftPct == null ? 100 : ttftPct}%"></div>` +
         (ttftPct != null ? `<div style="position:absolute;left:${ttftPct}%;width:2px;height:8px;background:var(--warn)"></div>` : '') +
-        `</div><div style="display:flex;font-size:11px;color:var(--muted);margin-top:4px"><span>首字节 ${r.ttft_ms != null ? r.ttft_ms + 'ms' : '—'}</span><span style="flex:1"></span><span>总耗时 ${(r.latency_ms / 1000).toFixed(2)}s</span></div></div>`;
+        `</div><div style="display:flex;font-size:11px;color:var(--muted);margin-top:4px"><span>First byte ${r.ttft_ms != null ? r.ttft_ms + 'ms' : '—'}</span><span style="flex:1"></span><span>Total time ${(r.latency_ms / 1000).toFixed(2)}s</span></div></div>`;
     }
-    html += `<div class="kv"><b>Tokens</b>输入 ${r.prompt_tokens || 0} / 输出 ${r.completion_tokens || 0}</div>`;
-    if (r.route_reason) html += `<div class="kv"><b>路由原因</b>${esc(r.route_reason)}</div>`;
-    if (r.error_excerpt) html += `<details open><summary>错误详情</summary><pre>${esc(r.error_excerpt)}</pre></details>`;
-    html += `<div class="kv" style="margin-top:10px"><b>人话解释</b>${esc(explain(r))}</div>`;
-    if (events.length) html += `<details open><summary>事件链（${events.length}）</summary>${events.map(e => `<div class="kv" style="font-size:12px"><b>${fmtTime(e.ts)} ${esc(e.kind)}</b>${esc(e.detail)}</div>`).join('')}</details>`;
+    html += `<div class="kv"><b>Tokens</b>input ${r.prompt_tokens || 0} / output ${r.completion_tokens || 0}</div>`;
+    if (r.route_reason) html += `<div class="kv"><b>Route reason</b>${esc(r.route_reason)}</div>`;
+    if (r.error_excerpt) html += `<details open><summary>Error details</summary><pre>${esc(r.error_excerpt)}</pre></details>`;
+    html += `<div class="kv" style="margin-top:10px"><b>Explanation</b>${esc(explain(r))}</div>`;
+    if (events.length) html += `<details open><summary>Event chain (${events.length})</summary>${events.map(e => `<div class="kv" style="font-size:12px"><b>${fmtTime(e.ts)} ${esc(e.kind)}</b>${esc(e.detail)}</div>`).join('')}</details>`;
     $('dr-body').innerHTML = html;
-  } catch (e) { $('dr-body').innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`; }
+  } catch (e) { $('dr-body').innerHTML = `<div class="empty">Load failed: ${esc(e.message)}</div>`; }
 }
 function closeDrawer() { $('drawer').classList.remove('open'); }
 function explain(r) {
   const k = r.error_kind || '';
-  if (k === 'waiting_room') return '上游免费队列排队中 —— 这不是网关故障，稍等重试即可。';
-  if (k === 'no_account') return '没有可用账号 —— 去「账号」页添加。';
-  if (k === 'upstream_4xx') return '上游拒绝了这次请求（多为账号凭证过期或模型不可用）。查看错误详情。';
-  if (k === 'upstream_5xx') return '上游服务端错误 —— 通常重试即可，网关会自动切换账号。';
-  if (k === 'network' || k === 'timeout') return '网络超时/中断 —— 检查代理设置与上游连通性（体检页可测）。';
-  if (r.status >= 200 && r.status < 300) return '请求成功。' + (r.ttft_ms ? `首字节 ${r.ttft_ms}ms，` : '') + `总耗时 ${(r.latency_ms / 1000).toFixed(2)}s。`;
-  return '暂无解释数据。';
+  if (k === 'waiting_room') return 'Upstream free queue in progress — this is not a gateway fault, just retry shortly.';
+  if (k === 'no_account') return 'No available account — add one on the "Account" page.';
+  if (k === 'upstream_4xx') return 'Upstream rejected this request (usually an expired credential or unavailable model). See error details.';
+  if (k === 'upstream_5xx') return 'Upstream server error — usually just retry, the gateway will switch accounts automatically.';
+  if (k === 'network' || k === 'timeout') return 'Network timeout/interruption — check proxy settings and upstream connectivity (testable on the health check page).';
+  if (r.status >= 200 && r.status < 300) return 'Request succeeded.' + (r.ttft_ms ? `First byte ${r.ttft_ms}ms, ` : '') + `total time ${(r.latency_ms / 1000).toFixed(2)}s.`;
+  return 'No explanation data available.';
 }
 
-// ---------- 余额卡 ----------
-// ---------- 浏览器扩展桥（面板 ↔ 扩展 直连） ----------
-// 扩展的 bridge.js content script 会 postMessage 广播自己的 id；
-// 拿到 id 后本页就能用 chrome.runtime.sendMessage 直接指挥扩展读 Cookie（真正的一键登录）。
+// ---------- Balance card ----------
+// ---------- Browser extension bridge (panel <-> extension direct connection) ----------
+// The extension's bridge.js content script broadcasts its own id via postMessage;
+// once this page has the id, it can use chrome.runtime.sendMessage to directly tell the extension to read the Cookie (true one-click login).
 let extId = null, extVersion = '';
 function pingExtension(showToast) {
   try { window.postMessage({ source: 'freebuff2api-page', type: 'ping' }, location.origin); } catch (e) {}
   if (showToast) setTimeout(() => {
-    toast(extId ? `扩展已就绪（v${extVersion || '?'}）` : '未检测到扩展 —— 可点「⬇ 下载扩展」安装，或用手动向导', 5000);
+    toast(extId ? `Extension ready (v${extVersion || '?'})` : 'Extension not detected — click "⬇ Download extension" to install, or use the manual wizard', 5000);
   }, 600);
 }
 window.addEventListener('message', (e) => {
@@ -1088,20 +1137,20 @@ window.addEventListener('message', (e) => {
   const isNew = extId !== d.id;
   extId = d.id; extVersion = d.version || '';
   renderExtStatus();
-  if (isNew && $('tab-account') && $('tab-account').style.display !== 'none') { /* 首次进入时静默 */ }
+  if (isNew && $('tab-account') && $('tab-account').style.display !== 'none') { /* Silent on first entry */ }
 });
 function renderExtStatus() {
   const el = $('ext-status');
   if (!el) return;
-  if (extId) { el.className = 'badge ok'; el.textContent = `扩展已就绪 v${extVersion || '?'}`; }
-  else { el.className = 'badge dim'; el.textContent = '未检测到扩展（可手动粘贴导入）'; }
+  if (extId) { el.className = 'badge ok'; el.textContent = `Extension ready v${extVersion || '?'}`; }
+  else { el.className = 'badge dim'; el.textContent = 'Extension not detected (you can import by pasting manually)'; }
 }
 function extensionAvailable() {
   return !!extId && typeof chrome !== 'undefined' && chrome.runtime && typeof chrome.runtime.sendMessage === 'function';
 }
 function sendToExtension(msg) {
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error('扩展未在规定时间内响应（可能被浏览器回收，请刷新页面重试）')), 20000);
+    const timer = setTimeout(() => reject(new Error('Extension did not respond within the time limit (it may have been reclaimed by the browser, please refresh and retry)')), 20000);
     try {
       chrome.runtime.sendMessage(extId, msg, (resp) => {
         clearTimeout(timer);
@@ -1116,231 +1165,231 @@ function downloadExtension() {
   window.open('/api/extension/bundle' + (k ? '?key=' + encodeURIComponent(k) : ''), '_blank');
 }
 
-// ---------- 账号 / 导入 ----------
-// ---------- 内嵌 WebView2 登录窗口（网关派生 --login-window 子进程） ----------
+// ---------- Account / import ----------
+// ---------- Embedded WebView2 login window (gateway-spawned --login-window subprocess) ----------
 /**
- * 弹出内嵌登录窗口：后端 spawn `当前exe --login-window`（独立进程，tao+WebView2 事件循环），
- * 用户在窗口里完成 GitHub 登录后由后端自动抓 Cookie（含 HttpOnly）并入库。
- * 结果通过面板轮询 /api/tokens 感知（凭证数量增加即成功）。
+ * Pop up the embedded login window: the backend spawns `current-exe --login-window` (a separate process, tao+WebView2 event loop),
+ * after the user completes GitHub login in the window, the backend automatically captures the Cookie (including HttpOnly) and stores it.
+ * The result is detected by the panel polling /api/tokens (a credential count increase means success).
  */
 async function openEmbedLogin() {
   const st = $('embed-status');
-  if (st) st.textContent = '正在弹出窗口…';
+  if (st) st.textContent = 'Opening window…';
   try {
     const r = await api('/api/login/embed', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
     if (!r.ok) {
-      if (st) st.innerHTML = '<span class="terr">' + esc(r.message || '当前环境不支持') + '</span>';
-      toast('内嵌窗口不可用：' + (r.message || '请改用方案 B/C'), 8000);
+      if (st) st.innerHTML = '<span class="terr">' + esc(r.message || 'not supported in this environment') + '</span>';
+      toast('Embedded window unavailable: ' + (r.message || 'please use plan B/C instead'), 8000);
       return;
     }
-    toast('内嵌登录窗口已弹出 —— 在窗口里完成 GitHub 登录即可自动入库', 8000);
-    if (st) st.innerHTML = '<span class="tok">窗口已弹出，等待登录…</span>';
+    toast('Embedded login window opened — complete GitHub login in the window and it will be stored automatically', 8000);
+    if (st) st.innerHTML = '<span class="tok">Window opened, waiting for login…</span>';
     const before = await tokenCount();
-    // 双通道感知：凭证数量增加（成功）或结果文件报告失败（子进程退出码非 0）
+    // Dual-channel detection: credential count increase (success) or result file reports failure (subprocess exit code non-zero)
     const deadline = Date.now() + 600000;
     while (Date.now() < deadline) {
       await new Promise(res => setTimeout(res, 3000));
       const now = await tokenCount();
       if (before >= 0 && now > before) {
-        toast('✅ 内嵌窗口登录成功，凭证已自动入库', 6000);
-        if (st) st.innerHTML = '<span class="tok">✅ 已入库</span>';
+        toast('✅ Embedded window login succeeded, credential stored automatically', 6000);
+        if (st) st.innerHTML = '<span class="tok">✅ Stored</span>';
         refreshTokens(); refreshAccountOverview(); loadHistory();
         return;
       }
-      // 失败结果文件（子进程异常退出时后端落盘）
+      // Failure result file (written by backend when the subprocess exits abnormally)
       try {
         const fr = await api('/api/login/result');
         if (fr && fr.ok === false && fr.message) {
           if (st) st.innerHTML = '<span class="terr">' + esc(fr.message) + '</span>';
-          toast('内嵌登录窗口退出：' + fr.message, 9000);
+          toast('Embedded login window exited: ' + fr.message, 9000);
           return;
         }
-      } catch (e2) { /* 结果文件接口失败不阻塞主轮询 */ }
+      } catch (e2) { /* Result-file API failure does not block the main polling loop */ }
     }
-    if (st) st.innerHTML = '<span class="twarn">等待超时（10 分钟）</span>';
-    toast('等待登录超时 —— 请重试或改用方案 B/C', 8000);
+    if (st) st.innerHTML = '<span class="twarn">Wait timed out (10 minutes)</span>';
+    toast('Login wait timed out — please retry or use plan B/C instead', 8000);
   } catch (e) {
     if (st) st.innerHTML = '<span class="terr">' + esc(e.message) + '</span>';
-    toast('弹出失败：' + e.message + ' —— 请改用方案 B/C', 8000);
+    toast('Popup failed: ' + e.message + ' — please use plan B/C instead', 8000);
   }
 }
 
 async function oneClickLogin() {
-  // [主控接线] 内嵌窗口分派将插入此处（内嵌 WebView2 登录窗口优先，由主控实现）
-  // 路径 1：桌面版 Electron（主进程可直接读 HttpOnly Cookie）
+  // [Main-control wiring] Embedded window dispatch will be inserted here (embedded WebView2 login window takes priority, implemented by main control)
+  // Path 1: Desktop Electron (main process can read HttpOnly Cookie directly)
   if (window.freebuffDesktop && window.freebuffDesktop.openLogin) {
     window.freebuffDesktop.openLogin();
-    toast('已打开登录窗口，登录 freebuff.com 后 Cookie 会自动入库');
+    toast('Login window opened, the Cookie will be stored automatically after logging into freebuff.com');
     return;
   }
-  // 路径 2：浏览器扩展直连 —— 全自动（自动打开 freebuff.com → 等待登录 → 自动入库）
+  // Path 2: Direct browser extension connection -- fully automatic (auto-opens freebuff.com -> wait for login -> auto store)
   if (extensionAvailable()) {
     await oneClickViaExtension();
     return;
   }
-  // 路径 3：降级为手动向导（高亮"剪贴板自动检测"——步骤最少的手动路径）
+  // Path 3: Fall back to manual wizard (highlight "clipboard auto-detect" -- the manual path with the fewest steps)
   const wiz = $('login-wizard');
   wiz.style.display = '';
   wiz.scrollIntoView({ behavior: 'smooth', block: 'start' });
   const clipCard = $('wizard-clip');
   if (clipCard) {
     clipCard.classList.remove('wizard-flash');
-    // 强制 reflow 让动画可以重复触发
+    // Force reflow so the animation can retrigger
     void clipCard.offsetWidth;
     clipCard.classList.add('wizard-flash');
   }
   window.open('https://freebuff.com/', '_blank', 'noopener');
-  toast('未检测到浏览器扩展 —— 已打开 freebuff.com，推荐用向导「方案 B：自动检测剪贴板」（复制回来点一下即可）', 9000);
+  toast('Browser extension not detected — freebuff.com has been opened, we recommend using the wizard "Plan B: auto-detect clipboard" (just copy and click)', 9000);
 }
 /**
- * 剪贴板自动导入：读取剪贴板文本 → 填入输入框 → 自动触发导入。
- * 剪贴板 API 需要安全上下文且部分浏览器要求页面先获得焦点，失败时明确提示改用手动粘贴（降级路径始终存在）。
+ * Clipboard auto-import: read clipboard text -> fill into the input box -> automatically trigger import.
+ * The clipboard API requires a secure context, and some browsers require the page to be focused first; on failure, clearly prompt to use manual paste instead (a fallback path always exists).
  */
 async function importFromClipboard() {
   const st = $('clip-status');
-  if (st) st.textContent = '正在读取剪贴板…（若浏览器弹窗询问权限，请允许）';
+  if (st) st.textContent = 'Reading clipboard… (if the browser asks for permission, please allow it)';
   let text = '';
   try {
     if (!navigator.clipboard || typeof navigator.clipboard.readText !== 'function') {
-      throw new Error('当前浏览器不支持读取剪贴板（或页面不在 HTTPS/localhost 安全上下文）');
+      throw new Error('This browser does not support reading the clipboard (or the page is not in an HTTPS/localhost secure context)');
     }
     text = (await navigator.clipboard.readText()).trim();
   } catch (e) {
-    if (st) st.innerHTML = `<span class="twarn">读取剪贴板失败：${esc(e.message)}</span> —— 请改用下方输入框手动粘贴（Ctrl+V），效果完全一样`;
-    toast('无法读取剪贴板 —— 请手动粘贴到输入框后点「导入」', 7000);
+    if (st) st.innerHTML = `<span class="twarn">Failed to read clipboard: ${esc(e.message)}</span> — please paste manually into the input box below (Ctrl+V), it works exactly the same`;
+    toast('Could not read clipboard — please paste manually into the input box then click "Import"', 7000);
     $('import-text').focus();
     return;
   }
   if (!text) {
-    if (st) st.innerHTML = '<span class="twarn">剪贴板是空的 —— 请先去 freebuff.com 的 DevTools 里复制 Cookie 整行（Ctrl+C）</span>';
+    if (st) st.innerHTML = '<span class="twarn">Clipboard is empty — first go to freebuff.com DevTools and copy the entire Cookie line (Ctrl+C)</span>';
     return;
   }
-  if (st) st.textContent = '已从剪贴板取到内容，开始自动导入…';
+  if (st) st.textContent = 'Content retrieved from clipboard, starting automatic import…';
   $('import-text').value = text;
-  toast('已从剪贴板读取内容，正在自动导入…', 4000);
+  toast('Content read from clipboard, importing automatically…', 4000);
   await doImport('clipboard');
 }
 /**
- * 导入成功后的即贴即验：找出最新入库的凭证 → 调上游检查端点 → 把结果直接显示在向导里。
- * id 匹配不到时静默跳过（列表刷新已由 doImport 完成，不阻塞主流程）。
+ * Instant verification after successful import: find the most recently stored credential -> call the upstream check endpoint -> show the result directly in the wizard.
+ * Silently skip when the id cannot be matched (list refresh is already handled by doImport, does not block the main flow).
  */
 async function verifyNewCredential() {
   const box = $('import-verify');
   if (!box) return;
   box.style.display = '';
-  box.innerHTML = '<span style="color:var(--muted)">⏳ 正在向上游验证刚导入的凭证…（需要几秒）</span>';
+  box.innerHTML = '<span style="color:var(--muted)">⏳ Verifying the just-imported credential with upstream… (takes a few seconds)</span>';
   try {
     const r = await api('/api/tokens');
     const list = r.tokens || [];
-    // 列表接口不保证排序，比较入库时间取最新一条
+    // The list API does not guarantee ordering, compare stored time to pick the latest one
     const newest = list.slice().sort((a, b) => String(b.added_at || '').localeCompare(String(a.added_at || '')))[0];
     if (!newest || !newest.id) { box.style.display = 'none'; return; }
     const c = await api('/api/tokens/check', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id: newest.id }) });
     if (c.ok && c.valid) {
       const m = c.meta || {};
-      const who = m.email || m.name || '账号信息已更新';
-      box.innerHTML = `<span class="tok">✅ 已验证：${esc(who)}</span> <span style="color:var(--muted)">（${esc([m.name, m.email].filter(Boolean).join(' · ') || '凭证有效')}）</span>`;
+      const who = m.email || m.name || 'Account info updated';
+      box.innerHTML = `<span class="tok">✅ Verified: ${esc(who)}</span> <span style="color:var(--muted)">(${esc([m.name, m.email].filter(Boolean).join(' · ') || 'Credential valid')})</span>`;
     } else {
-      box.innerHTML = `<span class="twarn">⚠️ Cookie 已录入但上游校验失败（可能未登录或已过期），请重新复制</span>${c.message ? `<div style="font-size:12px;color:var(--muted);margin-top:4px">上游说：${esc(c.message)}</div>` : ''}`;
+      box.innerHTML = `<span class="twarn">⚠️ Cookie recorded but upstream verification failed (may not be logged in or has expired), please copy again</span>${c.message ? `<div style="font-size:12px;color:var(--muted);margin-top:4px">Upstream says: ${esc(c.message)}</div>` : ''}`;
     }
   } catch (e) {
-    box.innerHTML = `<span class="twarn">⚠️ 自动验证失败：${esc(e.message)}</span> <span style="color:var(--muted)">—— 凭证已入库，可稍后在凭证列表点「检查」手动验证</span>`;
+    box.innerHTML = `<span class="twarn">⚠️ Automatic verification failed: ${esc(e.message)}</span> <span style="color:var(--muted)">— credential stored, you can manually verify later by clicking "Check" in the credential list</span>`;
   }
 }
 async function oneClickViaExtension() {
-  toast('正在通知扩展…', 3000);
+  toast('Notifying extension…', 3000);
   const before = await tokenCount();
   let resp = null;
   try {
     resp = await sendToExtension({ type: 'freebuff2api.import', gatewayPort: Number(location.port || 47821), apiKey: apiKey() });
   } catch (e) {
-    toast('调用扩展失败：' + e.message, 7000);
+    toast('Failed to call extension: ' + e.message, 7000);
     return;
   }
-  if (resp && resp.ok === false) { toast('扩展返回：' + (resp.message || '导入失败'), 8000); return; }
+  if (resp && resp.ok === false) { toast('Extension returned: ' + (resp.message || 'import failed'), 8000); return; }
   if (resp && resp.done) {
-    // 扩展已同步完成（已登录且已导入 / 或已存在去重）—— 无需轮询
+    // Extension completed synchronously (already logged in and imported / or already existed and was deduplicated) -- no polling needed
     if (resp.added > 0) {
-      toast(`✅ 扩展已导入 ${resp.added} 个凭证`, 6000);
+      toast(`✅ Extension imported ${resp.added} credential(s)`, 6000);
       refreshTokens(); refreshAccountOverview(); loadHistory();
     } else {
-      toast('该账号凭证已在库中（同值自动去重，无需重复导入）', 7000);
+      toast('This account credential is already stored (identical values are auto-deduplicated, no need to import again)', 7000);
       refreshTokens();
     }
     return;
   }
   if (resp && resp.needLogin) {
-    toast('已自动打开 freebuff.com —— 完成 GitHub 登录后凭证会自动入库（最多等 3 分钟）', 9000);
+    toast('freebuff.com opened automatically — the credential will be stored automatically after GitHub login completes (wait up to 3 minutes)', 9000);
   } else {
-    toast('扩展已开始导入，正在等待凭证入库…', 6000);
+    toast('Extension has started importing, waiting for the credential to be stored…', 6000);
   }
   pollForNewCredential(before, 180000);
 }
 async function tokenCount() {
   try { const r = await api('/api/tokens'); return (r.tokens || []).length; } catch (e) { return -1; }
 }
-/** 轮询等待扩展把凭证写进网关（扩展是独立进程，只能靠轮询收敛） */
+/** Poll waiting for the extension to write the credential into the gateway (the extension is a separate process, can only converge via polling) */
 async function pollForNewCredential(before, timeoutMs) {
-  // 基线没取到（before<0）时先补取一次，避免"任何请求成功都误报为入库"
+  // When the baseline was not obtained (before<0), fetch it once first, to avoid "any successful request being falsely reported as stored"
   if (before < 0) before = await tokenCount();
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     await new Promise(r => setTimeout(r, 3000));
     const now = await tokenCount();
     if (before >= 0 && now > before) {
-      toast('✅ 凭证已自动入库，正在拉取账号信息…', 6000);
+      toast('✅ Credential stored automatically, fetching account info…', 6000);
       refreshTokens(); refreshAccountOverview(); loadHistory();
       return;
     }
   }
-  toast('等待登录超时 —— 完成登录后点扩展图标，或回到本页点「刷新」', 8000);
+  toast('Login wait timed out — after completing login click the extension icon, or come back to this page and click "Refresh"', 8000);
 }
 async function doImport(source) {
   const text = $('import-text').value.trim();
-  if (!text) { toast('请先粘贴内容'); return; }
-  $('import-result').textContent = '导入中…';
+  if (!text) { toast('Please paste content first'); return; }
+  $('import-result').textContent = 'Importing…';
   const verifyBox = $('import-verify');
   if (verifyBox) { verifyBox.style.display = 'none'; verifyBox.innerHTML = ''; }
   try {
     const r = await api('/api/tokens/import', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ cookie: text }) });
     if (r.added > 0) {
-      $('import-result').innerHTML = `<span class="tok">✅ 成功导入 ${r.added} 个凭证${source === 'clipboard' ? '（来源：剪贴板）' : ''}</span>`;
+      $('import-result').innerHTML = `<span class="tok">✅ Successfully imported ${r.added} credential(s)${source === 'clipboard' ? ' (source: clipboard)' : ''}</span>`;
       $('import-text').value = '';
       $('login-wizard').style.display = 'none';
-      toast(source === 'clipboard' ? '✅ 剪贴板内容导入成功，正在验证凭证…' : '导入成功，正在拉取账号信息…');
+      toast(source === 'clipboard' ? '✅ Clipboard content imported successfully, verifying credential…' : 'Import succeeded, fetching account info…');
       refreshTokens();
       refreshAccountOverview();
       loadHistory();
-      // 即贴即验：导入成功后立刻向上游验证新凭证并把结果显示在向导附近
+      // Instant verification: right after a successful import, verify the new credential with upstream and show the result near the wizard
       verifyNewCredential();
     } else {
-      $('import-result').innerHTML = `<span class="twarn">该凭证已存在（同值自动去重，未重复入库）</span>`;
+      $('import-result').innerHTML = `<span class="twarn">This credential already exists (identical values are auto-deduplicated, not stored again)</span>`;
       refreshTokens();
     }
-  } catch (e) { $('import-result').innerHTML = `<span class="terr">导入失败：${esc(e.message)}</span>`; }
+  } catch (e) { $('import-result').innerHTML = `<span class="terr">Import failed: ${esc(e.message)}</span>`; }
 }
 
-// ---------- 凭证列表（账号详细信息 / 入库时间 / 检查 / 删除） ----------
+// ---------- Credential list (account details / stored time / check / delete) ----------
 let tokenCache = [];
 async function refreshTokens() {
   try {
     const r = await api('/api/tokens');
     const list = r.tokens || [];
     tokenCache = list;
-    $('cred-count').textContent = list.length ? `（${list.length} 个 · 同值自动去重）` : '';
+    $('cred-count').textContent = list.length ? `(${list.length} · same-value auto-dedup)` : '';
     fillHistoryCredOptions(list);
     $('tokens-wrap').innerHTML = list.length ? `<table><thead><tr>
-        <th>账号</th><th>类型</th><th>凭证</th><th>套餐</th><th>今日剩余</th><th>入库时间</th><th>操作</th>
+        <th>Account</th><th>Type</th><th>Credential</th><th>Plan</th><th>Remaining today</th><th>Added</th><th>Actions</th>
       </tr></thead><tbody>${
       list.map((t, i) => {
         const m = t.meta || null;
         const acct = m
           ? `<div style="font-weight:600">${esc(m.name || '—')}</div><div style="font-size:12px;color:var(--muted)">${esc(m.email || '')}</div>`
-          : `<span style="color:var(--muted)">未检查</span>`;
-        const validBadge = m ? (m.valid ? badge('有效', 'ok') : badge('可能失效', 'err')) : '';
-        const tier = m ? (m.tier_id ? badge(m.tier_id, 'ok') : badge('免费', 'dim')) : '—';
+          : `<span style="color:var(--muted)">Not checked</span>`;
+        const validBadge = m ? (m.valid ? badge('Valid', 'ok') : badge('Possibly invalid', 'err')) : '';
+        const tier = m ? (m.tier_id ? badge(m.tier_id, 'ok') : badge('Free', 'dim')) : '—';
         const remain = (m && m.daily_remaining != null) ? `<b>${m.daily_remaining}</b> / ${m.daily_limit ?? '—'}` : '—';
-        const added = t.added_at ? new Date(t.added_at).toLocaleString('zh-CN', { hour12: false }) : '—';
+        const added = t.added_at ? new Date(t.added_at).toLocaleString('en-GB', { hour12: false }) : '—';
         return `<tr>
           <td>${acct} ${validBadge}</td>
           <td>${t.kind === 'web-cookie' ? badge('Web Cookie', 'ok') : badge('Bearer', 'dim')}</td>
@@ -1349,77 +1398,77 @@ async function refreshTokens() {
           <td style="font-size:12px">${remain}</td>
           <td style="font-size:12px">${esc(added)}</td>
           <td class="row">
-            <button class="ghost sm" onclick="checkCredAt(${i})">检查</button>
-            <button class="ghost sm" onclick="openCredDetail(${i})">详情</button>
-            <button class="ghost sm" onclick="deleteCredAt(${i})">删除</button>
+            <button class="ghost sm" onclick="checkCredAt(${i})">Check</button>
+            <button class="ghost sm" onclick="openCredDetail(${i})">Details</button>
+            <button class="ghost sm" onclick="deleteCredAt(${i})">Delete</button>
           </td></tr>`;
-      }).join('')}</tbody></table>` : '<div class="empty">还没有导入凭证 — 用上方「一键登录」或粘贴导入</div>';
-  } catch (e) { $('tokens-wrap').innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`; }
+      }).join('')}</tbody></table>` : '<div class="empty">No credentials imported yet — use "One-click login" above or paste to import</div>';
+  } catch (e) { $('tokens-wrap').innerHTML = `<div class="empty">Load failed: ${esc(e.message)}</div>`; }
 }
 function checkCredAt(i) { const t = tokenCache[i]; if (t) checkCred(t.id); }
 function deleteCredAt(i) { const t = tokenCache[i]; if (t) deleteCred(t.id, (t.meta && t.meta.email) || t.token_masked); }
 function openCredDetail(i) { const t = tokenCache[i]; if (t) renderCredDetail(t); }
 
 async function checkCred(id) {
-  toast('正在检查该凭证…（需要几秒）');
+  toast('Checking this credential… (takes a few seconds)');
   try {
     const r = await api('/api/tokens/check', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id }) });
-    toast(r.message || (r.ok ? '凭证有效' : '凭证可能已失效'), 7000);
+    toast(r.message || (r.ok ? 'Credential valid' : 'Credential may be invalid'), 7000);
     refreshTokens();
     loadHistory();
-  } catch (e) { toast('检查失败：' + e.message, 7000); }
+  } catch (e) { toast('Check failed: ' + e.message, 7000); }
 }
 async function deleteCred(id, label) {
-  if (!confirm(`确定删除凭证 ${label || ''}？\n\n删除后会同时从运行中的账号池移除，需要重新登录导入才能恢复。`)) return;
+  if (!confirm(`Delete credential ${label || ''}?\n\nThis will also remove it from the running account pool; you'll need to log in and import again to restore it.`)) return;
   try {
     const r = await api('/api/tokens/delete', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id }) });
-    toast(r.message || '已删除', 5000);
+    toast(r.message || 'Deleted', 5000);
     refreshTokens();
     loadHistory();
-  } catch (e) { toast('删除失败：' + e.message, 7000); }
+  } catch (e) { toast('Delete failed: ' + e.message, 7000); }
 }
 function renderCredDetail(t) {
   const m = t.meta;
   $('drawer').classList.add('open');
-  $('dr-title').textContent = '凭证详情';
+  $('dr-title').textContent = 'Credential details';
   let html = '';
-  html += `<div class="kv"><b>凭证</b><code>${esc(t.token_masked)}</code></div>`;
-  html += `<div class="kv"><b>类型</b>${t.kind === 'web-cookie' ? 'Web Cookie（网页版登录）' : 'Bearer Token'}</div>`;
-  html += `<div class="kv"><b>来源</b>${esc(t.source || '—')}${t.host ? ' · ' + esc(t.host) : ''}</div>`;
-  html += `<div class="kv"><b>入库时间</b>${t.added_at ? new Date(t.added_at).toLocaleString('zh-CN', { hour12: false }) : '未知（旧数据）'}</div>`;
+  html += `<div class="kv"><b>Credential</b><code>${esc(t.token_masked)}</code></div>`;
+  html += `<div class="kv"><b>Type</b>${t.kind === 'web-cookie' ? 'Web Cookie (website login)' : 'Bearer Token'}</div>`;
+  html += `<div class="kv"><b>Source</b>${esc(t.source || '—')}${t.host ? ' · ' + esc(t.host) : ''}</div>`;
+  html += `<div class="kv"><b>Added</b>${t.added_at ? new Date(t.added_at).toLocaleString('en-GB', { hour12: false }) : 'Unknown (legacy data)'}</div>`;
   if (!m) {
-    html += `<div class="empty" style="margin-top:12px">这条凭证还没检查过 —— 点凭证列表里的「检查」即可拉取账号详细信息。</div>`;
+    html += `<div class="empty" style="margin-top:12px">This credential has not been checked yet — click "Check" in the credential list to fetch account details.</div>`;
     $('dr-body').innerHTML = html;
     return;
   }
-  html += `<div class="kv"><b>检查时间</b>${m.checked_at ? new Date(m.checked_at).toLocaleString('zh-CN', { hour12: false }) : '—'} ${m.valid ? badge('有效', 'ok') : badge('可能失效', 'err')}</div>`;
-  html += '<div style="border-top:1px solid var(--border);margin:10px 0;padding-top:8px"><b>账号</b></div>';
+  html += `<div class="kv"><b>Checked</b>${m.checked_at ? new Date(m.checked_at).toLocaleString('en-GB', { hour12: false }) : '—'} ${m.valid ? badge('Valid', 'ok') : badge('Possibly invalid', 'err')}</div>`;
+  html += '<div style="border-top:1px solid var(--border);margin:10px 0;padding-top:8px"><b>Account</b></div>';
   if (m.image) html += `<img src="${esc(m.image)}" style="width:40px;height:40px;border-radius:50%;vertical-align:middle" onerror="this.style.display='none'">`;
-  html += `<div class="kv"><b>昵称</b>${esc(m.name || '—')}</div>`;
-  html += `<div class="kv"><b>邮箱</b>${esc(m.email || '—')}</div>`;
-  if (m.user_id) html += `<div class="kv"><b>用户 ID</b><code>${esc(m.user_id)}</code></div>`;
-  if (m.expires) html += `<div class="kv"><b>登录有效期</b>${new Date(m.expires).toLocaleString('zh-CN', { hour12: false })}</div>`;
-  html += '<div style="border-top:1px solid var(--border);margin:10px 0;padding-top:8px"><b>额度</b></div>';
-  html += `<div class="kv"><b>层级 / 套餐</b>${esc(m.access_tier || '—')} / ${esc(m.tier_id || '免费')}</div>`;
-  if (m.daily_limit != null) html += `<div class="kv"><b>今日积分</b>剩余 <b class="tok">${m.daily_remaining ?? '—'}</b> / ${m.daily_limit}（已用 ${m.daily_spent ?? 0}）</div>`;
-  if (m.reset_at) html += `<div class="kv"><b>下次重置</b>${new Date(m.reset_at).toLocaleString('zh-CN', { hour12: false })}</div>`;
-  if (m.streak_current != null) html += `<div class="kv"><b>连续使用</b>${m.streak_current} 天（累计活跃 ${m.all_time_active_days ?? '—'} 天）</div>`;
-  if (m.tokens_7d != null) html += `<div class="kv"><b>近 7 天 token</b>${m.tokens_7d.toLocaleString()}</div>`;
-  if (m.country_code) html += `<div class="kv"><b>地区</b>${esc(m.country_code)}${m.country_block_reason ? ' ' + badge(m.country_block_reason, 'err') : ''}</div>`;
-  if (m.error) html += `<div class="kv"><b>错误</b><span class="terr">${esc(m.error)}</span></div>`;
+  html += `<div class="kv"><b>Nickname</b>${esc(m.name || '—')}</div>`;
+  html += `<div class="kv"><b>Email</b>${esc(m.email || '—')}</div>`;
+  if (m.user_id) html += `<div class="kv"><b>User ID</b><code>${esc(m.user_id)}</code></div>`;
+  if (m.expires) html += `<div class="kv"><b>Login valid until</b>${new Date(m.expires).toLocaleString('en-GB', { hour12: false })}</div>`;
+  html += '<div style="border-top:1px solid var(--border);margin:10px 0;padding-top:8px"><b>Quota</b></div>';
+  html += `<div class="kv"><b>Tier / Plan</b>${esc(m.access_tier || '—')} / ${esc(m.tier_id || 'Free')}</div>`;
+  if (m.daily_limit != null) html += `<div class="kv"><b>Today's credits</b>remaining <b class="tok">${m.daily_remaining ?? '—'}</b> / ${m.daily_limit} (used ${m.daily_spent ?? 0})</div>`;
+  if (m.reset_at) html += `<div class="kv"><b>Next reset</b>${new Date(m.reset_at).toLocaleString('en-GB', { hour12: false })}</div>`;
+  if (m.streak_current != null) html += `<div class="kv"><b>Streak</b>${m.streak_current} days (total active ${m.all_time_active_days ?? '—'} days)</div>`;
+  if (m.tokens_7d != null) html += `<div class="kv"><b>Tokens in last 7 days</b>${m.tokens_7d.toLocaleString()}</div>`;
+  if (m.country_code) html += `<div class="kv"><b>Region</b>${esc(m.country_code)}${m.country_block_reason ? ' ' + badge(m.country_block_reason, 'err') : ''}</div>`;
+  if (m.error) html += `<div class="kv"><b>Error</b><span class="terr">${esc(m.error)}</span></div>`;
   if ((m.models || []).length) {
-    html += `<details open style="margin-top:8px"><summary>逐模型今日剩余（${m.models.length}）</summary><table style="margin-top:6px"><thead><tr><th>模型</th><th>剩余</th><th>限额</th><th>已用</th><th>积分价</th></tr></thead><tbody>${
-      m.models.map(x => `<tr><td>${esc(x.model)}</td><td><b>${x.remaining ?? '—'}</b></td><td>${x.limit ?? '—'}</td><td>${x.used ?? 0}</td><td>${x.price === 0 ? '<b class="tok">免费</b>' : (x.price ?? '—')}</td></tr>`).join('')}</tbody></table></details>`;
+    html += `<details open style="margin-top:8px"><summary>Remaining today per model (${m.models.length})</summary><table style="margin-top:6px"><thead><tr><th>Model</th><th>Remaining</th><th>Limit</th><th>Used</th><th>Credit price</th></tr></thead><tbody>${
+      m.models.map(x => `<tr><td>${esc(x.model)}</td><td><b>${x.remaining ?? '—'}</b></td><td>${x.limit ?? '—'}</td><td>${x.used ?? 0}</td><td>${x.price === 0 ? '<b class="tok">Free</b>' : (x.price ?? '—')}</td></tr>`).join('')}</tbody></table></details>`;
   }
   $('dr-body').innerHTML = html;
 }
 
-// ---------- 使用记录 ----------
+// ---------- Usage history ----------
 function fillHistoryCredOptions(list) {
   const sel = $('hist-cred');
   if (!sel) return;
   const cur = sel.value;
-  const opts = ['<option value="">全部账号</option>'].concat(
+  const opts = ['<option value="">All accounts</option>'].concat(
     (list || []).map(t => {
       const m = t.meta || {};
       const label = m.email || m.name || t.token_masked;
@@ -1432,7 +1481,7 @@ function fillHistoryCredOptions(list) {
 async function loadHistory() {
   const wrap = $('hist-wrap');
   if (!wrap) return;
-  wrap.innerHTML = '<div class="empty">加载中…</div>';
+  wrap.innerHTML = '<div class="empty">Loading…</div>';
   try {
     if (!tokenCache.length) { try { const r = await api('/api/tokens'); tokenCache = r.tokens || []; fillHistoryCredOptions(tokenCache); } catch (e) {} }
     const cred = $('hist-cred') ? $('hist-cred').value : '';
@@ -1440,121 +1489,121 @@ async function loadHistory() {
     const d = await api(q);
     const rows = d.records || [];
     wrap.innerHTML = rows.length ? `<table><thead><tr>
-        <th>时间</th><th>账号</th><th>套餐</th><th>今日剩余</th><th>已用</th><th>近 7 天 token</th><th>连续天数</th><th>结果</th>
+        <th>Time</th><th>Account</th><th>Plan</th><th>Remaining today</th><th>Used</th><th>Tokens (7d)</th><th>Streak days</th><th>Result</th>
       </tr></thead><tbody>${
       rows.map(r => `<tr>
-        <td style="font-size:12px">${new Date(r.ts).toLocaleString('zh-CN', { hour12: false })}</td>
+        <td style="font-size:12px">${new Date(r.ts).toLocaleString('en-GB', { hour12: false })}</td>
         <td>${esc(r.email || r.name || r.cred_id.slice(0, 8))}</td>
-        <td>${esc(r.tier_id || '免费')}</td>
+        <td>${esc(r.tier_id || 'Free')}</td>
         <td>${r.daily_remaining ?? '—'} / ${r.daily_limit ?? '—'}</td>
         <td>${r.daily_spent ?? '—'}</td>
         <td>${r.tokens_7d != null ? r.tokens_7d.toLocaleString() : '—'}</td>
         <td>${r.streak_current ?? '—'}</td>
-        <td>${r.ok ? badge('成功', 'ok') : badge('失败', 'err')}</td>
-      </tr>`).join('')}</tbody></table>` : '<div class="empty">暂无记录 — 点「刷新账号全貌」或凭证行的「检查」即可产生记录</div>';
-  } catch (e) { wrap.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`; }
+        <td>${r.ok ? badge('Success', 'ok') : badge('Failed', 'err')}</td>
+      </tr>`).join('')}</tbody></table>` : '<div class="empty">No records yet — click "Refresh Account Overview" or "Check" on a credential row to generate records</div>';
+  } catch (e) { wrap.innerHTML = `<div class="empty">Load failed: ${esc(e.message)}</div>`; }
 }
 
-// ---------- 账号全貌（中文呈现上游数据） ----------
+// ---------- Account Overview (renders upstream data) ----------
 async function refreshAccountOverview() {
-  $('overview-wrap').innerHTML = '<div class="empty">拉取中…（上游可能需要几秒）</div>';
+  $('overview-wrap').innerHTML = '<div class="empty">Fetching… (upstream may take a few seconds)</div>';
   try {
     const d = await api('/api/account/overview');
     $('overview-wrap').innerHTML = renderOverview(d);
   } catch (e) {
     const m = String(e.message || '');
-    $('overview-wrap').innerHTML = `<div class="empty">拉取失败：${esc(m)}${m.includes('Cookie') ? ' — 请先在上方导入凭证' : ''}</div>`;
+    $('overview-wrap').innerHTML = `<div class="empty">Fetch failed: ${esc(m)}${m.includes('Cookie') ? ' — please import credentials above first' : ''}</div>`;
   }
 }
 function renderOverview(d) {
   const id = (d.identity && d.identity.user) || {};
   let html = '';
-  // 身份
+  // Identity
   html += '<div class="row" style="gap:12px;margin-bottom:14px">';
   if (id.image) html += `<img src="${esc(id.image)}" style="width:44px;height:44px;border-radius:50%" onerror="this.style.display='none'">`;
-  html += `<div><div style="font-size:16px;font-weight:600">${esc(id.name || '未命名账号')}</div>
-    <div style="font-size:12px;color:var(--muted)">${esc(id.email || '')}${id.id ? ' · 用户 ID ' + esc(String(id.id).slice(0, 8)) + '…' : ''}</div></div>`;
-  if (d.identity && d.identity.expires) html += `<span style="flex:1"></span><span style="font-size:12px;color:var(--muted)">凭证有效期至 ${new Date(d.identity.expires).toLocaleString('zh-CN', { hour12: false })}</span>`;
+  html += `<div><div style="font-size:16px;font-weight:600">${esc(id.name || 'Unnamed account')}</div>
+    <div style="font-size:12px;color:var(--muted)">${esc(id.email || '')}${id.id ? ' · User ID ' + esc(String(id.id).slice(0, 8)) + '…' : ''}</div></div>`;
+  if (d.identity && d.identity.expires) html += `<span style="flex:1"></span><span style="font-size:12px;color:var(--muted)">Credential valid until ${new Date(d.identity.expires).toLocaleString('en-GB', { hour12: false })}</span>`;
   html += '</div>';
 
-  // 使用统计（中文）
+  // Usage stats
   const u = d.usage || {};
   if (u.streak || u.recent) {
-    html += '<div style="border-top:1px solid var(--border);padding-top:12px;margin-bottom:4px"><b style="font-size:14px">📊 使用统计</b></div>';
-    if (u.streak) html += `<p style="font-size:13px;margin-top:6px">🔥 连续使用 <b class="tok">${u.streak.current ?? 0}</b> 天（最长 ${u.streak.longest ?? 0} 天） · 累计活跃 <b>${u.allTimeActiveDays ?? 0}</b> 天</p>`;
+    html += '<div style="border-top:1px solid var(--border);padding-top:12px;margin-bottom:4px"><b style="font-size:14px">📊 Usage Stats</b></div>';
+    if (u.streak) html += `<p style="font-size:13px;margin-top:6px">🔥 Streak: <b class="tok">${u.streak.current ?? 0}</b> days (longest ${u.streak.longest ?? 0} days) · Total active: <b>${u.allTimeActiveDays ?? 0}</b> days</p>`;
     const r = u.recent || {};
-    if (r.totalTokens != null) html += `<p style="font-size:13px;color:var(--muted);margin-top:4px">近 ${r.days ?? 7} 天：<b>${r.messages ?? 0}</b> 条消息 · 输入 <b>${(r.inputTokens || 0).toLocaleString()}</b> · 输出 <b>${(r.outputTokens || 0).toLocaleString()}</b> · 缓存 <b>${(r.cacheReadTokens || 0).toLocaleString()}</b> · 合计 <b>${(r.totalTokens || 0).toLocaleString()}</b> tokens</p>`;
+    if (r.totalTokens != null) html += `<p style="font-size:13px;color:var(--muted);margin-top:4px">Last ${r.days ?? 7} days: <b>${r.messages ?? 0}</b> messages · Input <b>${(r.inputTokens || 0).toLocaleString()}</b> · Output <b>${(r.outputTokens || 0).toLocaleString()}</b> · Cache <b>${(r.cacheReadTokens || 0).toLocaleString()}</b> · Total <b>${(r.totalTokens || 0).toLocaleString()}</b> tokens</p>`;
     if ((u.sessionsByModel || []).length) {
-      html += `<table style="margin-top:8px"><thead><tr><th>模型</th><th>会话数</th><th>消耗单位</th></tr></thead><tbody>${u.sessionsByModel.map(m => `<tr><td>${esc(m.model)}</td><td>${m.sessions}</td><td>${m.units}</td></tr>`).join('')}</tbody></table>`;
+      html += `<table style="margin-top:8px"><thead><tr><th>Model</th><th>Sessions</th><th>Units Used</th></tr></thead><tbody>${u.sessionsByModel.map(m => `<tr><td>${esc(m.model)}</td><td>${m.sessions}</td><td>${m.units}</td></tr>`).join('')}</tbody></table>`;
     }
   }
 
-  // 今日额度
+  // Daily quota
   const q = d.quota || {};
   const fb = q.freebucks || {};
   const daily = fb.daily || {};
   const tierId = (d.subscription && d.subscription.subscription && d.subscription.subscription.tierId) || null;
-  html += '<div style="border-top:1px solid var(--border);padding-top:12px;margin-top:12px"><b style="font-size:14px">💰 今日额度</b></div>';
-  html += `<p style="font-size:13px;margin-top:6px">账号层级 <b>${esc(q.accessTier || '—')}</b> · 订阅套餐 <b>${esc(tierId || '免费')}</b></p>`;
+  html += '<div style="border-top:1px solid var(--border);padding-top:12px;margin-top:12px"><b style="font-size:14px">💰 Daily Quota</b></div>';
+  html += `<p style="font-size:13px;margin-top:6px">Account tier <b>${esc(q.accessTier || '—')}</b> · Subscription plan <b>${esc(tierId || 'Free')}</b></p>`;
   if (daily.limit != null) {
     const pct = daily.limit > 0 ? Math.round(((daily.remaining || 0) / daily.limit) * 100) : 0;
-    const reset = daily.resetAt ? new Date(daily.resetAt).toLocaleString('zh-CN', { hour12: false }) : '—';
-    html += `<p style="font-size:13px;margin-top:4px">积分：剩余 <b class="tok">${daily.remaining ?? '—'}</b> / ${daily.limit ?? '—'}（已用 ${daily.spent ?? 0}） · 重置 <b>${reset}</b> <span style="color:var(--muted)">（太平洋时间午夜，隔天自动刷新）</span></p>`;
+    const reset = daily.resetAt ? new Date(daily.resetAt).toLocaleString('en-GB', { hour12: false }) : '—';
+    html += `<p style="font-size:13px;margin-top:4px">Credits: remaining <b class="tok">${daily.remaining ?? '—'}</b> / ${daily.limit ?? '—'} (used ${daily.spent ?? 0}) · Reset <b>${reset}</b> <span style="color:var(--muted)">(midnight Pacific Time, refreshes automatically the next day)</span></p>`;
     html += `<div style="height:8px;background:#21262d;border-radius:4px;overflow:hidden;margin:8px 0 10px"><div style="height:100%;width:${pct}%;background:${pct > 50 ? 'var(--ok)' : pct > 20 ? 'var(--warn)' : 'var(--err)'}"></div></div>`;
   }
   const prices = fb.prices || {};
   const rl = q.rateLimitsByModel || {};
   const models = Object.keys(rl);
   if (models.length) {
-    html += `<table><thead><tr><th>模型</th><th>今日剩余次数</th><th>限额</th><th>已用</th><th>积分价</th><th>下次重置</th></tr></thead><tbody>${
+    html += `<table><thead><tr><th>Model</th><th>Remaining Today</th><th>Limit</th><th>Used</th><th>Credit Price</th><th>Next Reset</th></tr></thead><tbody>${
       models.map(m => {
         const v = rl[m] || {};
         const remain = v.limit != null ? Math.max(0, (v.limit || 0) - (v.recentCount || 0)) : '—';
-        const price = prices[m] != null ? (prices[m] === 0 ? '<b class="tok">免费</b>' : prices[m]) : '—';
-        const reset = v.resetAt ? new Date(v.resetAt).toLocaleString('zh-CN', { hour12: false, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) : '—';
+        const price = prices[m] != null ? (prices[m] === 0 ? '<b class="tok">Free</b>' : prices[m]) : '—';
+        const reset = v.resetAt ? new Date(v.resetAt).toLocaleString('en-GB', { hour12: false, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) : '—';
         const pool = v.poolLabel ? ` <span style="color:var(--muted);font-size:11px">${esc(v.poolLabel)}</span>` : '';
         return `<tr><td>${esc(m)}${pool}</td><td><b>${remain}</b></td><td>${v.limit ?? '—'}</td><td>${v.recentCount ?? 0}</td><td>${price}</td><td style="font-size:12px">${reset}</td></tr>`;
       }).join('')}</tbody></table>`;
   }
   const extra = Object.entries(prices).filter(([m]) => !rl[m]);
   if (extra.length) {
-    html += `<details style="margin-top:8px"><summary>其他模型积分价（${extra.length}）</summary><div style="margin-top:6px">${extra.map(([m, p]) => `<span class="chip">${esc(m)}: ${p === 0 ? '免费' : p}</span>`).join('')}</div></details>`;
+    html += `<details style="margin-top:8px"><summary>Other model credit prices (${extra.length})</summary><div style="margin-top:6px">${extra.map(([m, p]) => `<span class="chip">${esc(m)}: ${p === 0 ? 'Free' : p}</span>`).join('')}</div></details>`;
   }
 
-  // 凭证与刷新时间
+  // Credential and refresh time
   const c = d.credential || {};
-  html += `<div style="font-size:12px;color:var(--muted);margin-top:12px;border-top:1px solid var(--border);padding-top:8px">当前凭证 ${esc(c.token_masked || '')} · 来源 ${esc(c.source || '')}${c.added_at ? ' · 入库 ' + new Date(c.added_at).toLocaleString('zh-CN', { hour12: false }) : ''} · 数据更新于 ${d.fetched_at ? new Date(d.fetched_at).toLocaleTimeString('zh-CN', { hour12: false }) : '—'}</div>`;
+  html += `<div style="font-size:12px;color:var(--muted);margin-top:12px;border-top:1px solid var(--border);padding-top:8px">Current credential ${esc(c.token_masked || '')} · Source ${esc(c.source || '')}${c.added_at ? ' · Added ' + new Date(c.added_at).toLocaleString('en-GB', { hour12: false }) : ''} · Data updated at ${d.fetched_at ? new Date(d.fetched_at).toLocaleTimeString('en-GB', { hour12: false }) : '—'}</div>`;
   return html;
 }
 async function refreshCredential() {
-  toast('正在做凭证保活检查…');
+  toast('Running credential keep-alive check…');
   try {
     const r = await api('/api/account/refresh', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
-    toast(r.message || (r.ok ? '凭证有效' : '凭证可能已失效'), 7000);
+    toast(r.message || (r.ok ? 'Credential valid' : 'Credential may have expired'), 7000);
     if (r.ok) refreshAccountOverview();
-  } catch (e) { toast('检查失败：' + e.message, 6000); }
+  } catch (e) { toast('Check failed: ' + e.message, 6000); }
 }
 
-// ---------- 技能 ----------
+// ---------- Skills ----------
 let editingSkillId = null;
-let skillsCache = [];   // 索引化引用，避免把用户数据拼进内联 JS（防 XSS/引号破坏）
+let skillsCache = [];   // Indexed reference, avoids splicing user data into inline JS (prevents XSS / quote breakage)
 async function refreshSkills() {
   try {
     const d = await api('/api/skills');
     const skills = d.skills || [];
     skillsCache = skills;
-    $('roster-info').textContent = `roster 预览约 ${d.roster_tokens ?? '—'} tokens（注入预算 ${d.max_roster_tokens ?? 2000}）`;
-    $('skills-wrap').innerHTML = skills.length ? `<table><thead><tr><th>名称</th><th>描述</th><th>来源</th><th>状态</th><th>操作</th></tr></thead><tbody>${
+    $('roster-info').textContent = `roster preview ~${d.roster_tokens ?? '—'} tokens (injection budget ${d.max_roster_tokens ?? 2000})`;
+    $('skills-wrap').innerHTML = skills.length ? `<table><thead><tr><th>Name</th><th>Description</th><th>Source</th><th>Status</th><th>Actions</th></tr></thead><tbody>${
       skills.map((s, i) => `<tr>
-        <td>${esc(s.name)} ${s.builtin ? badge('内置', 'dim') : ''}</td>
+        <td>${esc(s.name)} ${s.builtin ? badge('Built-in', 'dim') : ''}</td>
         <td style="max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(s.description)}">${esc(s.description)}</td>
         <td>${esc(s.source || 'local')}</td>
-        <td>${s.enabled ? badge('已启用', 'ok') : badge('已禁用', 'dim')}</td>
+        <td>${s.enabled ? badge('Enabled', 'ok') : badge('Disabled', 'dim')}</td>
         <td class="row">
-          <button class="ghost sm" onclick="toggleSkillAt(${i})">${s.enabled ? '禁用' : '启用'}</button>
-          ${s.builtin ? '<span style="color:var(--muted);font-size:12px">内置项不可编辑</span>' : `<button class="ghost sm" onclick="editSkillAt(${i})">编辑</button><button class="ghost sm" onclick="delSkillAt(${i})">删除</button>`}
-        </td></tr>`).join('')}</tbody></table>` : '<div class="empty">技能库为空（内置技能会在首次启动时自动写入）</div>';
-  } catch (e) { $('skills-wrap').innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`; }
+          <button class="ghost sm" onclick="toggleSkillAt(${i})">${s.enabled ? 'Disable' : 'Enable'}</button>
+          ${s.builtin ? '<span style="color:var(--muted);font-size:12px">Built-in items cannot be edited</span>' : `<button class="ghost sm" onclick="editSkillAt(${i})">Edit</button><button class="ghost sm" onclick="delSkillAt(${i})">Delete</button>`}
+        </td></tr>`).join('')}</tbody></table>` : '<div class="empty">Skill library is empty (built-in skills are written automatically on first launch)</div>';
+  } catch (e) { $('skills-wrap').innerHTML = `<div class="empty">Load failed: ${esc(e.message)}</div>`; }
 }
 function toggleSkillAt(i) { const s = skillsCache[i]; if (s) toggleSkill(s.id, !s.enabled); }
 function delSkillAt(i) { const s = skillsCache[i]; if (s) delSkill(s.id); }
@@ -1562,14 +1611,14 @@ function editSkillAt(i) {
   const s = skillsCache[i];
   if (!s) return;
   editingSkillId = s.id;
-  $('skill-editor-title').textContent = '编辑技能：' + s.name;
+  $('skill-editor-title').textContent = 'Edit skill: ' + s.name;
   $('sk-name').value = s.name; $('sk-desc').value = s.description; $('sk-body').value = s.body || '';
   $('skill-editor').style.display = '';
   $('gate-result').textContent = '';
 }
 function newSkill() {
   editingSkillId = null;
-  $('skill-editor-title').textContent = '新建技能';
+  $('skill-editor-title').textContent = 'New skill';
   $('sk-name').value = ''; $('sk-desc').value = ''; $('sk-body').value = '';
   $('skill-editor').style.display = '';
   $('gate-result').textContent = '';
@@ -1577,45 +1626,45 @@ function newSkill() {
 function editSkill(jsonStr) {
   const s = JSON.parse(jsonStr);
   editingSkillId = s.id;
-  $('skill-editor-title').textContent = '编辑技能：' + s.name + (s.builtin ? '（内置，仅可改正文）' : '');
+  $('skill-editor-title').textContent = 'Edit skill: ' + s.name + (s.builtin ? ' (built-in, body only editable)' : '');
   $('sk-name').value = s.name; $('sk-desc').value = s.description; $('sk-body').value = s.body || '';
   $('skill-editor').style.display = '';
 }
 async function saveSkill() {
   const name = $('sk-name').value.trim(), desc = $('sk-desc').value.trim(), body = $('sk-body').value;
-  if (!name || !desc) { toast('名称和描述不能为空'); return; }
+  if (!name || !desc) { toast('Name and description cannot be empty'); return; }
   let force = false;
   try {
-    // 保存前质量门：有问题先提示，用户确认后 force 保存
+    // Quality gate before saving: show issues first, force-save after user confirms
     const g = await api('/api/skills/gate', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ body: name + '\n' + desc + '\n' + body }) });
     const issues = g.issues || [];
     if (issues.length) {
-      $('gate-result').innerHTML = '<span class="terr">质量门发现问题：</span><br>' + issues.map(x => '• ' + esc(x)).join('<br>');
-      if (!confirm('质量门发现 ' + issues.length + ' 个问题：\n\n' + issues.join('\n') + '\n\n仍要强制保存吗？')) return;
+      $('gate-result').innerHTML = '<span class="terr">Quality gate found issues:</span><br>' + issues.map(x => '• ' + esc(x)).join('<br>');
+      if (!confirm('Quality gate found ' + issues.length + ' issue(s):\n\n' + issues.join('\n') + '\n\nForce save anyway?')) return;
       force = true;
     } else {
-      $('gate-result').textContent = '质量门通过 ✅';
+      $('gate-result').textContent = 'Quality gate passed ✅';
     }
     await api('/api/skills', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id: editingSkillId, name, description: desc, body, force }) });
-    $('skill-save-result').textContent = '✅ 已保存';
+    $('skill-save-result').textContent = '✅ Saved';
     $('skill-editor').style.display = 'none';
     refreshSkills();
-  } catch (e) { $('skill-save-result').innerHTML = `<span class="terr">保存失败：${esc(e.message)}</span>`; }
+  } catch (e) { $('skill-save-result').innerHTML = `<span class="terr">Save failed: ${esc(e.message)}</span>`; }
 }
 async function toggleSkill(id, enabled) {
   try { await api('/api/skills/toggle', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id, enabled }) }); refreshSkills(); }
-  catch (e) { toast('操作失败: ' + e.message); }
+  catch (e) { toast('Operation failed: ' + e.message); }
 }
 async function delSkill(id) {
-  if (!confirm('确定删除这个技能？')) return;
+  if (!confirm('Delete this skill?')) return;
   try { await api('/api/skills/delete', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id }) }); refreshSkills(); }
-  catch (e) { toast('删除失败: ' + e.message); }
+  catch (e) { toast('Delete failed: ' + e.message); }
 }
 
-// ---------- 记忆 ----------
+// ---------- Memory ----------
 let memCache = [];
 let memEnabled = false;
-function kindLabel(k) { return ({ preference: '偏好', correction: '纠正', habit: '习惯', project: '项目', feedback: '反馈' })[k] || k; }
+function kindLabel(k) { return ({ preference: 'Preference', correction: 'Correction', habit: 'Habit', project: 'Project', feedback: 'Feedback' })[k] || k; }
 async function refreshMemory() {
   try {
     const d = await api('/api/memory');
@@ -1623,22 +1672,22 @@ async function refreshMemory() {
     memEnabled = !!d.enabled;
     const t = $('mem-toggle');
     if (t.checked !== memEnabled) t.checked = memEnabled;
-    $('mem-toggle-state').textContent = memEnabled ? '已开启' : '已关闭（默认）';
+    $('mem-toggle-state').textContent = memEnabled ? 'Enabled' : 'Disabled (default)';
     $('mem-toggle-state').style.color = memEnabled ? 'var(--ok)' : 'var(--muted)';
-    $('mem-stats').innerHTML = `共 <b>${s.total ?? 0}</b> 条 · 稳定事实 ${s.static_count ?? 0} · 纠正 ${s.corrections ?? 0}`;
+    $('mem-stats').innerHTML = `Total <b>${s.total ?? 0}</b> · Stable facts ${s.static_count ?? 0} · Corrections ${s.corrections ?? 0}`;
     const items = d.memories || [];
     memCache = items;
-    $('mem-wrap').innerHTML = items.length ? `<table><thead><tr><th>类型</th><th>标题</th><th>内容</th><th>状态</th><th>操作</th></tr></thead><tbody>${
+    $('mem-wrap').innerHTML = items.length ? `<table><thead><tr><th>Type</th><th>Title</th><th>Content</th><th>Status</th><th>Actions</th></tr></thead><tbody>${
       items.map((m, i) => `<tr>
         <td>${esc(kindLabel(m.kind))}</td>
         <td>${esc(m.title)}</td>
         <td style="max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(m.content)}">${esc(m.content)}</td>
-        <td>${m.is_static ? badge('稳定', 'ok') : badge('近期', 'dim')}</td>
+        <td>${m.is_static ? badge('Stable', 'ok') : badge('Recent', 'dim')}</td>
         <td class="row">
-          <button class="ghost sm" onclick="toggleMemStaticAt(${i})">${m.is_static ? '转近期' : '转稳定'}</button>
-          <button class="ghost sm" onclick="delMemAt(${i})">删除</button>
-        </td></tr>`).join('')}</tbody></table>` : '<div class="empty">还没有记忆 — 正常使用即可自动积累，或点「手动添加」</div>';
-  } catch (e) { $('mem-wrap').innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`; }
+          <button class="ghost sm" onclick="toggleMemStaticAt(${i})">${m.is_static ? 'Mark Recent' : 'Mark Stable'}</button>
+          <button class="ghost sm" onclick="delMemAt(${i})">Delete</button>
+        </td></tr>`).join('')}</tbody></table>` : '<div class="empty">No memories yet — they accumulate automatically with normal use, or click "Add Manually"</div>';
+  } catch (e) { $('mem-wrap').innerHTML = `<div class="empty">Load failed: ${esc(e.message)}</div>`; }
 }
 async function toggleMemoryEnabled() {
   const t = $('mem-toggle');
@@ -1648,12 +1697,12 @@ async function toggleMemoryEnabled() {
     const r = await api('/api/memory/toggle', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ enabled: target }) });
     memEnabled = !!(r && r.enabled !== undefined ? r.enabled : target);
     if (t.checked !== memEnabled) t.checked = memEnabled;
-    $('mem-toggle-state').textContent = memEnabled ? '已开启' : '已关闭（默认）';
+    $('mem-toggle-state').textContent = memEnabled ? 'Enabled' : 'Disabled (default)';
     $('mem-toggle-state').style.color = memEnabled ? 'var(--ok)' : 'var(--muted)';
-    toast((r && r.message) || (memEnabled ? '记忆层已开启' : '记忆层已关闭'), 5000);
+    toast((r && r.message) || (memEnabled ? 'Memory layer enabled' : 'Memory layer disabled'), 5000);
   } catch (e) {
-    t.checked = memEnabled; // 失败回滚
-    toast('切换失败：' + e.message);
+    t.checked = memEnabled; // roll back on failure
+    toast('Toggle failed: ' + e.message);
   } finally { t.disabled = false; }
 }
 function newMemory() {
@@ -1662,27 +1711,27 @@ function newMemory() {
 }
 async function saveMemory() {
   const title = $('mem-title').value.trim(), content = $('mem-content').value.trim(), kind = $('mem-kind').value;
-  if (!title || !content) { toast('标题和内容不能为空'); return; }
+  if (!title || !content) { toast('Title and content cannot be empty'); return; }
   try {
     await api('/api/memory', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ kind, title, content, is_static: false }) });
-    $('mem-save-result').textContent = '✅ 已保存';
+    $('mem-save-result').textContent = '✅ Saved';
     $('mem-editor').style.display = 'none';
     refreshMemory();
-  } catch (e) { $('mem-save-result').innerHTML = `<span class="terr">保存失败：${esc(e.message)}</span>`; }
+  } catch (e) { $('mem-save-result').innerHTML = `<span class="terr">Save failed: ${esc(e.message)}</span>`; }
 }
 function toggleMemStaticAt(i) { const m = memCache[i]; if (m) setMemStatic(m.id, !m.is_static); }
 function delMemAt(i) { const m = memCache[i]; if (m) delMemory(m.id); }
 async function setMemStatic(id, v) {
   try { await api('/api/memory/static', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id, is_static: v }) }); refreshMemory(); }
-  catch (e) { toast('操作失败: ' + e.message); }
+  catch (e) { toast('Operation failed: ' + e.message); }
 }
 async function delMemory(id) {
-  if (!confirm('删除这条记忆？')) return;
+  if (!confirm('Delete this memory?')) return;
   try { await api('/api/memory/delete', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id }) }); refreshMemory(); }
-  catch (e) { toast('删除失败: ' + e.message); }
+  catch (e) { toast('Delete failed: ' + e.message); }
 }
 
-// ---------- 日志 ----------
+// ---------- Logs ----------
 let logEvents = [];
 let logSource = null;
 async function initLogs() {
@@ -1696,8 +1745,8 @@ async function initLogs() {
     logSource.onmessage = (e) => {
       try { const ev = JSON.parse(e.data); logEvents.push(ev); if (logEvents.length > 1000) logEvents = logEvents.slice(-1000); renderLogs(); } catch (err) {}
     };
-    logSource.onerror = () => { /* 自动重连由浏览器处理 */ };
-  } catch (e) { $('logbox').innerHTML = `<div class="empty">日志加载失败：${esc(e.message)}</div>`; }
+    logSource.onerror = () => { /* automatic reconnection handled by the browser */ };
+  } catch (e) { $('logbox').innerHTML = `<div class="empty">Log load failed: ${esc(e.message)}</div>`; }
 }
 let logPaused = false;
 function visibleLogs() {
@@ -1711,31 +1760,31 @@ function setLogLevel(btn) {
 }
 function toggleLogPause() {
   logPaused = !logPaused;
-  const b = $('log-pause-btn'); if (b) { b.textContent = logPaused ? '▶ 恢复滚动' : '⏸ 暂停滚动'; b.classList.toggle('active', logPaused); }
+  const b = $('log-pause-btn'); if (b) { b.textContent = logPaused ? '▶ Resume scroll' : '⏸ Pause scroll'; b.classList.toggle('active', logPaused); }
   if (!logPaused) { const box = $('logbox'); if (box && logEvents.length) box.scrollTop = box.scrollHeight; }
 }
 function exportLogs() {
   const events = visibleLogs();
-  if (!events.length) { toast('当前缓冲为空，无可导出', 2500); return; }
+  if (!events.length) { toast('Current buffer is empty, nothing to export', 2500); return; }
   const blob = new Blob([JSON.stringify({ exported_at: new Date().toISOString(), count: events.length, logs: events }, null, 2)], { type: 'application/json' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob); a.download = 'freebuff2api-logs-' + new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-') + '.json'; a.click();
-  URL.revokeObjectURL(a.href); toast('已导出 ' + events.length + ' 条日志');
+  URL.revokeObjectURL(a.href); toast('Exported ' + events.length + ' log entries');
 }
 function renderLogs() {
   const events = visibleLogs();
   const box = $('logbox');
   if (!box) return;
-  // 错误计数徽标 + 无障碍播报（仅数量变化时更新隐藏节点，避免刷屏）
+  // Error count badge + accessibility announcement (update hidden node only when count changes, to avoid flooding)
   const errCount = (logEvents || []).filter(e => e && e.level === 'error').length;
   const ec = $('log-err-count'); if (ec) { ec.textContent = errCount; ec.style.display = errCount ? '' : 'none'; }
   const sr = $('log-sr');
-  if (sr && sr.textContent !== '已加载 ' + logEvents.length + ' 条日志，其中错误 ' + errCount + ' 条') {
-    sr.textContent = '已加载 ' + logEvents.length + ' 条日志，其中错误 ' + errCount + ' 条';
+  if (sr && sr.textContent !== 'Loaded ' + logEvents.length + ' log entries, ' + errCount + ' error(s)') {
+    sr.textContent = 'Loaded ' + logEvents.length + ' log entries, ' + errCount + ' error(s)';
   }
-  // 大列表 windowed 渲染（v0.8）：只渲染可视区 + 上下缓冲，>500 条不卡
-  const ROW_H = 22; // 单行日志近似高度（px）
-  const BUFFER = 40; // 上下缓冲行数
+  // Large-list windowed rendering (v0.8): renders only the visible area + top/bottom buffer, no lag above 500 entries
+  const ROW_H = 22; // approximate height of a single log row (px)
+  const BUFFER = 40; // number of buffer rows above/below
   const viewport = box.clientHeight || 460;
   const visible = Math.ceil(viewport / ROW_H) + BUFFER * 2;
   const total = events.length;
@@ -1744,40 +1793,40 @@ function renderLogs() {
   const end = Math.min(total, start + visible);
   const slice = events.slice(start, end);
   const html = total === 0
-    ? '<div class="empty">暂无日志</div>'
+    ? '<div class="empty">No logs yet</div>'
     : `<div style="height:${start * ROW_H}px"></div>` + slice.map(e =>
         `<div class="lv-${esc(e.level)}">[${fmtTime(e.ts)}] ${esc(e.level).toUpperCase()} ${esc(e.kind)}${e.req_id ? ' #' + esc(e.req_id) : ''} — ${esc(e.message)}</div>`
       ).join('') + `<div style="height:${(total - end) * ROW_H}px"></div>`;
   box.innerHTML = html;
-  // 是否跟随底部（自动滚动）：暂停滚动时强制不跟随；否则仅当此前贴在底部时保持
+  // Whether to stick to bottom (auto-scroll): forced off while paused; otherwise kept only if previously at the bottom
   const stick = !logPaused && box._stick !== false;
   if (stick && total > 0) box.scrollTop = box.scrollHeight;
 }
 function clearLogs() { logEvents = []; renderLogs(); }
-// windowed 滚动监听（节流：滚动停止/变化时重渲染）
+// windowed scroll listener (throttled: re-render when scroll stops/changes)
 function bindLogScroll() {
   const box = $('logbox'); if (!box || box._scrollBound) return;
   box._scrollBound = true;
   box.addEventListener('scroll', () => {
     box._stick = !logPaused && (box.scrollTop + box.clientHeight >= box.scrollHeight - 24);
-    // windowed 渲染生效（总量接近可视区+缓冲）后滚动才需要重渲染；
-    // 阈值与 renderLogs 的可见区算法对齐（≈ 底部缓冲区首个非可视行）
+    // Re-render on scroll is only needed once windowed rendering kicks in (total count near viewport + buffer);
+    // threshold aligns with renderLogs' visible-area algorithm (≈ first non-visible row past the bottom buffer)
     if (logEvents.length > 100) { clearTimeout(box._rt); box._rt = setTimeout(renderLogs, 60); }
   }, { passive: true });
 }
 
-// ---------- 体检 ----------
+// ---------- Health Check ----------
 async function refreshDoctor() {
-  $('doctor-wrap').innerHTML = '<div class="empty">检查中…</div>';
+  $('doctor-wrap').innerHTML = '<div class="empty">Checking…</div>';
   try {
     const d = await api('/api/doctor');
     const checks = d.checks || [];
     const icon = (s) => s === 'ok' ? '<span class="tok">✅ ok</span>' : s === 'fault' ? '<span class="terr">❌ fault</span>' : s === 'fact' ? '<span class="twarn">ℹ️ fact</span>' : '<span style="color:var(--muted)">◻ not checked</span>';
     $('doctor-wrap').innerHTML = checks.map(c => `<div class="doctor-item"><div class="st">${icon(c.state)}</div><div style="flex:1"><b>${esc(c.label)}</b><div style="color:var(--muted);margin-top:2px">${esc(c.detail)}</div>${c.fix ? `<div style="color:var(--accent);margin-top:2px">→ ${esc(c.fix)}</div>` : ''}</div></div>`).join('');
-  } catch (e) { $('doctor-wrap').innerHTML = `<div class="empty">体检失败：${esc(e.message)}</div>`; }
+  } catch (e) { $('doctor-wrap').innerHTML = `<div class="empty">Health check failed: ${esc(e.message)}</div>`; }
 }
 
-// ---------- 凭证健康看板（v0.9 §2.1） ----------
+// ---------- Credential Health Dashboard (v0.9 §2.1) ----------
 function stateBadge(s) {
   if (s === 'closed' || s === 'half_open') return s === 'half_open' ? '<span class="badge warn">half</span>' : '<span class="badge ok">closed</span>';
   if (s === 'half') return '<span class="badge warn">half</span>';
@@ -1785,21 +1834,21 @@ function stateBadge(s) {
 }
 async function refreshHealth() {
   const w = $('health-wrap'); if (!w) return;
-  w.innerHTML = '<div class="empty">加载中…</div>';
+  w.innerHTML = '<div class="empty">Loading…</div>';
   try {
     const d = await api('/api/accounts/health');
     const rows = d.accounts || [];
-    if (!rows.length) { w.innerHTML = '<div class="empty">暂无凭证健康数据（先导入 Cookie / Bearer）</div>'; return; }
-    w.innerHTML = '<div style="overflow-x:auto"><table style="width:100%"><thead><tr><th>凭证</th><th>类型</th><th>熔断</th><th>评分</th><th>失败</th><th>冷却</th><th>最近错误 / 时间线</th></tr></thead><tbody>' +
+    if (!rows.length) { w.innerHTML = '<div class="empty">No credential health data yet (import a Cookie / Bearer token first)</div>'; return; }
+    w.innerHTML = '<div style="overflow-x:auto"><table style="width:100%"><thead><tr><th>Credential</th><th>Type</th><th>Circuit</th><th>Score</th><th>Failures</th><th>Cooldown</th><th>Last Error / Timeline</th></tr></thead><tbody>' +
       rows.map(r => {
         const hist = (r.history || []).slice(0, 10);
-        const tl = hist.length ? `<details style="margin:4px 0 0"><summary>时间线（${hist.length}）</summary>${hist.map(h => `<div class="kv" style="font-size:12px"><b>${fmtTime(h.ts)} ${h.type === 'ok' ? '✅' : '❌'}</b>${esc(h.detail || '')}</div>`).join('')}</details>` : '';
+        const tl = hist.length ? `<details style="margin:4px 0 0"><summary>Timeline (${hist.length})</summary>${hist.map(h => `<div class="kv" style="font-size:12px"><b>${fmtTime(h.ts)} ${h.type === 'ok' ? '✅' : '❌'}</b>${esc(h.detail || '')}</div>`).join('')}</details>` : '';
         return `<tr><td>${esc((r.masked || r.id || '').slice(0, 26))}</td><td>${esc(r.kind || '—')}</td><td>${stateBadge(r.circuit_state)}</td><td>${Number(r.health_score || 0).toFixed(0)}</td><td>${r.trips || 0}</td><td>${esc(r.cooldown_until ? fmtTime(r.cooldown_until) : '—')}</td><td style="max-width:240px"><div style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(r.last_error || '—')}</div>${tl}</td></tr>`;
       }).join('') + '</tbody></table></div>';
-  } catch (e) { w.innerHTML = `<div class="empty">健康看板加载失败：${esc(e.message)}</div>`; }
+  } catch (e) { w.innerHTML = `<div class="empty">Health dashboard load failed: ${esc(e.message)}</div>`; }
 }
 
-// ---------- 今日推荐（v0.9 §2.2） ----------
+// ---------- Today's Recommendations (v0.9 §2.2) ----------
 async function loadRecommend() {
   const w = $('recommend-wrap'); if (!w) return;
   try {
@@ -1809,7 +1858,7 @@ async function loadRecommend() {
     const mr = b.model_remaining || {};
     const rows = Object.entries(mr);
     if (!rows.length) { $('recommend-panel').style.display = 'none'; return; }
-    // v0.10：/v1/models meta → availableAt / 未经策略验证 标注（防御性：meta 缺失不渲染该列）
+    // v0.10: /v1/models meta → availableAt / "unverified against policy" label (defensive: skip rendering this column if meta is missing)
     let metaById = {};
     try { const mm = await api('/v1/models'); if (Array.isArray(mm.meta)) mm.meta.forEach(x => { if (x && x.id) metaById[x.id] = x; }); } catch (e6) {}
     rows.sort((x, y) => (x[1].usable_today === -1 ? 0 : 1) - (y[1].usable_today === -1 ? 0 : 1));
@@ -1817,71 +1866,71 @@ async function loadRecommend() {
     $('recommend-panel').style.display = '';
     const availCell = (m) => {
       const meta = metaById[m];
-      if (!meta) return '<span class="badge dim" title="上游动态新增/未纳入策略表">未经策略验证</span>';
+      if (!meta) return '<span class="badge dim" title="Dynamically added upstream / not yet in the policy table">Unverified</span>';
       if (meta.available === false) {
         if (meta.available_at) {
           let t = '';
-          try { t = new Date(meta.available_at).toLocaleString('zh-CN', { hour12: false }); } catch (e7) {}
-          return '<span class="badge warn" title="' + esc(meta.available_at || '') + '">暂停/高峰，预计 ' + esc(t) + ' 恢复</span>';
+          try { t = new Date(meta.available_at).toLocaleString('en-GB', { hour12: false }); } catch (e7) {}
+          return '<span class="badge warn" title="' + esc(meta.available_at || '') + '">Paused/peak, expected to resume ' + esc(t) + '</span>';
         }
-        return '<span class="badge warn">暂停/下架</span>';
+        return '<span class="badge warn">Paused/removed</span>';
       }
-      return '<span class="badge ok">可用</span>';
+      return '<span class="badge ok">Available</span>';
     };
-    w.innerHTML = '<div style="font-size:12px;color:var(--muted);margin-bottom:6px">按上游 rateLimitsByModel 今日剩余次数排序（已暂停/高峰模型自动靠后）</div>' +
-      '<div style="overflow-x:auto"><table style="width:100%"><thead><tr><th>模型</th><th>今日剩余</th><th>积分价</th><th>可用性</th></tr></thead><tbody>' +
-      top.map(([m, v]) => `<tr><td>${esc(m)}</td><td><b>${v.usable_today === -1 ? '不限' : esc(String(v.usable_today ?? '—'))}</b></td><td>${v.price === 0 ? '<b class="tok">免费</b>' : esc(String(v.price ?? '—'))}</td><td>${availCell(m)}</td></tr>`).join('') +
+    w.innerHTML = '<div style="font-size:12px;color:var(--muted);margin-bottom:6px">Sorted by upstream rateLimitsByModel remaining count today (paused/peak models sorted last)</div>' +
+      '<div style="overflow-x:auto"><table style="width:100%"><thead><tr><th>Model</th><th>Remaining Today</th><th>Credit Price</th><th>Availability</th></tr></thead><tbody>' +
+      top.map(([m, v]) => `<tr><td>${esc(m)}</td><td><b>${v.usable_today === -1 ? 'Unlimited' : esc(String(v.usable_today ?? '—'))}</b></td><td>${v.price === 0 ? '<b class="tok">Free</b>' : esc(String(v.price ?? '—'))}</td><td>${availCell(m)}</td></tr>`).join('') +
       '</tbody></table></div>';
   } catch (e) { $('recommend-panel').style.display = 'none'; }
 }
 
-// ---------- 数据迁移（v0.9 §2.3） ----------
+// ---------- Data Migration (v0.9 §2.3) ----------
 async function exportConfig() {
-  const st = $('migrate-status'); if (st) st.textContent = '导出中…';
+  const st = $('migrate-status'); if (st) st.textContent = 'Exporting…';
   try {
     const d = await api('/api/export');
     const blob = new Blob([JSON.stringify({ data: d.data }, null, 2)], { type: 'application/json' });
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob); a.download = 'freebuff2api-export-' + new Date().toISOString().slice(0, 10) + '.json'; a.click();
     URL.revokeObjectURL(a.href);
-    if (st) st.textContent = '已导出（含 ' + (d.data.tokens || []).length + ' 条凭证）';
-    toast('已导出配置');
-  } catch (e) { if (st) st.textContent = ''; toast('导出失败：' + e.message, 3500); }
+    if (st) st.textContent = 'Exported (includes ' + (d.data.tokens || []).length + ' credential(s))';
+    toast('Config exported');
+  } catch (e) { if (st) st.textContent = ''; toast('Export failed: ' + e.message, 3500); }
 }
 async function importConfig(files) {
   const f = files && files[0]; const st = $('migrate-status');
   if (!f) return;
   let parsed;
   try { parsed = JSON.parse(await f.text()); }
-  catch (e) { if (st) st.textContent = ''; toast('JSON 解析失败', 3000); return; }
+  catch (e) { if (st) st.textContent = ''; toast('JSON parse failed', 3000); return; }
   const data = parsed && parsed.data ? parsed.data : parsed;
   const tokens = (data && data.tokens) || [];
   const skills = (data && data.skills) || [];
   const mem = data && data.memory_enabled;
-  const okc = confirm('将导入：\n· 凭证 ' + tokens.length + ' 条（覆盖本机 tokens.json，导入前自动备份）\n· 技能启用态 ' + skills.length + ' 项\n· 记忆开关：' + (mem === undefined ? '不变' : (mem ? '开启' : '关闭')) + '\n· config 白名单字段（api_keys/auth_tokens 不会被覆盖）\n\n继续？');
+  const okc = confirm('Will import:\n· Credentials: ' + tokens.length + ' (overwrites local tokens.json, auto-backed up before import)\n· Skill enabled states: ' + skills.length + ' item(s)\n· Memory toggle: ' + (mem === undefined ? 'unchanged' : (mem ? 'on' : 'off')) + '\n· config whitelisted fields (api_keys/auth_tokens will not be overwritten)\n\nContinue?');
   if (!okc) { if (st) st.textContent = ''; return; }
-  if (st) st.textContent = '导入中…';
+  if (st) st.textContent = 'Importing…';
   try {
     const r = await api('/api/import', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ data }) });
     const s = r.imported || {};
-    const msg = '导入完成：tokens ' + (s.tokens ?? 0) + ' 条' + (s.backed_up_to ? '，备份至 ' + s.backed_up_to : '');
-    if (st) st.textContent = msg; toast('导入成功');
+    const msg = 'Import complete: tokens ' + (s.tokens ?? 0) + (s.backed_up_to ? ', backed up to ' + s.backed_up_to : '');
+    if (st) st.textContent = msg; toast('Import successful');
     refreshTokens(); loadSettings();
-  } catch (e) { if (st) st.textContent = ''; toast('导入失败：' + e.message, 4000); }
+  } catch (e) { if (st) st.textContent = ''; toast('Import failed: ' + e.message, 4000); }
 }
 
-// ---------- 启动 ----------
+// ---------- Startup ----------
 initTabKeyboard();
 refreshOverview();
 loadRecommend();
 loadGuide();
-// 扩展可能在页面加载后才被激活，启动后多探几次（最多 5 次，探测到即停）
+// Extension may only activate after page load; probe a few extra times after startup (up to 5 tries, stop once detected)
 renderExtStatus();
 (() => {
   let tries = 0;
   const t = setInterval(() => { pingExtension(); if (++tries >= 5 || extId) clearInterval(t); }, 2000);
 })();
-// hash 路由：托盘「系统体检」→ /#doctor（加载时 + hash 变化时均响应）
+// hash routing: tray "System Health Check" → /#doctor (responds both on load and on hash change)
 function applyHashTab() {
   const h = location.hash.replace(/^#/, '');
   if (h && document.querySelector('nav button[data-tab="' + h + '"]')) showTab(h);
@@ -1889,6 +1938,8 @@ function applyHashTab() {
 if (location.hash === '#doctor') showTab('doctor');
 window.addEventListener('hashchange', applyHashTab);
 startOverviewTimer();
+// The embedded login window needs WebView2 (Windows only): hide Option A when the gateway runs elsewhere (Linux/Docker/Render)
+fetch('/healthz').then(r => r.json()).then(h => { if (h.os && h.os !== 'windows') { const e = $('wizard-embed'); if (e) e.style.display = 'none'; } }).catch(() => {});
 </script>
 </body>
 </html>"##;

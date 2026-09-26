@@ -1,4 +1,4 @@
--- Migration 0002: 增强审计和统计功能
+-- Migration 0002: enhanced audit and statistics features
 ALTER TABLE usage_events ADD COLUMN ip TEXT DEFAULT '';
 ALTER TABLE usage_events ADD COLUMN path TEXT DEFAULT '';
 ALTER TABLE usage_events ADD COLUMN user_agent TEXT DEFAULT '';

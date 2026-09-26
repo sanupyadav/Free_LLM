@@ -1,11 +1,11 @@
-//! 遥测写入：独立 SQLite 连接 + 后台写线程（WAL 模式）
+//! Telemetry writer: independent SQLite connection + background writer thread (WAL mode)
 //!
-//! - `requests_v2`：单请求明细（模型、账号、状态、延迟、token、错误等）
-//! - `events`：请求生命周期事件
-//! - 使用独立连接与线程，不与 `usage.rs` 争锁；`record` 为 `try_send`
-//!   非阻塞，队列满计入 [`TelemetryWriter::dropped`]
-//! - [`TelemetryWriter::flush`] 发送屏障消息并等待写完（测试/关闭用）
-//! - `Drop` 发送关闭信号并 join 线程，确保 Windows 下 SQLite 句柄释放
+//! - `requests_v2`: per-request detail (model, account, status, latency, tokens, errors, etc.)
+//! - `events`: request lifecycle events
+//! - Uses a separate connection and thread so it doesn't contend for locks with `usage.rs`; `record` uses `try_send`
+//!   non-blocking, counted into [`TelemetryWriter::dropped`] when the queue is full
+//! - [`TelemetryWriter::flush`] sends a barrier message and waits for writes to complete (used in tests/shutdown)
+//! - `Drop` sends a shutdown signal and joins the thread, ensuring the SQLite handle is released on Windows
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -16,7 +16,7 @@ use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
-/// 建表语句（幂等）
+/// Table creation statements (idempotent)
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS requests_v2 (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -49,7 +49,7 @@ CREATE INDEX IF NOT EXISTS idx_requests_v2_req ON requests_v2(req_id);
 CREATE INDEX IF NOT EXISTS idx_events_req ON events(req_id);
 "#;
 
-/// 单请求遥测明细
+/// Per-request telemetry detail
 #[derive(Debug, Clone, Default)]
 pub struct TraceRow {
     pub req_id: String,
@@ -70,7 +70,7 @@ pub struct TraceRow {
     pub client_ip: Option<String>,
 }
 
-/// 后台写线程消息
+/// Background writer thread message
 enum Msg {
     Row(Box<TraceRow>),
     Event {
@@ -78,12 +78,12 @@ enum Msg {
         kind: String,
         detail: String,
     },
-    /// 屏障：收到即回复 ack（此前消息均已落库）
+    /// Barrier: replies with ack as soon as received (all prior messages are already persisted)
     Flush(std::sync::mpsc::Sender<()>),
     Shutdown,
 }
 
-/// 遥测写入器（克隆共享 sender 即可在多处使用）
+/// Telemetry writer (clone the shared sender to use it in multiple places)
 pub struct TelemetryWriter {
     tx: SyncSender<Msg>,
     dropped: Arc<AtomicU64>,
@@ -91,9 +91,9 @@ pub struct TelemetryWriter {
 }
 
 impl TelemetryWriter {
-    /// 打开/建库建表并启动后台写线程
+    /// Opens/creates the database and tables, and starts the background writer thread
     ///
-    /// 建表在调用线程完成，因此返回成功即保证表已存在。
+    /// Table creation happens on the calling thread, so a successful return guarantees the tables already exist.
     pub fn spawn(db_path: PathBuf, capacity: usize) -> Result<Self> {
         let conn = open_db(&db_path)?;
         let (tx, rx) = sync_channel::<Msg>(capacity.clamp(1, 1 << 20));
@@ -101,7 +101,7 @@ impl TelemetryWriter {
         let handle = std::thread::Builder::new()
             .name("telemetry-writer".into())
             .spawn(move || writer_loop(conn, rx))
-            .context("启动遥测写线程失败")?;
+            .context("failed to start telemetry writer thread")?;
         Ok(Self {
             tx,
             dropped,
@@ -109,12 +109,12 @@ impl TelemetryWriter {
         })
     }
 
-    /// 记录一条请求明细（非阻塞，队列满丢弃并计数）
+    /// Records a request detail (non-blocking; dropped and counted if the queue is full)
     pub fn record(&self, row: TraceRow) {
         self.enqueue(Msg::Row(Box::new(row)));
     }
 
-    /// 记录一条请求事件
+    /// Records a request event
     pub fn event(&self, req_id: &str, kind: &str, detail: &str) {
         self.enqueue(Msg::Event {
             req_id: req_id.to_string(),
@@ -123,12 +123,12 @@ impl TelemetryWriter {
         });
     }
 
-    /// 因队列满/线程退出而丢弃的消息数
+    /// Number of messages dropped due to a full queue / thread exit
     pub fn dropped(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
     }
 
-    /// 等待队列排空（发送屏障并等待写线程确认）
+    /// Waits for the queue to drain (sends a barrier and waits for the writer thread to confirm)
     pub fn flush(&self) {
         let (ack_tx, ack_rx) = std::sync::mpsc::channel();
         if self.tx.send(Msg::Flush(ack_tx)).is_ok() {
@@ -136,7 +136,7 @@ impl TelemetryWriter {
         }
     }
 
-    /// 非阻塞入队，失败计入 dropped
+    /// Non-blocking enqueue; counted into dropped on failure
     fn enqueue(&self, msg: Msg) {
         match self.tx.try_send(msg) {
             Ok(()) => {}
@@ -149,7 +149,7 @@ impl TelemetryWriter {
 
 impl Drop for TelemetryWriter {
     fn drop(&mut self) {
-        // 队列满时阻塞等待，确保关闭信号送达；线程已退出则忽略错误
+        // Blocks and waits when the queue is full, to ensure the shutdown signal gets through; ignores the error if the thread has already exited
         let _ = self.tx.send(Msg::Shutdown);
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
@@ -157,13 +157,13 @@ impl Drop for TelemetryWriter {
     }
 }
 
-/// 后台线程主循环：顺序消费消息，出错仅告警不中断
-/// 落库前对敏感字段脱敏（Cookie/Bearer/authorization → ***），见 `crate::redact`。
+/// Background thread main loop: consumes messages in order, warns on error without interrupting
+/// Sensitive fields are redacted before persisting (Cookie/Bearer/authorization -> ***), see `crate::redact`.
 fn writer_loop(conn: Connection, rx: Receiver<Msg>) {
     for msg in rx {
         match msg {
             Msg::Row(mut row) => {
-                // v0.8 脱敏：错误摘要/路由原因/请求 key 都可能含凭证片段
+                // v0.8 redaction: error excerpt / route reason / request key may all contain credential fragments
                 if let Some(ex) = row.error_excerpt.take() {
                     row.error_excerpt = Some(crate::redact::redact(&ex));
                 }
@@ -174,7 +174,7 @@ fn writer_loop(conn: Connection, rx: Receiver<Msg>) {
                     row.api_key = Some(crate::redact::redact(&k));
                 }
                 if let Err(e) = insert_row(&conn, &row) {
-                    tracing::warn!(error = %e, "遥测明细写入失败");
+                    tracing::warn!(error = %e, "failed to write telemetry detail");
                 }
             }
             Msg::Event {
@@ -184,7 +184,7 @@ fn writer_loop(conn: Connection, rx: Receiver<Msg>) {
             } => {
                 let detail = crate::redact::redact(&detail);
                 if let Err(e) = insert_event(&conn, &req_id, &kind, &detail) {
-                    tracing::warn!(error = %e, "遥测事件写入失败");
+                    tracing::warn!(error = %e, "failed to write telemetry event");
                 }
             }
             Msg::Flush(ack) => {
@@ -195,23 +195,23 @@ fn writer_loop(conn: Connection, rx: Receiver<Msg>) {
     }
 }
 
-/// 打开数据库：建目录、启用 WAL、建表
+/// Opens the database: creates the directory, enables WAL, creates tables
 fn open_db(path: &Path) -> Result<Connection> {
     if let Some(dir) = path.parent() {
         if !dir.as_os_str().is_empty() {
             std::fs::create_dir_all(dir)
-                .with_context(|| format!("创建遥测目录失败: {}", dir.display()))?;
+                .with_context(|| format!("failed to create telemetry directory: {}", dir.display()))?;
         }
     }
     let conn =
-        Connection::open(path).with_context(|| format!("打开遥测库失败: {}", path.display()))?;
-    // 审计 L1：设 busy_timeout，避免与后台写线程瞬时争锁时 SQLITE_BUSY
+        Connection::open(path).with_context(|| format!("failed to open telemetry database: {}", path.display()))?;
+    // Audit L1: sets busy_timeout to avoid SQLITE_BUSY from momentary lock contention with the background writer thread
     let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
-    // journal_mode 会返回一行结果，必须用 query_row 读取
+    // journal_mode returns a row, so it must be read with query_row
     let _mode: String = conn
         .query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))
-        .context("启用 WAL 失败")?;
-    conn.execute_batch(SCHEMA).context("初始化遥测表失败")?;
+        .context("failed to enable WAL")?;
+    conn.execute_batch(SCHEMA).context("failed to initialize telemetry tables")?;
     Ok(conn)
 }
 
@@ -242,7 +242,7 @@ fn insert_row(conn: &Connection, row: &TraceRow) -> Result<()> {
             row.client_ip
         ],
     )
-    .context("写入 requests_v2 失败")?;
+    .context("failed to write to requests_v2")?;
     Ok(())
 }
 
@@ -251,17 +251,17 @@ fn insert_event(conn: &Connection, req_id: &str, kind: &str, detail: &str) -> Re
         "INSERT INTO events (req_id, ts, kind, detail) VALUES (?1,?2,?3,?4)",
         params![req_id, Utc::now().to_rfc3339(), kind, detail],
     )
-    .context("写入 events 失败")?;
+    .context("failed to write to events")?;
     Ok(())
 }
 
-/// "三最"遥测聚合：最慢账号 Top3、最常用模型 Top5、错误率最高时段 Top3。
+/// "Top 3" telemetry aggregation: slowest accounts Top3, most-used models Top5, highest-error-rate hours Top3.
 ///
-/// - window_hours：>0 时只统计最近 N 小时；否则不限
-/// - 全部聚合在本地 SQLite 完成；空库返回空数组，不报错
-/// - account 空/NULL 回退 "unknown"；错误判定 status >= 400（覆盖 5xx）
-/// - 慢账号按总耗时均值(latency_ms)降序，并列按 TTFT 均值(ttft_ms)降序，
-///   同时返回 TTFT 均值（指南 2.3「TTFT 均值」口径）
+/// - window_hours: when >0, only counts the last N hours; otherwise unbounded
+/// - All aggregation is done locally in SQLite; an empty database returns empty arrays, no error
+/// - account empty/NULL falls back to "unknown"; an error is defined as status >= 400 (covers 5xx)
+/// - Slow accounts are sorted descending by mean total latency (latency_ms), ties broken descending by mean TTFT (ttft_ms),
+///   and the mean TTFT is also returned (per guideline 2.3 "mean TTFT" definition)
 pub fn insights(db_path: &str, hours: i64) -> Result<serde_json::Value> {
     let conn = open_db(Path::new(db_path))?;
     let generated_at = Utc::now();
@@ -271,7 +271,7 @@ pub fn insights(db_path: &str, hours: i64) -> Result<serde_json::Value> {
         "1970-01-01T00:00:00Z".to_string()
     };
 
-    // 1) 最慢账号 Top3
+    // 1) Slowest accounts Top3
     let mut slowest_stmt = conn.prepare(
         "SELECT COALESCE(NULLIF(TRIM(account), ''), 'unknown') AS acct,
                 COUNT(*), AVG(latency_ms), AVG(ttft_ms)
@@ -309,7 +309,7 @@ pub fn insights(db_path: &str, hours: i64) -> Result<serde_json::Value> {
             })
         })
         .collect();
-    // 2) 最常用模型 Top5（请求数降序 + 错误率）
+    // 2) Most-used models Top5 (descending request count + error rate)
     let mut model_stmt = conn.prepare(
         "SELECT COALESCE(NULLIF(TRIM(resolved_model), ''), NULLIF(TRIM(requested_model), ''), 'unknown') AS model,
                 COUNT(*), SUM(CASE WHEN status >= 400 THEN 1 ELSE 0 END)
@@ -338,7 +338,7 @@ pub fn insights(db_path: &str, hours: i64) -> Result<serde_json::Value> {
         })
         .collect();
 
-    // 3) 错误率最高时段 Top3（按小时 UTC）
+    // 3) Highest-error-rate hours Top3 (by UTC hour)
     let mut hour_stmt = conn.prepare(
         "SELECT substr(ts, 1, 13) AS hour_utc, COUNT(*),
                 SUM(CASE WHEN status >= 400 THEN 1 ELSE 0 END)
@@ -390,7 +390,7 @@ pub fn insights(db_path: &str, hours: i64) -> Result<serde_json::Value> {
     }))
 }
 
-/// 归一到 4 位小数的错误率，避免浮点尾差
+/// Error rate normalized to 4 decimal places, to avoid floating-point tail differences
 fn round_rate(rate: f64) -> f64 {
     (rate * 10_000.0).round() / 10_000.0
 }
@@ -484,7 +484,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("telemetry.db");
         let writer = TelemetryWriter::spawn(path.clone(), 16).unwrap();
-        writer.event("req-7", "retry", "第 2 次尝试");
+        writer.event("req-7", "retry", "2nd attempt");
         writer.flush();
         {
             let conn = Connection::open(&path).unwrap();
@@ -495,14 +495,14 @@ mod tests {
                 .unwrap();
             assert_eq!(req_id, "req-7");
             assert_eq!(kind, "retry");
-            assert_eq!(detail, "第 2 次尝试");
+            assert_eq!(detail, "2nd attempt");
         }
         drop(writer);
     }
 
     #[test]
     fn enqueue_counts_dropped_when_full() {
-        // 内部入队逻辑：容量 1 的通道先占满，再入队必然计入 dropped
+        // Internal enqueue logic: fill a capacity-1 channel first, so the next enqueue must count into dropped
         let (tx, rx) = test_channel::<Msg>(1);
         let dropped = Arc::new(AtomicU64::new(0));
         tx.try_send(Msg::Shutdown).unwrap();
@@ -514,7 +514,7 @@ mod tests {
         writer.record(sample_row("a"));
         writer.record(sample_row("b"));
         assert_eq!(writer.dropped(), 2);
-        // 先断开 receiver，避免 Drop 中 Shutdown 的阻塞 send 永久等待
+        // Disconnect the receiver first, to avoid the blocking send of Shutdown in Drop waiting forever
         drop(rx);
         drop(writer);
     }
@@ -523,7 +523,7 @@ mod tests {
     fn dropped_and_persisted_conserve_total_records() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("telemetry.db");
-        // 极小容量 + 瞬间灌入，触发丢弃；总量守恒：落库 + 丢弃 == 总数
+        // Tiny capacity + instant flood, triggering drops; total is conserved: persisted + dropped == total
         let writer = TelemetryWriter::spawn(path.clone(), 1).unwrap();
         let total = 300u64;
         for i in 0..total {
@@ -551,7 +551,7 @@ mod tests {
             writer.record(sample_row("first"));
             writer.flush();
         }
-        // 第二次 spawn：表已存在应幂等复用
+        // Second spawn: tables already exist, should be idempotently reused
         let writer = TelemetryWriter::spawn(path.clone(), 8).unwrap();
         writer.record(sample_row("second"));
         writer.flush();
@@ -572,13 +572,13 @@ mod tests {
         let writer = TelemetryWriter::spawn(path.clone(), 8).unwrap();
         writer.record(sample_row("r"));
         drop(writer);
-        // 句柄已释放：Windows 下应可直接删除整个目录
+        // Handle already released: on Windows the whole directory should be directly removable
         let removed = std::fs::remove_dir_all(dir.path());
-        assert!(removed.is_ok(), "SQLite 句柄未释放: {removed:?}");
+        assert!(removed.is_ok(), "SQLite handle not released: {removed:?}");
     }
 
-    /// 直接插入一条已知时间戳的请求（不走写线程，便于构造窗口/时段样本）
-    #[allow(clippy::too_many_arguments)] // 测试构造器：字段多，参数清晰优先
+    /// Directly inserts a request with a known timestamp (bypassing the writer thread, for building window/hour samples)
+    #[allow(clippy::too_many_arguments)] // test constructor: many fields, clarity over brevity
     fn insert_direct(
         conn: &Connection,
         req_id: &str,
@@ -683,7 +683,8 @@ mod tests {
         insert_direct(&conn, "e", h2, "acct", "claude", 200, 100, Some(10));
         insert_direct(&conn, "f", h2, "acct", "claude", 200, 100, Some(10));
 
-        let v = insights(path.to_str().unwrap(), 24).unwrap();
+        // window 0 = unbounded: the fixed timestamps above would age out of a 24h window
+        let v = insights(path.to_str().unwrap(), 0).unwrap();
         let arr = v["worst_hours"].as_array().unwrap();
         assert_eq!(arr.len(), 2);
         assert_eq!(arr[0]["hour_utc"], "2026-09-19T08");

@@ -1,7 +1,9 @@
-// Freebuff2API 面板 ↔ 扩展 桥接（content script，仅注入 127.0.0.1 / localhost）
-// 作用：把扩展 ID 与版本号通过 window.postMessage 告诉网关控制面板（/ui），
-// 面板拿到 ID 后即可用 chrome.runtime.sendMessage(扩展ID, {type:'freebuff2api.import'}) 直连扩展。
-// 背景：content script 与页面共享同一个 window，postMessage 是两者唯一可用的通信方式。
+// Freebuff2API panel <-> extension bridge (content script, injected only on 127.0.0.1 / localhost)
+// Purpose: announces the extension ID and version to the gateway control panel (/ui) via
+// window.postMessage; once the panel has the ID, it can connect directly to the extension via
+// chrome.runtime.sendMessage(extensionId, {type:'freebuff2api.import'}).
+// Background: the content script and the page share the same window, so postMessage is the
+// only communication channel available between them.
 
 (function () {
   'use strict';
@@ -11,7 +13,8 @@
 
   function handshake() {
     try {
-      // 扩展被重载后旧 content script 的 runtime 会失效，此时 chrome.runtime.id 抛异常——静默即可
+      // After the extension reloads, the old content script's runtime becomes invalid and
+      // chrome.runtime.id throws -- silently ignore it
       window.postMessage(
         {
           source: SOURCE_EXT,
@@ -20,20 +23,21 @@
         },
         location.origin
       );
-    } catch (e) { /* 扩展上下文失效，等待页面刷新 */ }
+    } catch (e) { /* extension context invalidated, wait for a page refresh */ }
   }
 
   window.addEventListener('message', function (ev) {
-    // 只接受本窗口、本源的页面消息
+    // Only accept page messages from this window and this origin
     if (ev.source !== window) return;
     if (ev.origin !== location.origin) return;
     var d = ev.data;
     if (!d || typeof d !== 'object') return;
     if (d.source !== SOURCE_PAGE) return;
-    // 面板可能在 bridge 注入前就已开始监听，因此每次 ping 都重发一次握手
+    // The panel may start listening before the bridge injects, so resend the handshake on every ping
     if (d.type === 'ping') handshake();
   });
 
-  // 尽早广播一次；若页面脚本此时尚未注册监听，会通过上面的 ping 机制补发
+  // Broadcast once as early as possible; if the page script hasn't registered its listener yet,
+  // the ping mechanism above will retry
   handshake();
 })();

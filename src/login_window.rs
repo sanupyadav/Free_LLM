@@ -1,7 +1,7 @@
-//! 内嵌登录窗口平台入口：Windows 走 WebView2 实现，其他平台走 stub。
+//! Platform entry point for the embedded login window: Windows uses the WebView2 implementation, other platforms use the stub.
 //!
-//! 统一 API（`is_login_mode` / `run_login_window` / `spawn_login_window`），
-//! 调用方（main.rs / api.rs）无需感知平台差异。
+//! Unified API (`is_login_mode` / `run_login_window` / `spawn_login_window`);
+//! callers (main.rs / api.rs) don't need to be aware of platform differences.
 
 #[cfg(windows)]
 pub use crate::login_window_windows::*;

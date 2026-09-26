@@ -1,15 +1,15 @@
-//! Web 版协议客户端（freebuff.com）
+//! Web protocol client (freebuff.com)
 //!
-//! 逆向自 Freebuff web 版网络包：
-//! - POST /api/chat/stream  —— Cookie 鉴权，SSE 流式（11 种事件类型）
-//! - POST /api/chat/upload   —— multipart 上传 → convex storageId → images
-//! - GET  /api/web/freebuff-session —— 积分/套餐/每模型每日限额
-//! - GET  /api/web/usage-summary —— 用量汇总（streak/tokens/sessionsByModel）
-//! - GET  /api/auth/session   —— 用户信息
-//! - GET  /api/web/subscriptions —— 套餐 tiers
-//! - GET  /api/web/convex-token —— token 续期（短期 JWT）
+//! Reverse-engineered from the Freebuff web app's network traffic:
+//! - POST /api/chat/stream  -- Cookie auth, SSE streaming (11 event types)
+//! - POST /api/chat/upload   -- multipart upload -> convex storageId -> images
+//! - GET  /api/web/freebuff-session -- freebucks / plan / per-model daily limits
+//! - GET  /api/web/usage-summary -- usage summary (streak/tokens/sessionsByModel)
+//! - GET  /api/auth/session   -- user info
+//! - GET  /api/web/subscriptions -- plan tiers
+//! - GET  /api/web/convex-token -- token renewal (short-lived JWT)
 //!
-//! 鉴权靠 Cookie（__Secure-next-auth.session-token 等），无 Bearer。
+//! Auth relies on Cookie (__Secure-next-auth.session-token etc.), no Bearer.
 
 use anyhow::{anyhow, Result};
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
@@ -20,7 +20,7 @@ use std::time::Duration;
 
 pub const WEB_HOST: &str = "https://freebuff.com";
 
-/// FNV-1a 64 位（零依赖、跨版本稳定；与 `import::cred_id` 同算法，保证指纹可重现）
+/// FNV-1a 64-bit (zero dependency, stable across versions; same algorithm as `import::cred_id`, so the fingerprint is reproducible)
 fn fnv1a64(s: &str) -> u64 {
     const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -32,8 +32,8 @@ fn fnv1a64(s: &str) -> u64 {
     h
 }
 
-/// 指纹种子：取 session-token 的值（无则退化为整串 Cookie）。
-/// 种子只在本机参与哈希，原始 Cookie 不外传。
+/// Fingerprint seed: takes the session-token value (falls back to the whole Cookie if absent).
+/// The seed only participates in local hashing; the raw Cookie is never sent out.
 fn session_seed(cookie: &str) -> String {
     cookie
         .split(';')
@@ -46,14 +46,16 @@ fn session_seed(cookie: &str) -> String {
         .unwrap_or_else(|| cookie.to_string())
 }
 
-/// 上游抓包中客户端会带 `x-freebuff-instance-id`（UUID 形状）。
-/// 此前网关完全不发这个头 —— 抓包里有、我们却没有，是最容易被风控识别的差异之一。
-/// 这里按 Cookie 派生：同账号每次启动都得到同一个值，不同账号得到不同值。
+/// Upstream packet captures show the client sends `x-freebuff-instance-id` (UUID-shaped).
+/// The gateway previously never sent this header at all -- present in captures but missing on
+/// our side is one of the differences most likely to be flagged by risk control.
+/// Derived here from the Cookie: the same account always gets the same value on every startup,
+/// different accounts get different values.
 pub fn instance_id_for_cookie(cookie: &str) -> String {
     let seed = session_seed(cookie);
     let a = fnv1a64(&seed);
     let b = fnv1a64(&format!("{seed}#instance"));
-    let hex = format!("{a:016x}{b:016x}"); // 32 个 ASCII 十六进制字符
+    let hex = format!("{a:016x}{b:016x}"); // 32 ASCII hex characters
     format!(
         "{}-{}-4{}-{}-{}",
         &hex[0..8],
@@ -69,23 +71,23 @@ pub struct WebClient {
     http: reqwest::Client,
     pub cookie: String,
     pub model: String,
-    /// 上游 host（默认 WEB_HOST；测试可注入本地 Mock 地址）
+    /// Upstream host (defaults to WEB_HOST; tests can inject a local mock address)
     base_host: String,
-    /// 按 Cookie 派生的实例 id（上游 `x-freebuff-instance-id`；同账号稳定、跨账号不同）
+    /// Instance id derived from the Cookie (upstream `x-freebuff-instance-id`; stable per account, different across accounts)
     instance_id: String,
-    /// 最近一次流中上游 meta/title 事件给出的 threadId（多轮续聊用）。
-    /// 并发多路流共用同一 WebClient 时以最后写入者为准。
+    /// The threadId from the most recent upstream meta/title event in this stream (for multi-turn continuation).
+    /// When concurrent streams share the same WebClient, the last writer wins.
     last_thread_id: Arc<Mutex<Option<String>>>,
-    /// 上游 200 内嵌错误旁路（本路流最近一次检测到的 error envelope）。
-    /// encode_block 在反序列化前探测——桥接层 tail 只含转换后 chunk，这是唯一可见点。
+    /// Upstream embedded-error bypass for a 200 response (the most recently detected error envelope on this stream).
+    /// Detected by encode_block before deserialization -- the bridge layer's tail only contains converted chunks, so this is the only visible point.
     last_upstream_error: Arc<Mutex<Option<String>>>,
 }
 
-/// chat/stream SSE 事件（web 版 11 种类型）
+/// chat/stream SSE events (11 types in the web app)
 ///
-/// 注意：上游 JSON 的字段名为 camelCase（`threadId`/`toolCallId`/`accessTier`），
-/// 而 `rename_all` 只作用于变体名，故必须用 `rename_all_fields` 映射字段名，
-/// 否则带下划线的字段会静默落为 None。
+/// Note: upstream JSON field names are camelCase (`threadId`/`toolCallId`/`accessTier`),
+/// and `rename_all` only affects variant names, so `rename_all_fields` must be used to map
+/// field names too, otherwise fields with underscores silently fall back to None.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(
     tag = "type",
@@ -167,7 +169,7 @@ pub struct Followup {
     pub label: String,
 }
 
-/// 累计流式结果
+/// Accumulated streaming result
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StreamResult {
     pub thread_id: Option<String>,
@@ -179,12 +181,12 @@ pub struct StreamResult {
     pub suggestions: Vec<Followup>,
     pub tools: Vec<String>,
     pub done: bool,
-    /// 转 OpenAI tool_calls 的中间态（agent_tool → agent_tool_done 对）
+    /// Intermediate state for converting to OpenAI tool_calls (agent_tool -> agent_tool_done pairs)
     #[serde(default)]
     pub tool_calls: Vec<ToolCallState>,
 }
 
-/// 上游 agent_tool 事件 → OpenAI 工具调用状态
+/// Upstream agent_tool event -> OpenAI tool-call state
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCallState {
     pub id: String,
@@ -213,9 +215,11 @@ pub struct GravityUserData {
 }
 
 impl GravityContext {
-    /// 按 Cookie 派生确定性指纹（同账号稳定、不同账号不同）。
-    /// 此前硬编码抓包中的 visitor_id/session_id，所有用户共用同一指纹——易被上游风控识别为同一客户端。
-    /// 用 Cookie 中的 session-token 值作为种子（无则用整串），仅本地计算，不外传原始 Cookie。
+    /// Derives a deterministic fingerprint from the Cookie (stable per account, different across accounts).
+    /// Previously hardcoded the visitor_id/session_id from a packet capture, so all users shared the same
+    /// fingerprint -- easily flagged by upstream risk control as the same client.
+    /// Uses the session-token value from the Cookie as the seed (falls back to the whole string), computed
+    /// locally only, the raw Cookie is never sent out.
     pub fn for_cookie(cookie: &str) -> Self {
         let seed = session_seed(cookie);
         let v = fnv1a64(&seed);
@@ -227,7 +231,7 @@ impl GravityContext {
             v.rotate_right(13),
             v ^ 0x9E37_79B9_7F4A_7C15
         );
-        // 客户端环境也按账号派生：所有账号共用同一套 screen/viewport/hardware 同样是可识别特征
+        // The client environment is also derived per account: all accounts sharing the same screen/viewport/hardware would also be an identifiable trait
         let pick = |salt: u64, lo: u64, hi: u64| -> u64 {
             lo + (fnv1a64(&format!("{seed}#{salt}")) % (hi - lo + 1))
         };
@@ -297,12 +301,14 @@ impl WebClient {
         Self::with_host(cookie, model, WEB_HOST)
     }
 
-    /// 指定上游 host 构造（默认 `WEB_HOST`；测试用本地 Mock 地址覆盖）
+    /// Construct with a given upstream host (defaults to `WEB_HOST`; tests override with a local mock address)
     pub fn with_host(cookie: String, model: String, base_host: &str) -> Result<Self> {
-        // 流式响应不受整体 timeout 影响：reqwest 的 .timeout() 是「总请求」超时，对流式会截断
-        // （v0.7.3 修复：此前 300s 总超时会把仍在增量的长流硬生生掐断，客户端表现为
-        //  ERR_INCOMPLETE_CHUNKED_ENCODING）。与 upstream.rs 同款做法：read_timeout =
-        //  单次读块超时——只要增量还在吐就一直收，只有完全静默 5 分钟才断。
+        // Streaming responses are not affected by the overall timeout: reqwest's .timeout() is a
+        // "whole request" timeout and would cut off a stream mid-flight
+        // (fixed in v0.7.3: the previous 300s total timeout would hard-kill a long stream that was
+        //  still producing increments, which the client saw as ERR_INCOMPLETE_CHUNKED_ENCODING).
+        // Same approach as upstream.rs: read_timeout = per-chunk read timeout -- keeps reading as
+        // long as increments keep arriving, only cuts off after 5 minutes of total silence.
         let http = reqwest::Client::builder()
             .read_timeout(Duration::from_secs(300))
             .user_agent(crate::upstream::DESKTOP_UA)
@@ -321,24 +327,24 @@ impl WebClient {
         })
     }
 
-    /// 最近一次 web 流中上游 meta/title 事件给出的 threadId。
-    /// 调用后可用于下一轮请求的 `thread_id` 续聊；从未收到则返回 None。
+    /// The threadId from the most recent upstream meta/title event in a web stream.
+    /// Can be used for the next request's `thread_id` to continue the conversation; returns None if never received.
     pub fn last_thread_id(&self) -> Option<String> {
         self.last_thread_id.lock().ok().and_then(|g| g.clone())
     }
 
-    /// 内部：threadId 记录槽（克隆 Arc 供流闭包持有，避免借用 self）
+    /// Internal: threadId slot (clones the Arc for the stream closure to hold, avoids borrowing self)
     fn thread_slot(&self) -> Arc<Mutex<Option<String>>> {
         self.last_thread_id.clone()
     }
 
-    /// 内部：上游内嵌错误旁路槽（同 thread_slot 模式）
+    /// Internal: upstream embedded-error bypass slot (same pattern as thread_slot)
     fn error_slot(&self) -> Arc<Mutex<Option<String>>> {
         self.last_upstream_error.clone()
     }
 
-    /// 本 WebClient 最近一路流中检测到的上游内嵌错误（200 OK + error envelope）。
-    /// 桥接层在流结束时读取，用于遥测/日志如实记录失败原因。
+    /// The upstream embedded error detected in this WebClient's most recent stream (200 OK + error envelope).
+    /// Read by the bridge layer at stream end, used to accurately record the failure reason in telemetry/logs.
     pub fn last_upstream_error(&self) -> Option<String> {
         self.last_upstream_error.lock().ok().and_then(|g| g.clone())
     }
@@ -354,7 +360,7 @@ impl WebClient {
             HeaderValue::from_static("https://freebuff.com/chat"),
         );
         h.insert("accept", HeaderValue::from_static("*/*"));
-        // 上游网页版每个请求都会带这个头（高级功能.txt:610/804）；缺失是最容易被风控识别的差异
+        // The upstream web app sends this header on every request (advanced-features.txt:610/804); its absence is one of the differences most likely to be flagged by risk control
         if let Ok(v) = HeaderValue::from_str(&self.instance_id) {
             h.insert("x-freebuff-instance-id", v);
         }
@@ -364,10 +370,10 @@ impl WebClient {
         h
     }
 
-    /// web 聊天流（SSE，真实增量透传）。返回逐事件 body stream。
-    /// 每个上游 data: 事件实时转换为 OpenAI chunk 输出，不聚合不缓冲。
-    /// 上游 meta/title 事件携带的 threadId 通过 [`WebClient::last_thread_id`] 暴露
-    /// （流结束/收到 meta 后可读，用于多轮续聊）。
+    /// Web chat stream (SSE, real incremental passthrough). Returns a per-event body stream.
+    /// Each upstream data: event is converted to an OpenAI chunk in real time, no aggregation or buffering.
+    /// The threadId carried by upstream meta/title events is exposed via [`WebClient::last_thread_id`]
+    /// (readable after the stream ends / after a meta event, for multi-turn continuation).
     pub async fn chat_stream_raw(
         &self,
         thread_id: Option<&str>,
@@ -404,7 +410,7 @@ impl WebClient {
 
         let byte_stream = resp.bytes_stream();
         let sse_buf: Vec<u8> = Vec::new();
-        // 每路流独立的转换器：tool_calls index 分配 + threadId 记录 + 上游内嵌错误旁路
+        // Per-stream converter: tool_calls index allocation + threadId recording + upstream embedded-error bypass
         let error_slot = self.error_slot();
         let encoder = StreamEncoder::new(self.thread_slot(), error_slot);
         let stream = futures::stream::unfold(
@@ -417,7 +423,7 @@ impl WebClient {
                     match stream.next().await {
                         Some(Ok(chunk)) => {
                             buf.extend_from_slice(&chunk);
-                            // 切出完整事件块（空行分隔），逐块转 OpenAI chunk（真实增量）
+                            // Slice out complete event blocks (blank-line delimited), convert each to an OpenAI chunk (real increments)
                             let mut out_line = String::new();
                             let mut got_done = false;
                             while let Some(pos) = find_double_newline(&buf) {
@@ -431,7 +437,7 @@ impl WebClient {
                                 }
                             }
                             if got_done {
-                                // encode_block 已输出 finish_reason chunk + [DONE]
+                                // encode_block already emitted the finish_reason chunk + [DONE]
                                 return Some((
                                     Ok::<_, std::io::Error>(axum::body::Bytes::from(out_line)),
                                     (stream, buf, true, enc),
@@ -443,7 +449,7 @@ impl WebClient {
                                     (stream, buf, false, enc),
                                 ));
                             }
-                            // buf 已无完整事件，继续收下一个 chunk
+                            // No complete event left in buf, keep receiving the next chunk
                         }
                         Some(Err(e)) => {
                             return Some((
@@ -452,7 +458,7 @@ impl WebClient {
                             ));
                         }
                         None => {
-                            // 上游结束但没收到 done → 补发 finish_reason chunk + [DONE]
+                            // Upstream ended without a done event -> emit the finish_reason chunk + [DONE] ourselves
                             let out = format!("{}data: [DONE]\n\n", enc.finish_chunk());
                             return Some((
                                 Ok::<_, std::io::Error>(axum::body::Bytes::from(out)),
@@ -466,7 +472,7 @@ impl WebClient {
         Ok(axum::body::Body::from_stream(stream))
     }
 
-    /// web 聊天流（SSE 聚合版，一次性返回全文）
+    /// Web chat stream (SSE aggregated version, returns the full text at once)
     pub async fn chat_stream(
         &self,
         thread_id: Option<&str>,
@@ -502,12 +508,12 @@ impl WebClient {
         let mut result = StreamResult::default();
         let mut stream = resp.bytes_stream();
         use futures::StreamExt;
-        // 逐行解析 SSE（data: {json} 行，空行分隔事件）
+        // Parse SSE line by line (data: {json} lines, blank line delimits events)
         let mut buf: Vec<u8> = Vec::new();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
             buf.extend_from_slice(&chunk);
-            // 按 \n\n 切事件
+            // Split events on \n\n
             while let Some(pos) = find_double_newline(&buf) {
                 let event_line = buf.drain(..pos).collect::<Vec<u8>>();
                 let line_str = String::from_utf8_lossy(&event_line);
@@ -525,14 +531,14 @@ impl WebClient {
                 }
             }
         }
-        // 聚合路径同样记录 threadId（供后续续聊）
+        // The aggregated path also records threadId (for later continuation)
         record_thread_id(&self.last_thread_id, result.thread_id.as_deref());
         Ok(result)
     }
 
-    /// 上传文件（multipart）→ storageId；model 字段由调用方指定
-    /// 响应：`{kind:"image"|"document", storageId, url?(图片), mediaType, name,
-    ///        descriptionStorageId?(图片), chars?(文档), truncated?(文档)}`
+    /// Upload a file (multipart) -> storageId; the model field is specified by the caller
+    /// Response: `{kind:"image"|"document", storageId, url?(image), mediaType, name,
+    ///        descriptionStorageId?(image), chars?(document), truncated?(document)}`
     pub async fn upload_with_model(
         &self,
         file_bytes: Vec<u8>,
@@ -566,7 +572,7 @@ impl WebClient {
         Ok(resp.json().await?)
     }
 
-    /// 上传文件（multipart）→ storageId（使用客户端配置的默认 model）
+    /// Upload a file (multipart) -> storageId (uses the client's configured default model)
     pub async fn upload(
         &self,
         file_bytes: Vec<u8>,
@@ -577,16 +583,17 @@ impl WebClient {
             .await
     }
 
-    /// 删除上游会话（用户批注：反代不能长期堆积给上游制造压力）。
+    /// Delete an upstream conversation (per the user's note: the reverse proxy must not let these pile up and put load on upstream).
     ///
-    /// 端点已**实证**（2026-09-11，真实凭证探针）：
-    /// - `DELETE /api/chat/threads/{id}` → 不存在的路由返回 HTML 404 页，而该路径返回 JSON
-    ///   `{"error":"Not found"}`，说明**路由存在**、只是没找到该 thread；删除成功为 2xx。
-    /// - `POST /api/chat/threads/delete` → `405 Method Not Allowed`（被动态路由 `[id]` 吃掉，
-    ///   id="delete"），**不是**独立端点，故不再作为回退。
-    /// - 线程列表：`GET /api/chat/threads` → `{"threads":[{id,title,model,updated_at}],...}`（同样实证）。
+    /// The endpoint has been **verified in practice** (2026-09-11, real-credential probing):
+    /// - `DELETE /api/chat/threads/{id}` -> a nonexistent route returns an HTML 404 page, while this
+    ///   path returns JSON `{"error":"Not found"}`, meaning **the route exists**, it just didn't find
+    ///   that thread; a successful delete returns 2xx.
+    /// - `POST /api/chat/threads/delete` -> `405 Method Not Allowed` (swallowed by the dynamic route
+    ///   `[id]`, with id="delete"), it is **not** a separate endpoint, so it's no longer used as a fallback.
+    /// - Thread list: `GET /api/chat/threads` -> `{"threads":[{id,title,model,updated_at}],...}` (also verified).
     ///
-    /// 返回 `Ok(true)` 表示上游确认删除；`Ok(false)` 表示上游明确说找不到；其他失败返回 `Err`。
+    /// Returns `Ok(true)` if upstream confirms the delete; `Ok(false)` if upstream explicitly says not found; other failures return `Err`.
     pub async fn delete_thread(&self, thread_id: &str) -> Result<bool> {
         let url = format!("{}/api/chat/threads/{thread_id}", self.base_host);
         let resp = self
@@ -600,13 +607,13 @@ impl WebClient {
             return Ok(true);
         }
         if status == reqwest::StatusCode::NOT_FOUND {
-            // 路由存在但该 thread 已不在上游 —— 视作"已经不需要清理"
+            // The route exists but the thread is no longer upstream -- treat as "nothing left to clean up"
             return Ok(false);
         }
-        Err(anyhow!("上游删除会话失败：DELETE {url} → HTTP {status}"))
+        Err(anyhow!("Failed to delete upstream conversation: DELETE {url} -> HTTP {status}"))
     }
 
-    /// 查询账号积分/每模型限额（web 版核心余额端点）
+    /// Query account freebucks / per-model limits (the web app's core balance endpoint)
     pub async fn freebuff_session(&self) -> Result<WebFreebuffSession> {
         let url = format!("{}/api/web/freebuff-session", self.base_host);
         let resp = self
@@ -618,7 +625,7 @@ impl WebClient {
         parse_json(resp).await
     }
 
-    /// 用量汇总（streak/tokens/sessionsByModel）
+    /// Usage summary (streak/tokens/sessionsByModel)
     pub async fn usage_summary(&self) -> Result<serde_json::Value> {
         let url = format!("{}/api/web/usage-summary", self.base_host);
         let resp = self
@@ -630,7 +637,7 @@ impl WebClient {
         parse_json(resp).await
     }
 
-    /// 用户信息
+    /// User info
     pub async fn auth_session(&self) -> Result<serde_json::Value> {
         let url = format!("{}/api/auth/session", self.base_host);
         let resp = self
@@ -642,7 +649,7 @@ impl WebClient {
         parse_json(resp).await
     }
 
-    /// 套餐
+    /// Subscription plans
     pub async fn subscriptions(&self) -> Result<serde_json::Value> {
         let url = format!("{}/api/web/subscriptions", self.base_host);
         let resp = self
@@ -654,7 +661,7 @@ impl WebClient {
         parse_json(resp).await
     }
 
-    /// 会话列表
+    /// Conversation list
     pub async fn threads(&self) -> Result<serde_json::Value> {
         let url = format!("{}/api/chat/threads", self.base_host);
         let resp = self
@@ -666,8 +673,8 @@ impl WebClient {
         parse_json(resp).await
     }
 
-    /// 短期 JWT（GET /api/web/convex-token；含 email/name/access_tier/country_code，约 5 分钟有效）
-    /// 用途：验证凭证有效性 / 保活。
+    /// Short-lived JWT (GET /api/web/convex-token; includes email/name/access_tier/country_code, valid for ~5 minutes)
+    /// Purpose: verify credential validity / keep-alive.
     pub async fn convex_token(&self) -> Result<serde_json::Value> {
         let url = format!("{}/api/web/convex-token", self.base_host);
         let resp = self
@@ -722,7 +729,7 @@ pub struct WebUploadResult {
     pub truncated: Option<bool>,
 }
 
-/// 账号余额全景（web 版 session 响应解析）
+/// Full account balance snapshot (parsed from the web app's session response)
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WebFreebuffSession {
     pub status: Option<String>,
@@ -772,21 +779,22 @@ pub struct FreebucksDaily {
     pub reset_at: Option<String>,
 }
 
-/// 单路流的上游 SSE 事件块 → OpenAI chunk 转换器。
+/// Converts a single stream's upstream SSE event blocks -> OpenAI chunks.
 ///
-/// 持有本路流的状态：
-/// - `tool_calls` 的 index 分配（同一 toolCallId 复用同一 index，并行工具不互相覆盖）
-/// - 是否出现过工具调用（决定终止 chunk 的 finish_reason）
-/// - threadId 记录槽（meta/title 事件）
+/// Holds this stream's state:
+/// - `tool_calls` index allocation (the same toolCallId reuses the same index, parallel tools don't overwrite each other)
+/// - whether a tool call has occurred (determines the finish_reason of the terminal chunk)
+/// - threadId recording slot (meta/title events)
 struct StreamEncoder {
     tool_index: HashMap<String, usize>,
     next_tool_index: usize,
     has_tool_calls: bool,
     thread_id: Arc<Mutex<Option<String>>>,
-    /// 上游 200 内嵌错误旁路：encode_block 反序列化失败/未知事件的行里若含
-    /// error envelope，在此记录（Critic-J P2-1：检测点前移到能看到上游原始事件的层面）
+    /// Upstream embedded-error bypass: if a line that fails to deserialize / is an unknown event
+    /// contains an error envelope, it's recorded here (Critic-J P2-1: moved the detection point
+    /// earlier, to where the raw upstream event is still visible)
     upstream_error: Option<String>,
-    /// 错误旁路槽（与 WebClient 共享，桥接层流结束后可读）
+    /// Error bypass slot (shared with WebClient, readable by the bridge layer after the stream ends)
     _error_slot: Arc<Mutex<Option<String>>>,
 }
 
@@ -802,14 +810,14 @@ impl StreamEncoder {
         }
     }
 
-    /// 读取上游内嵌错误（若有）。取后不清——同一错误重复读取得到同一结果。
+    /// Read the upstream embedded error (if any). Not cleared after reading -- reading the same error again yields the same result.
     #[cfg(test)]
     pub fn take_upstream_error(&self) -> Option<String> {
         self.upstream_error.clone()
     }
 
-    /// 分配（或复用）toolCallId 对应的 OpenAI tool_calls index。
-    /// 返回 (index, OpenAI 侧非空 id)：上游无 id 时用 `anon_{n}` 生成确定性 id。
+    /// Allocate (or reuse) the OpenAI tool_calls index for a toolCallId.
+    /// Returns (index, a non-empty OpenAI-side id): when upstream has no id, generates a deterministic id with `anon_{n}`.
     fn tool_slot(&mut self, raw_id: Option<&str>) -> (usize, String) {
         let key = match raw_id {
             Some(s) if !s.is_empty() => s.to_string(),
@@ -827,7 +835,7 @@ impl StreamEncoder {
         (index, format!("call_{key}"))
     }
 
-    /// 终止 chunk：content 为空，finish_reason 按是否出现工具调用取 tool_calls/stop。
+    /// Terminal chunk: content is empty, finish_reason is tool_calls/stop depending on whether a tool call occurred.
     fn finish_chunk(&self) -> String {
         let reason = if self.has_tool_calls {
             "tool_calls"
@@ -840,8 +848,8 @@ impl StreamEncoder {
         )
     }
 
-    /// 一个 SSE 事件块（可能含多条 data: 行）→ OpenAI chunk 文本。
-    /// 返回 (输出文本, 是否收到 done)；收到 done 时输出已含 finish_reason chunk 与 [DONE] 哨兵。
+    /// One SSE event block (may contain multiple data: lines) -> OpenAI chunk text.
+    /// Returns (output text, whether done was received); when done is received the output already includes the finish_reason chunk and the [DONE] sentinel.
     fn encode_block(&mut self, block: &str) -> (String, bool) {
         let mut text_parts: Vec<String> = Vec::new();
         let mut reasoning_parts: Vec<String> = Vec::new();
@@ -856,8 +864,10 @@ impl StreamEncoder {
             if json.is_empty() || json == "[DONE]" {
                 continue;
             }
-            // 检测点前移（Critic-J P2-1）：先探 error envelope（含反序列化会失败的未知事件），
-            // 桥接层的 tail 只含转换后 chunk，看不到这里——这是上游内嵌错误的唯一可见点
+            // Detection point moved earlier (Critic-J P2-1): probe for an error envelope first
+            // (this covers unknown events that would otherwise fail to deserialize) -- the bridge
+            // layer's tail only contains converted chunks and can't see this, so this is the only
+            // visible point for an upstream embedded error
             if self.upstream_error.is_none() {
                 if let Ok(raw) = serde_json::from_str::<serde_json::Value>(json) {
                     if let Some(err) = raw.get("error") {
@@ -867,7 +877,7 @@ impl StreamEncoder {
                             .unwrap_or_else(|| err.to_string());
                         self.upstream_error = Some(text.clone());
                         if let Ok(mut slot) = self._error_slot.lock() {
-                            *slot = Some(text); // 旁路槽：桥接层流结束后可读
+                            *slot = Some(text); // bypass slot: readable by the bridge layer after the stream ends
                         }
                     }
                 }
@@ -877,7 +887,7 @@ impl StreamEncoder {
             };
             match event {
                 ChatEvent::Delta { text } => text_parts.push(text),
-                // 抓包证据：工具产出的正文在 agent_delta 中，必须作为 content 透传
+                // Evidence from packet captures: text produced by a tool comes through agent_delta and must be passed through as content
                 ChatEvent::AgentDelta {
                     text: Some(text), ..
                 } => text_parts.push(text),
@@ -930,7 +940,7 @@ impl StreamEncoder {
     }
 }
 
-/// 记录上游给出的 threadId（空串忽略；后到覆盖，上游 meta/title 会重复携带同一 id）
+/// Records the threadId given by upstream (empty string ignored; last write wins, since upstream meta/title repeatedly carry the same id)
 fn record_thread_id(slot: &Mutex<Option<String>>, id: Option<&str>) {
     if let Some(id) = id.filter(|s| !s.is_empty()) {
         if let Ok(mut g) = slot.lock() {
@@ -939,7 +949,7 @@ fn record_thread_id(slot: &Mutex<Option<String>>, id: Option<&str>) {
     }
 }
 
-/// 聚合路径的事件归并（`chat_stream`）。
+/// Event merging for the aggregation path (`chat_stream`).
 fn apply_event(result: &mut StreamResult, event: ChatEvent) {
     match event {
         ChatEvent::Meta {
@@ -951,7 +961,7 @@ fn apply_event(result: &mut StreamResult, event: ChatEvent) {
             if let Some(t) = thread_id {
                 result.thread_id = Some(t);
             }
-            // title 二次更新：流中途由用户原文覆盖为模型摘要，后到覆盖
+            // Second title update: mid-stream, the original user text gets overwritten by the model's summary; last write wins
             if let Some(t) = title {
                 result.title = Some(t);
             }
@@ -972,7 +982,7 @@ fn apply_event(result: &mut StreamResult, event: ChatEvent) {
         }
         ChatEvent::ReasoningDelta { text } => result.reasoning.push_str(&text),
         ChatEvent::Delta { text } => result.text.push_str(&text),
-        // 工具产出的正文（agent_delta）与普通 delta 同通道，不能丢弃
+        // Tool-produced body text (agent_delta) shares the same channel as normal delta and must not be dropped
         ChatEvent::AgentDelta {
             text: Some(text), ..
         } => result.text.push_str(&text),
@@ -1012,7 +1022,7 @@ fn apply_event(result: &mut StreamResult, event: ChatEvent) {
     }
 }
 
-/// 定位事件块结束位置（含分隔空行）。兼容 LF 与 CRLF 两种 SSE 编码。
+/// Locates the end of an event block (including the separating blank line). Handles both LF and CRLF SSE encodings.
 fn find_double_newline(buf: &[u8]) -> Option<usize> {
     let lf = buf.windows(2).position(|w| w == b"\n\n").map(|i| i + 2);
     let crlf = buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4);
@@ -1033,7 +1043,7 @@ async fn parse_json<T: for<'de> Deserialize<'de>>(resp: reqwest::Response) -> Re
             text.chars().take(300).collect::<String>()
         ));
     }
-    serde_json::from_str(&text).map_err(|e| anyhow!("解析响应失败: {e}"))
+    serde_json::from_str(&text).map_err(|e| anyhow!("failed to parse response: {e}"))
 }
 
 #[cfg(test)]
@@ -1044,7 +1054,7 @@ mod tests {
         Arc::new(Mutex::new(None))
     }
 
-    /// 按真实流的方式切块并编码：\n\n（或 \r\n\r\n）分隔，逐块 feed 编码器
+    /// Chunks and encodes the way a real stream would: split on \n\n (or \r\n\r\n), feeding the encoder block by block
     fn drive(enc: &mut StreamEncoder, raw: &[u8]) -> String {
         let mut buf = raw.to_vec();
         let mut out = String::new();
@@ -1059,7 +1069,7 @@ mod tests {
         out
     }
 
-    /// 抽出 OpenAI chunk（跳过 [DONE] 哨兵）
+    /// Extracts OpenAI chunks (skipping the [DONE] sentinel)
     fn chunks(out: &str) -> Vec<serde_json::Value> {
         out.lines()
             .filter_map(|l| l.strip_prefix("data: "))
@@ -1078,12 +1088,12 @@ mod tests {
     fn agent_delta_maps_to_content_delta() {
         let mut enc = StreamEncoder::new(new_slot(), new_slot());
         let (out, done) = enc.encode_block(
-            "data: {\"type\":\"agent_delta\",\"agentId\":\"a1\",\"text\":\"工具结果\"}\n\n",
+            "data: {\"type\":\"agent_delta\",\"agentId\":\"a1\",\"text\":\"tool result\"}\n\n",
         );
         assert!(!done);
         let cs = chunks(&out);
         assert_eq!(cs.len(), 1);
-        assert_eq!(cs[0]["choices"][0]["delta"]["content"], "工具结果");
+        assert_eq!(cs[0]["choices"][0]["delta"]["content"], "tool result");
         assert!(cs[0]["choices"][0]["delta"]
             .get("reasoning_content")
             .is_none());
@@ -1118,7 +1128,7 @@ mod tests {
         assert_eq!(cs.len(), 5);
         for (i, c) in cs.iter().enumerate() {
             let tc = &c["choices"][0]["delta"]["tool_calls"][0];
-            assert_eq!(tc["index"], i as i64, "并行工具 index 必须递增");
+            assert_eq!(tc["index"], i as i64, "parallel tool indexes must increment");
             assert_eq!(tc["id"], format!("call_t{i}"));
             assert_eq!(tc["function"]["name"], "web_search");
             assert_eq!(tc["type"], "function");
@@ -1144,7 +1154,7 @@ mod tests {
                     .unwrap()
             })
             .collect();
-        assert_eq!(idx, vec![0, 1, 0], "同一 toolCallId 必须复用 index");
+        assert_eq!(idx, vec![0, 1, 0], "the same toolCallId must reuse its index");
     }
 
     #[test]
@@ -1191,7 +1201,7 @@ mod tests {
         let out = drive(&mut enc, raw.as_bytes());
         assert!(
             out.ends_with("data: [DONE]\n\n"),
-            "done 后必须发 [DONE] 哨兵"
+            "the [DONE] sentinel must follow done"
         );
         let cs = chunks(&out);
         let last = cs.last().unwrap();
@@ -1199,7 +1209,7 @@ mod tests {
         assert_eq!(
             last["choices"][0]["delta"],
             serde_json::json!({}),
-            "终止 chunk 的 delta 必须为空"
+            "the terminal chunk's delta must be empty"
         );
     }
 
@@ -1219,7 +1229,7 @@ mod tests {
 
     #[test]
     fn upstream_eof_without_done_still_emits_terminal_chunk() {
-        // 上游 EOF 无 done：调用方用 finish_chunk() 补发（chat_stream_raw 的 None 分支）
+        // Upstream EOF without a done: caller uses finish_chunk() to backfill (the None branch of chat_stream_raw)
         let enc = StreamEncoder::new(new_slot(), new_slot());
         let out = format!("{}data: [DONE]\n\n", enc.finish_chunk());
         assert!(out.ends_with("data: [DONE]\n\n"));
@@ -1234,10 +1244,10 @@ mod tests {
         let mut enc = StreamEncoder::new(slot.clone(), new_slot());
         enc.encode_block("data: {\"type\":\"meta\",\"threadId\":\"d8557501\",\"title\":\"用户原文\",\"model\":\"deepseek-v4-flash\",\"accessTier\":\"limited\"}\n\n");
         assert_eq!(slot.lock().unwrap().clone(), Some("d8557501".to_string()));
-        // title 二次更新（同一 threadId）
+        // Second title update (same threadId)
         enc.encode_block("data: {\"type\":\"title\",\"threadId\":\"d8557501\",\"title\":\"请求搜索GitHub用户仓库\"}\n\n");
         assert_eq!(slot.lock().unwrap().clone(), Some("d8557501".to_string()));
-        // 空 threadId 不得覆盖已有值
+        // An empty threadId must not overwrite the existing value
         enc.encode_block("data: {\"type\":\"title\",\"threadId\":\"\",\"title\":\"x\"}\n\n");
         assert_eq!(slot.lock().unwrap().clone(), Some("d8557501".to_string()));
     }
@@ -1255,7 +1265,7 @@ mod tests {
         assert_eq!(client.last_thread_id().as_deref(), Some("th-1"));
     }
 
-    // ---------- 聚合路径 ----------
+    // ---------- Aggregation path ----------
 
     #[test]
     fn aggregate_title_late_update_wins() {
@@ -1277,7 +1287,7 @@ mod tests {
             },
         );
         assert_eq!(r.title.as_deref(), Some("模型摘要"));
-        // 新值为 None 时不得清空旧值
+        // A None new value must not clear the old value
         apply_event(
             &mut r,
             ChatEvent::Title {
@@ -1328,7 +1338,7 @@ mod tests {
         assert_eq!(r.tools[0], "web_search: github");
     }
 
-    // ---------- 完整抓包序列 ----------
+    // ---------- Full captured sequence ----------
 
     #[test]
     fn full_captured_sequence_preserves_agent_output() {
@@ -1354,13 +1364,13 @@ mod tests {
         assert!(out.ends_with("data: [DONE]\n\n"));
         assert_eq!(slot.lock().unwrap().clone(), Some("d8557501".to_string()));
         let cs = chunks(&out);
-        // 正文 = delta + agent_delta（工具产出不得丢失）
+        // Body = delta + agent_delta (tool output must not be lost)
         let text: String = cs
             .iter()
             .map(|c| c["choices"][0]["delta"]["content"].as_str().unwrap_or(""))
             .collect();
         assert_eq!(text, "我来Based on research。");
-        // 推理单独走 reasoning_content
+        // Reasoning goes through reasoning_content separately
         let reasoning: String = cs
             .iter()
             .map(|c| {
@@ -1370,20 +1380,20 @@ mod tests {
             })
             .collect();
         assert_eq!(reasoning, "The");
-        // 工具调用存在且 index 正确
+        // The tool call exists and its index is correct
         let tc = cs
             .iter()
             .find_map(|c| c["choices"][0]["delta"]["tool_calls"].as_array().cloned())
             .unwrap();
         assert_eq!(tc[0]["index"], 0);
         assert_eq!(tc[0]["id"], "call_c1");
-        // 终止 chunk
+        // Terminal chunk
         let last = cs.last().unwrap();
         assert_eq!(last["choices"][0]["finish_reason"], "tool_calls");
         assert!(contains(&out, "\"object\":\"chat.completion.chunk\""));
     }
 
-    // ---------- SSE 分块 ----------
+    // ---------- SSE chunking ----------
 
     #[test]
     fn find_double_newline_handles_lf_and_crlf() {
@@ -1403,7 +1413,7 @@ mod tests {
         assert!(out.ends_with("data: [DONE]\n\n"));
     }
 
-    // ---------- WebUploadResult 解析 ----------
+    // ---------- WebUploadResult parsing ----------
 
     #[test]
     fn parses_image_upload_response() {
@@ -1433,7 +1443,7 @@ mod tests {
         assert!(v.url.is_none() && v.description_storage_id.is_none());
     }
 
-    /// 上游 200 内嵌错误旁路（Critic-J P2-1 闭环）：error envelope 在 encode_block 中被捕获
+    /// Upstream 200-with-embedded-error bypass (Critic-J P2-1 closure): the error envelope is captured inside encode_block
     #[test]
     fn upstream_error_bypass_captured() {
         let client = WebClient::new(
@@ -1442,19 +1452,19 @@ mod tests {
         )
         .unwrap();
         let mut enc = StreamEncoder::new(client.thread_slot(), client.error_slot());
-        // 反序列化会失败的纯 error envelope（无 type 字段）
+        // A plain error envelope that fails to deserialize (no type field)
         let (out, _) = enc.encode_block(
             "data: {\"error\":\"Unauthorized\"}
 
 ",
         );
-        assert!(out.is_empty(), "错误事件不应产生输出");
+        assert!(out.is_empty(), "an error event should produce no output");
         assert_eq!(
             client.last_upstream_error().as_deref(),
             Some("Unauthorized"),
-            "旁路槽必须能读到（桥接层唯一可见点）"
+            "the bypass slot must be readable (the bridge layer's only visible point)"
         );
-        // 已知事件变体携带额外 error 字段
+        // A known event variant carrying an extra error field
         let mut enc2 = StreamEncoder::new(new_slot(), new_slot());
         enc2.encode_block(
             "data: {\"type\":\"meta\",\"error\":\"rate limited\"}
@@ -1468,7 +1478,7 @@ mod tests {
         enc.take_upstream_error()
     }
 
-    /// 未映射事件（button/unknown）不得产生任何输出、不得报错
+    /// Unmapped events (button/unknown) must produce no output and never error
     #[test]
     fn unknown_events_are_ignored() {
         let mut enc = StreamEncoder::new(new_slot(), new_slot());
@@ -1487,27 +1497,27 @@ mod tests {
         assert_eq!(
             a,
             instance_id_for_cookie(c1),
-            "同账号必须稳定（否则每次重启都是新设备）"
+            "the same account must be stable (otherwise every restart looks like a new device)"
         );
-        assert_ne!(a, instance_id_for_cookie(c2), "不同账号必须是不同实例 id");
-        // UUID 形状：8-4-4-4-12，且第三段以 4 开头（版本位）
+        assert_ne!(a, instance_id_for_cookie(c2), "different accounts must have different instance ids");
+        // UUID shape: 8-4-4-4-12, with the third segment starting with 4 (version bit)
         let parts: Vec<&str> = a.split('-').collect();
-        assert_eq!(parts.len(), 5, "必须是 UUID 形状: {a}");
+        assert_eq!(parts.len(), 5, "must be UUID-shaped: {a}");
         assert_eq!(
             parts.iter().map(|p| p.len()).collect::<Vec<_>>(),
             vec![8, 4, 4, 4, 12],
-            "UUID 各段长度不对: {a}"
+            "UUID segment lengths are wrong: {a}"
         );
-        assert!(parts[2].starts_with('4'), "版本位应为 4: {a}");
+        assert!(parts[2].starts_with('4'), "version bit should be 4: {a}");
         assert!(
             a.chars().all(|ch| ch.is_ascii_hexdigit() || ch == '-'),
-            "只能含十六进制与连字符: {a}"
+            "must contain only hex digits and hyphens: {a}"
         );
     }
 
     #[test]
     fn instance_id_falls_back_to_whole_cookie() {
-        // 没有标准的 session-token 命名时，用整串 Cookie 当种子，仍须稳定且非空
+        // Without the standard session-token naming, the whole Cookie string is used as the seed; still must be stable and non-empty
         let a = instance_id_for_cookie("foo=1; bar=2");
         assert!(!a.is_empty());
         assert_eq!(a, instance_id_for_cookie("foo=1; bar=2"));
@@ -1519,7 +1529,7 @@ mod tests {
         let b = GravityContext::for_cookie("__Secure-next-auth.session-token=acc-b");
         assert_ne!(a.user_data.visitor_id, b.user_data.visitor_id);
         assert_ne!(a.user_data.session_id, b.user_data.session_id);
-        // 同一账号两次调用必须一致（否则每次请求都像换设备）
+        // Two calls for the same account must be consistent (otherwise every request looks like a device change)
         let a2 = GravityContext::for_cookie("__Secure-next-auth.session-token=acc-a");
         assert_eq!(a.user_data.visitor_id, a2.user_data.visitor_id);
         assert_eq!(a.client_context, a2.client_context);

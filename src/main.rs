@@ -15,7 +15,7 @@ use std::time::Duration;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // 登录窗口子进程模式：不初始化 tokio 重基础设施，直接进 WebView2 事件循环（结果走退出码）
+    // Login window child process mode: skip initializing heavy tokio infrastructure, go straight into the WebView2 event loop (result reported via exit code)
     if std::env::args().any(|a| a == "--login-window") {
         let port = std::env::var("GATEWAY_PORT")
             .ok()
@@ -24,7 +24,7 @@ async fn main() -> anyhow::Result<()> {
         std::process::exit(code);
     }
 
-    // 日志
+    // Logging
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -36,11 +36,11 @@ async fn main() -> anyhow::Result<()> {
     let config_path = freebuff2api::config::resolve_config_path();
     let cfg = Config::load(config_path.as_deref())?;
     let listen_addr = cfg.listen_addr.clone();
-    tracing::info!("Freebuff2API v{} 启动", env!("CARGO_PKG_VERSION"));
-    tracing::info!("监听 {}", listen_addr);
-    tracing::info!("账号数 {}", cfg.auth_tokens.len());
+    tracing::info!("Freebuff2API v{} starting", env!("CARGO_PKG_VERSION"));
+    tracing::info!("Listening on {}", listen_addr);
+    tracing::info!("Account count: {}", cfg.auth_tokens.len());
 
-    // 客户端
+    // Client
     let proxy = if cfg.http_proxy.is_empty() {
         None
     } else {
@@ -52,21 +52,22 @@ async fn main() -> anyhow::Result<()> {
         Duration::from_secs(cfg.request_timeout_sec),
     )?);
 
-    // 模型注册表
+    // Model registry
     let registry = Arc::new(ModelRegistry::new());
     registry.init().await;
     if let Ok((added, removed)) = registry.refresh_from_upstream(&client_http()).await {
-        tracing::info!("模型注册表同步：新增 {added} 个，移除 {removed} 个");
+        tracing::info!("Model registry synced: {added} added, {removed} removed");
     }
-    // v0.10 H1 修复：生产路径加载 vendored 上游模型快照 → 策略覆盖（availability 时间窗/efforts/fallback）。
-    // 失败静默降级到静态底座并 warn，绝不阻断启动（与计划书 §1.1 一致）。
+    // v0.10 H1 fix: the production path loads the vendored upstream model snapshot -> policy overrides
+    // (availability time windows/efforts/fallback).
+    // Fails silently degrade to the static base with a warn, never blocking startup (consistent with plan §1.1).
     if let Some(snap) = freebuff2api::models::load_local_snapshot() {
         match registry.refresh_strategy_from_snapshot(&snap) {
             Ok((added, updated)) => {
-                tracing::info!("模型策略快照同步：新增策略 {added}，更新 {updated}");
+                tracing::info!("Model policy snapshot synced: {added} policies added, {updated} updated");
             }
             Err(e) => {
-                tracing::warn!("模型策略快照同步失败，使用静态底座: {e}");
+                tracing::warn!("Model policy snapshot sync failed, using the static base: {e}");
             }
         }
     }
@@ -75,41 +76,41 @@ async fn main() -> anyhow::Result<()> {
         RouterConfig::from_app_config(&cfg),
     ));
 
-    // 多账号池
+    // Multi-account pool
     let pool = Arc::new(Pool::new(&cfg, client.clone()));
 
-    // 用量统计
+    // Usage stats
     let usage = Arc::new(UsageDb::open(&cfg.sqlite_path)?);
-    tracing::info!("用量统计 SQLite: {}", cfg.sqlite_path);
+    tracing::info!("Usage stats SQLite: {}", cfg.sqlite_path);
 
-    // 遥测（请求详情/事件链；独立库 + 独立写线程，不阻塞请求路径）
+    // Telemetry (per-request detail/event chain; independent DB + independent writer thread, doesn't block the request path)
     let telemetry = Arc::new(TelemetryWriter::spawn(
         PathBuf::from(&cfg.telemetry_path),
         4096,
     )?);
-    tracing::info!("遥测 SQLite: {}", cfg.telemetry_path);
+    tracing::info!("Telemetry SQLite: {}", cfg.telemetry_path);
 
-    // 实时日志总线（SSE 广播 + 环形缓冲）；脱敏开关跟随 config.redact_logs（默认开）
+    // Live log bus (SSE broadcast + ring buffer); the redaction switch follows config.redact_logs (on by default)
     let logs = Arc::new(LogBus::new_with_redact(500, cfg.redact_logs));
     if cfg.redact_logs {
-        tracing::info!("日志脱敏已开启（config.redact_logs=true）");
+        tracing::info!("Log redaction is enabled (config.redact_logs=true)");
     }
 
-    // 记忆层（用户偏好/纠正；零 LLM 规则 observe）
+    // Memory layer (user preferences/corrections; zero-LLM rule-based observe)
     let memory = Arc::new(freebuff2api::memory::MemoryStore::open(PathBuf::from(
         &cfg.memory_path,
     ))?);
-    tracing::info!("记忆库 SQLite: {}", cfg.memory_path);
-    // 记忆层运行时开关（默认关闭——用户批注：记忆不是每个人都需要的；面板可热切换）
+    tracing::info!("Memory store SQLite: {}", cfg.memory_path);
+    // Memory layer runtime switch (off by default -- per user note: memory isn't for everyone; the panel can toggle it live)
     let memory_runtime_enabled = Arc::new(std::sync::atomic::AtomicBool::new(cfg.memory_enabled));
     if cfg.memory_enabled {
-        tracing::info!("记忆层已开启（config memory_enabled=true）");
+        tracing::info!("Memory layer is enabled (config memory_enabled=true)");
     } else {
-        tracing::info!("记忆层已关闭（默认；面板「记忆」页可开启）");
+        tracing::info!("Memory layer is disabled (default; can be enabled on the panel's \"Memory\" page)");
     }
 
-    // 技能系统（文件为真相源 + SQLite 索引；旧 prompts 保留兼容）
-    // 注意：不用 with_extension（目录名含 '.' 时会被截断，如 data/my.skills → data/my.sqlite）
+    // Skills system (files are the source of truth + SQLite index; legacy prompts kept for compatibility)
+    // Note: doesn't use with_extension (it truncates when the directory name contains '.', e.g. data/my.skills -> data/my.sqlite)
     let skills_db = PathBuf::from(format!(
         "{}.sqlite",
         cfg.skills_dir.trim_end_matches(['/', '\\'])
@@ -119,41 +120,41 @@ async fn main() -> anyhow::Result<()> {
         skills_db,
     )?);
     tracing::info!(
-        "技能目录: {}（已载入 {} 条）",
+        "Skills directory: {} ({} loaded)",
         cfg.skills_dir,
         skills.list().len()
     );
 
-    // 广告保活
+    // Ad keepalive
     let ads = Arc::new(AdRefresher::new(client.clone(), cfg.clone()));
 
-    // 内置提示词/技能
+    // Built-in prompts/skills
     let prompts = Arc::new(freebuff2api::prompts::PromptManager::new());
 
-    // 凭证账号信息缓存 + 账号使用记录（面板凭证列表与历史查询）
+    // Credential account info cache + account usage history (panel credential list and history lookups)
     let meta = Arc::new(freebuff2api::account_meta::AccountMetaStore::new(
         PathBuf::from(&cfg.cred_meta_path),
         PathBuf::from(&cfg.account_history_path),
     ));
     tracing::info!(
-        "凭证信息缓存: {} · 使用记录: {}",
+        "Credential info cache: {} - Usage history: {}",
         cfg.cred_meta_path,
         cfg.account_history_path
     );
 
-    // 运行时 API Key（面板可一键生成并热生效，无需重启）
+    // Runtime API key (the panel can generate one with a click and it takes effect live, no restart needed)
     let api_keys = Arc::new(std::sync::RwLock::new(cfg.api_keys.clone()));
     if cfg.api_keys.is_empty() {
-        tracing::info!("未配置 api_keys：仅本机可访问（面板可在「接入指南」一键生成）");
+        tracing::info!("No api_keys configured: only accessible from localhost (the panel's \"Setup Guide\" can generate one with a click)");
     }
 
-    // web 协议桥接（OpenAI/Anthropic 客户端 → 上游 thread 复用，省每日会话额度）
+    // Web protocol bridge (OpenAI/Anthropic clients -> reuses upstream threads, saving daily session quota)
     let web_threads = Arc::new(freebuff2api::web_threads::WebThreadMap::new(PathBuf::from(
         &cfg.web_threads_path,
     )));
-    tracing::info!("web 桥接会话绑定: {}", cfg.web_threads_path);
+    tracing::info!("Web bridge session bindings: {}", cfg.web_threads_path);
 
-    // 启动各账号后台保活
+    // Start background keepalive for each account
     {
         let accounts = pool.accounts.lock().await;
         for acc in accounts.iter() {
@@ -163,7 +164,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // 双桶并发信号量容量（在 cfg move 进 Arc 前读取）
+    // Dual-bucket concurrency semaphore capacities (read before cfg moves into the Arc)
     let (conc_free_slots, conc_free_multi, conc_sub_slots, conc_sub_multi) = (
         cfg.concurrency_free_slots,
         cfg.concurrency_free_multi,
@@ -171,7 +172,7 @@ async fn main() -> anyhow::Result<()> {
         cfg.concurrency_sub_multi,
     );
 
-    // v0.9 §1.1：web Cookie 凭证池（config Cookie 项 + 导入库 kind=web-cookie）
+    // v0.9 §1.1: web Cookie credential pool (config Cookie entries + imported DB kind=web-cookie)
     let web_pool = Arc::new(freebuff2api::web_pool::WebCookiePool::new(&cfg));
 
     let state = AppState {
@@ -201,46 +202,46 @@ async fn main() -> anyhow::Result<()> {
         started: std::time::Instant::now(),
     };
 
-    // 上游会话自动清理（用户批注：反代要自己清理，别给上游留压力被查出来）
+    // Upstream session auto-cleanup (per user note: a reverse proxy should clean up after itself, don't leave load on upstream that could get it flagged)
     if state.cfg.thread_cleanup_interval_sec > 0 {
         tokio::spawn(freebuff2api::api::thread_cleanup_loop(state.clone()));
     } else {
-        tracing::info!("上游会话自动清理已关闭（thread_cleanup_interval_sec=0）");
+        tracing::info!("Upstream session auto-cleanup is disabled (thread_cleanup_interval_sec=0)");
     }
 
     let app = build_router(state);
     let listener = match tokio::net::TcpListener::bind(&listen_addr).await {
         Ok(l) => l,
         Err(e) => {
-            // v0.8：端口绑定失败给出明确中文错误（含占用进程提示），而非裸 anyhow 上抛
+            // v0.8: gives a clear error when port binding fails (including a hint about the process holding the port), instead of a bare anyhow throw
             let hint = match e.kind() {
                 std::io::ErrorKind::AddrInUse => {
                     format!(
-                        "端口 {} 被占用（可能已有 Freebuff2API 实例在运行，或其它程序占用了该端口）。\n\
-                         请修改 config.json 的 listen_addr 换个端口后重试。\n\
-                         排查：运行 `netstat -ano | findstr :{}` 查看占用进程 PID，\n\
-                         或用任务管理器结束占用该端口的进程（注意：不要误杀你自己的另一个实例）。",
+                        "Port {} is already in use (another Freebuff2API instance may be running, or another program is using this port).\n\
+                         Please change listen_addr in config.json to a different port and retry.\n\
+                         To investigate: run `netstat -ano | findstr :{}` to find the PID holding the port,\n\
+                         or use Task Manager to end the process using that port (careful not to kill your other instance by mistake).",
                         listen_addr, port_of(&listen_addr)
                     )
                 }
                 std::io::ErrorKind::PermissionDenied => {
                     format!(
-                        "没有权限绑定 {}（Windows 上 <1024 端口通常需要管理员权限）。\n\
-                         请把 listen_addr 改成高位端口（如 127.0.0.1:47821）或管理员运行。",
+                        "No permission to bind {} (ports <1024 on Windows usually require administrator privileges).\n\
+                         Please change listen_addr to a higher port (e.g. 127.0.0.1:47821) or run as administrator.",
                         listen_addr
                     )
                 }
                 _ => format!(
-                    "绑定监听地址 {} 失败: {e}\n请检查 config.json 的 listen_addr 是否合法。",
+                    "Failed to bind listen address {}: {e}\nPlease check that listen_addr in config.json is valid.",
                     listen_addr
                 ),
             };
-            eprintln!("\n[Freebuff2API] 启动失败：{hint}\n");
+            eprintln!("\n[Freebuff2API] Startup failed: {hint}\n");
             anyhow::bail!(hint)
         }
     };
-    tracing::info!("HTTP 服务就绪");
-    // v0.9 §1.5：注入真实 TCP 对端（ConnectInfo<SocketAddr>）供管理端点回环判定
+    tracing::info!("HTTP service ready");
+    // v0.9 §1.5: injects the real TCP peer (ConnectInfo<SocketAddr>) for admin endpoint loopback checks
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
@@ -249,7 +250,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 从 listen_addr 提取端口（用于错误提示中的 findstr 排查命令）
+/// Extracts the port from listen_addr (for the findstr troubleshooting command in error hints)
 fn port_of(listen_addr: &str) -> String {
     listen_addr
         .rsplit_once(':')
@@ -258,8 +259,8 @@ fn port_of(listen_addr: &str) -> String {
         .unwrap_or_else(|| "47821".into())
 }
 
-// 用普通 reqwest client 做 registry 拉取（避免与上游 http client 混淆）
-// 超时保护：注册表同步失败不应阻塞网关启动
+// Uses a plain reqwest client for registry fetches (to avoid confusion with the upstream http client)
+// Timeout protection: a registry sync failure should not block gateway startup
 fn client_http() -> reqwest::Client {
     let mut b = reqwest::Client::builder()
         .user_agent("freebuff2api-registry")

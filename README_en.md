@@ -1,6 +1,6 @@
 # Freebuff2API
 
-> English version. 中文文档：[README.md](README.md)
+> English version. Chinese docs: [README_zh.md](README_zh.md)
 
 Freebuff2API reverse-engineers the [Freebuff](https://freebuff.com) free tier into **OpenAI-compatible** and **Anthropic-compatible** local API endpoints. Implemented in **Rust (axum)** — single binary, zero runtime deps — usable from Claude Code, Codex, Cursor, LobeChat, or any OpenAI SDK.
 

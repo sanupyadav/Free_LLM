@@ -2,7 +2,7 @@
 name = "freebuff2api"
 version = "0.10.3"
 edition = "2021"
-description = "Freebuff 免费模型 OpenAI/Anthropic 兼容 API 网关（Rust 版）"
+description = "Freebuff free-model OpenAI/Anthropic-compatible API gateway (Rust edition)"
 authors = ["lza6"]
 
 [[bin]]
@@ -10,38 +10,38 @@ name = "freebuff2api"
 path = "src/main.rs"
 
 [dependencies]
-# Web 框架
+# Web framework
 axum = { version = "0.8", features = ["json", "ws", "macros"] }
 tokio = { version = "1", features = ["full"] }
 tower = "0.5"
 http = "1"
 
-# 序列化
+# Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-# 数据库（用量统计）
+# Database (usage stats)
 rusqlite = { version = "0.32", features = ["bundled"] }
 
-# 异步与任务
+# Async and tasks
 futures = "0.3"
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 
-# 网络
+# Networking
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "gzip", "brotli", "socks", "multipart", "cookies"] }
 
-# 日志与配置
+# Logging and config
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 thiserror = "2"
 
-# 工具
+# Utilities
 regex = "1"
 rand = "0.8"
 
-# 内嵌登录窗口（仅 Windows：WebView2；Linux/macOS 编译会失败故平台门控）
+# Embedded login window (Windows only: WebView2; gated by platform since Linux/macOS builds would fail)
 [target.'cfg(windows)'.dependencies]
 wry = { version = "0.57.0", default-features = false }
 tao = "0.37.0"

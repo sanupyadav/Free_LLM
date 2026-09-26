@@ -1,16 +1,16 @@
-//! 多账号池：会话健康评分 → 最优 token 轮询 + 熔断三态（Closed/Open/HalfOpen）
+//! Multi-account pool: session health score -> best-token round robin + 3-state circuit breaker (Closed/Open/HalfOpen)
 //!
-//! 评分维度（每 token/session 轮询一次）：
-//! - 会话 active 且剩余时间充足  +100
-//! - 队列位置越靠前  +50~+80
-//! - 熔断 Open  -999（直接摘除）；HalfOpen 放行探测
-//! - 最近错误  -加权
-//! - 心跳/广告刷新成功  +小分
+//! Scoring dimensions (once per token/session cycle):
+//! - Session active with enough remaining time  +100
+//! - The earlier the queue position  +50~+80
+//! - Circuit Open  -999 (removed outright); HalfOpen lets a probe through
+//! - Recent errors  -weighted
+//! - Heartbeat/ad refresh succeeded  +small bonus
 //!
-//! 熔断规则（参考 cc-switch）：
-//! - Closed：连续失败 ≥4 次 → Open（冷却 = min(60s × 2^(trips-1), 600s)）
-//! - Open：冷却期内拒绝选择；到期 → HalfOpen
-//! - HalfOpen：放行探测；连续成功 ≥2 次 → Closed；失败 → 再次 Open
+//! Circuit breaker rules (modeled on cc-switch):
+//! - Closed: >=4 consecutive failures -> Open (cooldown = min(60s * 2^(trips-1), 600s))
+//! - Open: rejects selection during cooldown; expires -> HalfOpen
+//! - HalfOpen: lets a probe through; >=2 consecutive successes -> Closed; failure -> Open again
 
 use crate::config::Config;
 use crate::session::SessionManager;
@@ -20,16 +20,16 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
 
-/// 连续失败阈值（Closed → Open）
+/// Consecutive failure threshold (Closed -> Open)
 const FAILURE_THRESHOLD: u32 = 4;
-/// HalfOpen 下连续成功次数（→ Closed）
+/// Consecutive successes needed in HalfOpen (-> Closed)
 const HALF_OPEN_SUCCESS_TO_CLOSE: u32 = 2;
-/// 基础冷却
+/// Base cooldown
 const BASE_COOLDOWN: Duration = Duration::from_secs(60);
-/// 冷却上限
+/// Cooldown cap
 const MAX_COOLDOWN: Duration = Duration::from_secs(600);
 
-/// 熔断器三态
+/// Circuit breaker's three states
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CircuitState {
@@ -38,16 +38,16 @@ pub enum CircuitState {
     HalfOpen,
 }
 
-/// 单账号熔断器
+/// Per-account circuit breaker
 #[derive(Debug)]
 pub struct CircuitBreaker {
     pub state: CircuitState,
     pub consecutive_failures: u32,
     pub half_open_successes: u32,
     pub open_until: Option<Instant>,
-    /// HalfOpen 探测闸门：同一时刻只放行一个在途探测
+    /// HalfOpen probe gate: only one in-flight probe is let through at a time
     pub probing: bool,
-    /// 累计熔断次数（可观测）
+    /// Cumulative trip count (observable)
     pub trips: u64,
     pub last_reason: Option<String>,
 }
@@ -65,13 +65,13 @@ impl CircuitBreaker {
         }
     }
 
-    /// 是否允许本次请求（Open 未到期 → false；到期自动转 HalfOpen 并放行单个探测）
+    /// Whether this request is allowed (Open not yet expired -> false; on expiry, auto-transitions to HalfOpen and lets a single probe through)
     pub fn allow(&mut self) -> bool {
         match self.state {
             CircuitState::Closed => true,
             CircuitState::HalfOpen => {
                 if self.probing {
-                    false // 已有探测在途，不再放行
+                    false // a probe is already in flight, don't let another through
                 } else {
                     self.probing = true;
                     true
@@ -91,7 +91,7 @@ impl CircuitBreaker {
         }
     }
 
-    /// 业务成功（HalfOpen 下累计探测成功）
+    /// Business success (accumulates probe successes while HalfOpen)
     pub fn record_success(&mut self) {
         self.consecutive_failures = 0;
         self.probing = false;
@@ -105,7 +105,7 @@ impl CircuitBreaker {
         }
     }
 
-    /// 业务失败（Closed 连续失败超阈值 / HalfOpen 任意失败 → 断开）
+    /// Business failure (Closed with consecutive failures over threshold / any HalfOpen failure -> trips)
     pub fn record_failure(&mut self, reason: &str) {
         self.consecutive_failures += 1;
         self.last_reason = Some(reason.to_string());
@@ -119,21 +119,21 @@ impl CircuitBreaker {
         }
     }
 
-    /// 直接断开（401/403 等确定性失败；冷却随累计次数指数增长，封顶 10 分钟）
+    /// Trips immediately (deterministic failures like 401/403; cooldown grows exponentially with trip count, capped at 10 minutes)
     pub fn trip(&mut self, reason: &str) {
         self.trips += 1;
         self.state = CircuitState::Open;
         self.consecutive_failures = FAILURE_THRESHOLD;
         self.half_open_successes = 0;
         self.probing = false;
-        // trips=1..→ 1,2,4,8,16 倍（16 倍被 MAX_COOLDOWN 截断为 10 分钟）
+        // trips=1..-> 1,2,4,8,16x (16x gets truncated to 10 minutes by MAX_COOLDOWN)
         let factor = 1u32 << self.trips.min(5).saturating_sub(1);
         let cd = BASE_COOLDOWN.saturating_mul(factor).min(MAX_COOLDOWN);
         self.open_until = Some(Instant::now() + cd);
         self.last_reason = Some(reason.to_string());
     }
 
-    /// 带自定义冷却时长的断开（如上游 Retry-After）
+    /// Trips with a custom cooldown duration (e.g. upstream Retry-After)
     pub fn trip_for(&mut self, duration: Duration, reason: &str) {
         self.trips += 1;
         self.state = CircuitState::Open;
@@ -163,9 +163,9 @@ pub struct AccountSnapshot {
     pub healthy: bool,
     pub score: f64,
     pub cooldown_until: Option<String>,
-    /// 熔断三态（closed/open/half_open）
+    /// Circuit breaker's three states (closed/open/half_open)
     pub circuit_state: String,
-    /// 累计熔断次数
+    /// Cumulative trip count
     pub trips: u64,
     pub last_error: Option<String>,
     pub session: Option<crate::session::SessionSnapshot>,
@@ -176,7 +176,7 @@ pub struct AccountEntry {
     pub token: String,
     pub session: Arc<SessionManager>,
     pub score: RwLock<f64>,
-    /// 熔断器（替代裸 cooldown_until）
+    /// Circuit breaker (replaces a bare cooldown_until)
     pub breaker: RwLock<CircuitBreaker>,
 }
 
@@ -192,14 +192,14 @@ impl Clone for AccountEntry {
     }
 }
 
-/// 负载均衡状态
+/// Load balancing state
 pub struct Pool {
     pub accounts: Mutex<Vec<AccountEntry>>,
     pub next: std::sync::atomic::AtomicUsize,
 }
 
 impl Pool {
-    /// 从配置构建多账号池
+    /// Builds a multi-account pool from configuration
     pub fn new(cfg: &Config, client: Arc<UpstreamClient>) -> Self {
         let accounts = cfg
             .auth_tokens
@@ -223,7 +223,7 @@ impl Pool {
         }
     }
 
-    /// 挑选健康度最高的 token（熔断 Open 跳过、HalfOpen 放行探测），返回克隆
+    /// Picks the healthiest token (skips circuit-Open, lets HalfOpen probes through), returns a clone
     pub async fn pick_best(&self) -> Option<AccountEntry> {
         let accounts = self.accounts.lock().await;
         if accounts.is_empty() {
@@ -248,7 +248,7 @@ impl Pool {
         best.cloned()
     }
 
-    /// 记录业务成功（驱动 HalfOpen → Closed）
+    /// Records business success (drives HalfOpen -> Closed)
     pub async fn mark_success(&self, name: &str) {
         let accounts = self.accounts.lock().await;
         if let Some(acc) = accounts.iter().find(|a| a.name == name) {
@@ -256,7 +256,7 @@ impl Pool {
         }
     }
 
-    /// 记录业务失败（驱动 Closed → Open / HalfOpen → Open）
+    /// Records business failure (drives Closed -> Open / HalfOpen -> Open)
     pub async fn mark_failure(&self, name: &str, reason: &str) {
         let accounts = self.accounts.lock().await;
         if let Some(acc) = accounts.iter().find(|a| a.name == name) {
@@ -264,17 +264,17 @@ impl Pool {
         }
     }
 
-    /// 标记冷却（熔断）：自定义时长（如上游 Retry-After / 401 冷却）
+    /// Marks a cooldown (trips the breaker) with a custom duration (e.g. upstream Retry-After / 401 cooldown)
     pub async fn mark_cooldown(&self, name: &str, duration: std::time::Duration, reason: &str) {
         let accounts = self.accounts.lock().await;
         if let Some(acc) = accounts.iter().find(|a| a.name == name) {
             acc.breaker.write().await.trip_for(duration, reason);
             acc.session.record_error(reason).await;
-            tracing::warn!("账号 {name} 熔断 {duration:?}: {reason}");
+            tracing::warn!("account {name} tripped for {duration:?}: {reason}");
         }
     }
 
-    /// 更新账号评分
+    /// Updates an account's score
     pub async fn update_score(&self, name: &str, delta: f64) {
         let accounts = self.accounts.lock().await;
         if let Some(acc) = accounts.iter().find(|a| a.name == name) {
@@ -284,7 +284,7 @@ impl Pool {
         }
     }
 
-    /// 健康快照
+    /// Health snapshot
     pub async fn snapshot(&self) -> PoolSnapshot {
         let accounts = self.accounts.lock().await;
         let mut snapshot_accounts = Vec::with_capacity(accounts.len());
@@ -319,7 +319,7 @@ impl Pool {
         }
     }
 
-    /// 热追加账号（token 导入后调用），返回是否真正新增
+    /// Hot-adds an account (called after a token import), returns whether it was actually added
     pub async fn add_account(&self, entry: AccountEntry) -> bool {
         let mut accounts = self.accounts.lock().await;
         if accounts.iter().any(|a| a.token == entry.token) {
@@ -329,7 +329,7 @@ impl Pool {
         true
     }
 
-    /// 热移除账号（凭证被删除后调用），返回是否真的移除了
+    /// Hot-removes an account (called after a credential is deleted), returns whether it was actually removed
     pub async fn remove_account(&self, token: &str) -> bool {
         let mut accounts = self.accounts.lock().await;
         let before = accounts.len();
@@ -338,7 +338,7 @@ impl Pool {
     }
 }
 
-/// 把 token 列表换为 Pool（无则返回空池）
+/// Converts a token list into a Pool (returns an empty pool if there are none)
 pub fn build_pool(cfg: &Config, client: Arc<UpstreamClient>) -> Arc<Pool> {
     Arc::new(Pool::new(cfg, client))
 }
@@ -359,24 +359,24 @@ mod tests {
         for _ in 0..FAILURE_THRESHOLD - 1 {
             b.record_failure("x");
         }
-        assert_eq!(b.state, CircuitState::Closed, "未达阈值不应断开");
+        assert_eq!(b.state, CircuitState::Closed, "should not trip before reaching the threshold");
         b.record_failure("x");
         assert_eq!(b.state, CircuitState::Open);
-        assert!(!b.allow(), "Open 冷却期内应拒绝");
+        assert!(!b.allow(), "should reject during the Open cooldown period");
     }
 
     #[test]
     fn breaker_half_open_closes_after_successes() {
         let mut b = CircuitBreaker::new();
         b.trip("test");
-        // 手动把到期时间提前，模拟冷却结束
+        // Manually move the expiry time earlier, to simulate the cooldown ending
         b.open_until = Some(Instant::now() - Duration::from_secs(1));
-        assert!(b.allow(), "到期后应放行探测");
+        assert!(b.allow(), "should let a probe through after expiry");
         assert_eq!(b.state, CircuitState::HalfOpen);
         b.record_success();
-        assert_eq!(b.state, CircuitState::HalfOpen, "一次成功不够");
+        assert_eq!(b.state, CircuitState::HalfOpen, "one success is not enough");
         b.record_success();
-        assert_eq!(b.state, CircuitState::Closed, "连续成功应闭合");
+        assert_eq!(b.state, CircuitState::Closed, "consecutive successes should close it");
     }
 
     #[test]
@@ -387,7 +387,7 @@ mod tests {
         assert!(b.allow());
         b.record_failure("again");
         assert_eq!(b.state, CircuitState::Open);
-        assert!(b.trips >= 2, "再次断开应累计 trips");
+        assert!(b.trips >= 2, "tripping again should accumulate trips");
     }
 
     #[test]
@@ -397,12 +397,12 @@ mod tests {
         let first = b.open_until.unwrap() - Instant::now();
         b.trip("2");
         let second = b.open_until.unwrap() - Instant::now();
-        assert!(second > first, "冷却应递增");
+        assert!(second > first, "cooldown should grow");
         for _ in 0..8 {
             b.trip("n");
         }
         let capped = b.open_until.unwrap() - Instant::now();
-        assert!(capped <= MAX_COOLDOWN, "冷却应封顶");
+        assert!(capped <= MAX_COOLDOWN, "cooldown should be capped");
     }
 
     #[test]
@@ -412,10 +412,10 @@ mod tests {
             b.trip("x");
         }
         let cd = b.open_until.unwrap() - Instant::now();
-        // 第 5 次：1<<4 = 16 倍 → 960s 被 MAX_COOLDOWN(600s) 截断
+        // 5th trip: 1<<4 = 16x -> 960s gets truncated by MAX_COOLDOWN (600s)
         assert!(
             cd > Duration::from_secs(550),
-            "第 5 次应接近 10 分钟封顶: {cd:?}"
+            "the 5th trip should be close to the 10-minute cap: {cd:?}"
         );
         assert!(cd <= MAX_COOLDOWN);
     }
@@ -425,10 +425,10 @@ mod tests {
         let mut b = CircuitBreaker::new();
         b.trip("x");
         b.open_until = Some(Instant::now() - Duration::from_secs(1));
-        assert!(b.allow(), "冷却到期应放行首个探测");
-        assert!(!b.allow(), "已有在途探测时不再放行（防并发探测风暴）");
+        assert!(b.allow(), "should let the first probe through once the cooldown expires");
+        assert!(!b.allow(), "should not let another through while a probe is in flight (prevents a concurrent probe storm)");
         b.record_success();
-        assert!(b.allow(), "探测完成后可放行下一个");
+        assert!(b.allow(), "should let the next one through after the probe completes");
         assert!(!b.allow());
     }
 }

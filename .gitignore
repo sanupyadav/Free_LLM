@@ -3,31 +3,31 @@
 **/*.rs.bk
 Cargo.lock.bak
 
-# 运行产物
+# Build artifacts
 *.exe
 *.log
 /desktop/dist/
 /desktop/node_modules/
 node_modules/
 
-# 本地数据
+# Local data
 data/
 *.sqlite
 *.sqlite3
 *.db
 
-# 系统
+# OS
 .DS_Store
 Thumbs.db
 
-# 运行时数据（不入库）
+# Runtime data (not checked in)
 /data/
 config.json
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
 
-# 桌面壳构建产物/依赖（不入库）
+# Desktop shell build artifacts/deps (not checked in)
 desktop/node_modules/
 desktop/dist/
 graft/
@@ -35,11 +35,11 @@ graft/
 *.exe
 config2.json
 
-# 本机 cargo 代理配置（含本地端口，不入库）
+# Local cargo proxy config (contains a local port, not checked in)
 .cargo/
 
-# E2E 运行时生成的隔离配置（可能临时含生成的 api key，绝不入库）
+# E2E-runtime-generated isolated config (may temporarily contain a generated api key, never check in)
 tests/e2e_phase_g.config.json
 
-# 旧产物归档（不入库）
+# Archive of old artifacts (not checked in)
 _archive_旧产物/

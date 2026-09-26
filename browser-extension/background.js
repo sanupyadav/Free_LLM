@@ -1,17 +1,23 @@
-// Freebuff2API 一键登录扩展（MV3）
+// Freebuff2API one-click login extension (MV3)
 //
-// 四条能力：
-//   1) 面板 → 扩展直连：/ui 面板通过 chrome.runtime.sendMessage(扩展ID, {type:'freebuff2api.import'})
-//      触发导入；扩展 ID 由 bridge.js（content script）postMessage 告知面板。
-//   2) 自动导航 + 等待登录：未登录时自动打开 freebuff.com，每 2 秒轮询 session-token（最长 180 秒），
-//      登录成功立即自动导入。
-//   3) 点击扩展图标 = 同一条流程（读得到就直接导入，读不到就走自动导航等待）。
-//   4) 多端口探测：面板端口 > 选项页端口 > 默认端口列表；只有连接层失败才换端口，
-//      HTTP 有响应（含 4xx/5xx）就停在该端口并报告错误。
-//   5) 网关 API Key：面板传入 > 选项页保存；有 Key 时带 authorization: Bearer 头，收到 401 明确提示。
+// Four capabilities:
+//   1) Panel -> extension direct connect: the /ui panel triggers an import via
+//      chrome.runtime.sendMessage(extensionId, {type:'freebuff2api.import'});
+//      the extension ID is announced to the panel by bridge.js (content script) via postMessage.
+//   2) Auto-navigate + wait for login: when not logged in, automatically opens freebuff.com,
+//      polls the session-token every 2 seconds (up to 180 seconds), and auto-imports as soon as
+//      login succeeds.
+//   3) Clicking the extension icon = the same flow (import directly if readable, otherwise
+//      auto-navigate and wait).
+//   4) Multi-port probing: panel port > options-page port > default port list; only a
+//      connection-layer failure switches ports — any HTTP response (including 4xx/5xx) stops
+//      on that port and reports the error.
+//   5) Gateway API key: panel-supplied > saved on the options page; when set, sends an
+//      authorization: Bearer header, and reports 401 clearly.
 //
-// 安全边界：只读取 freebuff.com 域下的 Cookie（HttpOnly 的 session-token 只有扩展读得到），
-// 只发送到本机 127.0.0.1，不接触账号密码。
+// Security boundary: only reads cookies under the freebuff.com domain (the HttpOnly
+// session-token is only readable by the extension), only sends to local 127.0.0.1,
+// never touches account credentials.
 
 const DEFAULT_PORTS = [47821, 47822, 8787];
 const SESSION_COOKIE = '__Secure-next-auth.session-token';
@@ -23,9 +29,9 @@ const LOGIN_TIMEOUT_MS = 180000;
 const FETCH_TIMEOUT_MS = 8000;
 const RESPONSE_GUARD_MS = 1500;
 
-// ---------- 基础工具 ----------
+// ---------- Basic utilities ----------
 
-/** 系统通知；任何失败（权限被关/图标缺失）都静默，不影响导入主流程 */
+/** System notification; any failure (permission off / missing icon) is silent and doesn't affect the main import flow */
 function notify(title, message) {
   try {
     chrome.notifications.create(
@@ -35,12 +41,12 @@ function notify(title, message) {
         title: String(title || 'Freebuff2API'),
         message: String(message || ''),
       },
-      function () { void chrome.runtime.lastError; } // 必须读取，否则控制台报未检查错误
+      function () { void chrome.runtime.lastError; } // must read this, otherwise the console reports an unchecked error
     );
-  } catch (e) { /* 通知不可用时静默 */ }
+  } catch (e) { /* silent when notifications are unavailable */ }
 }
 
-/** 回调式 chrome API → Promise：强制消费 lastError，失败/异常一律返回 null，绝不抛未捕获异常 */
+/** Callback-style chrome API -> Promise: always consumes lastError, returns null on any failure/exception, never throws uncaught */
 function chromeCall(invoke) {
   return new Promise(function (resolve) {
     try {
@@ -63,14 +69,14 @@ function normalizePort(v) {
   return Number.isInteger(n) && n > 0 && n <= 65535 ? n : 0;
 }
 
-/** API Key 规整：字符串、去换行（防头注入）、限长；无效/空返回 ''（表示不发送 Authorization 头） */
+/** Normalizes the API key: string, strip newlines (prevents header injection), length-limited; returns '' if invalid/empty (meaning no Authorization header is sent) */
 function normalizeApiKey(v) {
   if (typeof v !== 'string') return '';
   const s = v.replace(/[\r\n]/g, '').trim();
   return s.length > 0 && s.length <= 512 ? s : '';
 }
 
-/** 回退来源：选项页保存的 API Key */
+/** Fallback source: the API key saved on the options page */
 async function storedApiKey() {
   const r = await chromeCall(function (cb) {
     chrome.storage.local.get('apiKey', cb);
@@ -80,7 +86,7 @@ async function storedApiKey() {
 
 // ---------- Cookie ----------
 
-/** 读取 freebuff.com 全部 Cookie 并拼成 Cookie 头（含 HttpOnly） */
+/** Reads all freebuff.com cookies and joins them into a Cookie header (including HttpOnly) */
 async function readFreebuffCookie() {
   const cookies = (await chromeCall(function (cb) {
     chrome.cookies.getAll({ url: COOKIE_URL }, cb);
@@ -94,7 +100,7 @@ async function readFreebuffCookie() {
   return { ok: true, cookie: str, count: cookies.length };
 }
 
-/** 是否已有登录会话（毫秒级探测，用于 onMessageExternal 的 needLogin 字段） */
+/** Whether a login session already exists (millisecond-level probe, used for onMessageExternal's needLogin field) */
 async function hasSessionCookie() {
   const c = await chromeCall(function (cb) {
     chrome.cookies.get({ url: COOKIE_URL, name: SESSION_COOKIE }, cb);
@@ -102,9 +108,9 @@ async function hasSessionCookie() {
   return !!(c && c.value);
 }
 
-// ---------- 端口探测 ----------
+// ---------- Port probing ----------
 
-/** 候选端口：面板传入 > 选项页设置 > 默认列表，去重 */
+/** Candidate ports: panel-supplied > options-page setting > default list, deduplicated */
 async function candidatePorts(panelPort) {
   const list = [];
   const push = function (p) {
@@ -120,19 +126,20 @@ async function candidatePorts(panelPort) {
   return list;
 }
 
-// ---------- 导入 ----------
+// ---------- Import ----------
 
 /**
- * POST 到指定端口。
- * reached=false 仅代表连接层失败（拒绝连接/超时/中断），此时才应该换下一个端口；
- * 一旦收到 HTTP 响应（无论状态码），都视为「到达网关」。
+ * POSTs to the given port.
+ * reached=false means only a connection-layer failure (refused/timeout/aborted); that's the
+ * only case where the next port should be tried.
+ * Any HTTP response (regardless of status code) counts as "reached the gateway".
  */
 async function postToGateway(port, cookie, apiKey) {
   const ctrl = new AbortController();
   const timer = setTimeout(function () { ctrl.abort(); }, FETCH_TIMEOUT_MS);
   try {
     const headers = { 'content-type': 'application/json' };
-    if (apiKey) headers.authorization = 'Bearer ' + apiKey; // 网关未配置 api_keys 时不加此头
+    if (apiKey) headers.authorization = 'Bearer ' + apiKey; // omitted when the gateway has no api_keys configured
     const resp = await fetch('http://127.0.0.1:' + port + '/api/tokens/import', {
       method: 'POST',
       headers: headers,
@@ -141,7 +148,7 @@ async function postToGateway(port, cookie, apiKey) {
     });
     const text = await resp.text();
     let body = null;
-    try { body = JSON.parse(text); } catch (e) { /* 非 JSON 响应 */ }
+    try { body = JSON.parse(text); } catch (e) { /* non-JSON response */ }
     return { reached: true, httpOk: resp.ok, status: resp.status, body: body };
   } catch (e) {
     return { reached: false, error: String((e && e.message) || e) };
@@ -151,55 +158,55 @@ async function postToGateway(port, cookie, apiKey) {
 }
 
 async function importCookieToGateway(cookie, panelPort, panelApiKey) {
-  const apiKey = normalizeApiKey(panelApiKey) || (await storedApiKey()); // 面板优先，回退选项页
+  const apiKey = normalizeApiKey(panelApiKey) || (await storedApiKey()); // panel takes priority, falls back to options page
   const ports = await candidatePorts(panelPort);
   let lastErr = '';
   for (const port of ports) {
     const r = await postToGateway(port, cookie, apiKey);
-    if (!r.reached) { lastErr = r.error || '连接失败'; continue; } // 仅连接失败才换端口
+    if (!r.reached) { lastErr = r.error || 'connection failed'; continue; } // only try the next port on a connection failure
     if (r.httpOk && r.body && r.body.ok) {
       return { ok: true, port: port, added: Number(r.body.added) || 0, message: r.body.message || '' };
     }
     const msg = (r.body && (r.body.message || r.body.error)) || ('HTTP ' + r.status);
-    return { ok: false, port: port, error: String(msg), unauthorized: r.status === 401 }; // HTTP 有响应：停在此端口报告
+    return { ok: false, port: port, error: String(msg), unauthorized: r.status === 401 }; // got an HTTP response: stop and report on this port
   }
-  return { ok: false, port: 0, error: lastErr || '连接本地网关失败（连接被拒绝）' };
+  return { ok: false, port: 0, error: lastErr || 'Failed to connect to the local gateway (connection refused)' };
 }
 
 function notifyImportResult(res) {
   if (res.ok) {
     if (res.added > 0) {
       notify(
-        '✅ 已自动导入 ' + res.added + ' 个凭证',
-        '来源：freebuff.com 登录 Cookie（网关端口 ' + res.port + '）。回到面板点「刷新」即可看到账号全貌。'
+        '✅ Automatically imported ' + res.added + ' credential(s)',
+        'Source: freebuff.com login cookie (gateway port ' + res.port + '). Click "Refresh" on the panel to see the full account list.'
       );
     } else {
-      notify('✅ 凭证已存在，无需重复导入', '同值自动去重（网关端口 ' + res.port + '）。');
+      notify('✅ Credential already exists, no need to re-import', 'Deduplicated automatically (gateway port ' + res.port + ').');
     }
     return;
   }
   if (res.unauthorized) {
     notify(
-      '🔑 网关已启用 API Key 校验',
-      '请在扩展选项页填入面板显示的 Key（右键扩展图标 →「选项」→ 网关 API Key），然后重试。网关端口 ' + res.port + '。'
+      '🔑 The gateway has API key validation enabled',
+      'Enter the key shown on the panel into the extension options page (right-click the extension icon -> "Options" -> Gateway API Key), then retry. Gateway port ' + res.port + '.'
     );
     return;
   }
   if (res.port) {
-    notify('导入失败（端口 ' + res.port + '）', String(res.error).slice(0, 180));
+    notify('Import failed (port ' + res.port + ')', String(res.error).slice(0, 180));
   } else {
     notify(
-      '连接本地网关失败',
-      '请确认 Freebuff2API 已启动（默认端口 47821）。若改过端口：右键扩展图标 →「选项」填写，' +
-        '或直接在网关面板点「一键登录」（面板会自动带上自己的端口）。' +
-        (res.error ? ' 最后错误：' + String(res.error).slice(0, 120) : '')
+      'Failed to connect to the local gateway',
+      'Please make sure Freebuff2API is running (default port 47821). If you changed the port: right-click the extension icon -> "Options" to set it, ' +
+        'or just click "One-click login" on the gateway panel (it will pass along its own port automatically).' +
+        (res.error ? ' Last error: ' + String(res.error).slice(0, 120) : '')
     );
   }
 }
 
-// ---------- 自动导航 + 等待登录 ----------
+// ---------- Auto-navigate + wait for login ----------
 
-/** 已有 freebuff.com 标签页则聚焦复用，否则新开登录页 */
+/** Focuses and reuses an existing freebuff.com tab if present, otherwise opens a new login page */
 async function openOrFocusFreebuff() {
   const tabs = await chromeCall(function (cb) {
     chrome.tabs.query({ url: FREEBUFF_TAB_MATCH }, cb);
@@ -220,12 +227,12 @@ async function openOrFocusFreebuff() {
     chrome.tabs.create({ url: FREEBUFF_URL }, cb);
   });
   if (!created) {
-    notify('无法打开 freebuff.com', '请手动打开 https://freebuff.com/ 完成登录，登录后点扩展图标或面板「一键登录」即可导入。');
+    notify('Could not open freebuff.com', 'Please manually open https://freebuff.com/ to log in, then click the extension icon or the panel\'s "One-click login" to import.');
   }
   return created;
 }
 
-/** 每 2 秒轮询 session-token，最长 timeoutMs；检测到即返回 true */
+/** Polls the session-token every 2 seconds, up to timeoutMs; returns true as soon as detected */
 async function waitForSessionCookie(timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -238,11 +245,11 @@ async function waitForSessionCookie(timeoutMs) {
   return false;
 }
 
-// ---------- 主流程（同一时间只跑一条，重复触发复用进行中的流程） ----------
+// ---------- Main flow (only one runs at a time; repeat triggers reuse the in-flight flow) ----------
 
 let runningFlow = null;
-let flowPanelPort = 0; // 进行中的流程读取最新面板端口：等待登录期间面板再次触发也能用上
-let flowApiKey = '';   // 同上：面板传入的 API Key 优先，流程中途加入也能生效
+let flowPanelPort = 0; // the in-flight flow reads the latest panel port: usable even if the panel triggers again while waiting for login
+let flowApiKey = '';   // same as above: a panel-supplied API key takes priority, and can take effect even if added mid-flow
 
 function startFlow(panelPort, panelApiKey) {
   const p = normalizePort(panelPort);
@@ -258,15 +265,15 @@ function startFlow(panelPort, panelApiKey) {
         notifyImportResult(res);
         return res;
       }
-      // 未登录：自动打开 freebuff.com 并等待登录
+      // Not logged in: automatically open freebuff.com and wait for login
       notify(
-        '已打开 freebuff.com，请完成 GitHub 登录',
-        '登录成功后会自动把凭证导入本地网关，无需手动复制。'
+        'Opened freebuff.com, please finish logging in',
+        'Once logged in, the credential will be imported into the local gateway automatically, no manual copying needed.'
       );
       await openOrFocusFreebuff();
       const got = await waitForSessionCookie(LOGIN_TIMEOUT_MS);
       if (!got) {
-        notify('⏱ 等待登录超时', '已等待 3 分钟仍未检测到登录凭证。完成登录后，再点一次扩展图标或面板「一键登录」即可立即导入。');
+        notify('⏱ Timed out waiting for login', 'Waited 3 minutes but no login credential was detected. After logging in, click the extension icon or the panel\'s "One-click login" again to import immediately.');
         return { ok: false, port: 0, error: 'login_timeout' };
       }
       const after = await readFreebuffCookie();
@@ -275,10 +282,10 @@ function startFlow(panelPort, panelApiKey) {
       notifyImportResult(res);
       return res;
     } catch (e) {
-      notify('导入流程异常', String((e && e.message) || e).slice(0, 180));
+      notify('Import flow error', String((e && e.message) || e).slice(0, 180));
       return { ok: false, port: 0, error: 'unexpected_error' };
     } finally {
-      // 流程结束（含异常），允许下一次触发启动新流程；本身不会 reject
+      // flow ended (including on error): allow the next trigger to start a new flow; never rejects itself
       runningFlow = null;
       flowPanelPort = 0;
       flowApiKey = '';
@@ -287,17 +294,17 @@ function startFlow(panelPort, panelApiKey) {
   return runningFlow;
 }
 
-// ---------- 面板 → 扩展直连 ----------
+// ---------- Panel -> extension direct connect ----------
 
 function senderOrigin(sender) {
   try {
     if (sender && sender.origin) return String(sender.origin);
     if (sender && sender.url) return new URL(sender.url).origin;
-  } catch (e) { /* 忽略 */ }
+  } catch (e) { /* ignored */ }
   return '';
 }
 
-/** 只放行本机网关面板（http://127.0.0.1[:端口] 或 http://localhost[:端口]） */
+/** Only allows the local gateway panel (http://127.0.0.1[:port] or http://localhost[:port]) */
 function isLocalPanelOrigin(origin) {
   return origin === 'http://127.0.0.1' || origin.indexOf('http://127.0.0.1:') === 0 ||
          origin === 'http://localhost' || origin.indexOf('http://localhost:') === 0;
@@ -306,23 +313,26 @@ function isLocalPanelOrigin(origin) {
 chrome.runtime.onMessageExternal.addListener(function (msg, sender, sendResponse) {
   const origin = senderOrigin(sender);
   if (!isLocalPanelOrigin(origin)) {
-    try { sendResponse({ ok: false, error: 'forbidden_origin', message: '来源不在允许范围（仅本机网关面板可用）' }); } catch (e) { /* 通道已关 */ }
+    try { sendResponse({ ok: false, error: 'forbidden_origin', message: 'Origin not allowed (only the local gateway panel can use this)' }); } catch (e) { /* channel already closed */ }
     return false;
   }
   if (!msg || msg.type !== 'freebuff2api.import') {
-    try { sendResponse({ ok: false, error: 'unknown_type', message: '未知的消息类型' }); } catch (e) { /* 通道已关 */ }
+    try { sendResponse({ ok: false, error: 'unknown_type', message: 'Unknown message type' }); } catch (e) { /* channel already closed */ }
     return false;
   }
   const panelPort = normalizePort(msg.gatewayPort);
   const panelApiKey = normalizeApiKey(msg.apiKey);
   (async function () {
-    // 只等一次毫秒级登录态探测（带 1.5s 保险），绝不等长达 3 分钟的登录/导入流程
+    // Wait once for a millisecond-level login-state probe (with a 1.5s safety margin);
+    // never wait for the full 3-minute login/import flow.
     const loggedIn = (await Promise.race([
       hasSessionCookie(),
       sleep(RESPONSE_GUARD_MS).then(function () { return null; }),
     ])) === true;
-    // 同步完成路径：已登录时直接把导入跑完，第一个响应就带 done/added，面板无需再轮询。
-    // guard = 1.5s 登录探测 + 3s 流程兜底：超时说明网关极慢/多端口探测，回退 started 由面板轮询收敛。
+    // Synchronous completion path: if already logged in, run the import to completion so the
+    // first response carries done/added and the panel doesn't need to poll.
+    // guard = 1.5s login probe + 3s flow fallback: a timeout means the gateway is very slow or
+    // multi-port probing is underway; fall back to started and let the panel poll to converge.
     if (loggedIn) {
       let doneRes = null;
       try {
@@ -330,7 +340,7 @@ chrome.runtime.onMessageExternal.addListener(function (msg, sender, sendResponse
           startFlow(panelPort, panelApiKey),
           sleep(RESPONSE_GUARD_MS * 2).then(function () { return null; }),
         ]);
-      } catch (e) { /* 极端情况：回退 started */ }
+      } catch (e) { /* edge case: fall back to started */ }
       if (doneRes && doneRes.ok) {
         try {
           sendResponse({
@@ -340,27 +350,30 @@ chrome.runtime.onMessageExternal.addListener(function (msg, sender, sendResponse
             added: doneRes.added || 0,
             needLogin: false,
           });
-        } catch (e) { /* 面板已离开 */ }
+        } catch (e) { /* panel already gone */ }
         return;
       }
-      // doneRes 为 null（超时）或失败：失败结果的通知已由流程发出，这里回退 started。
-      // 流程已在同步路径启动过（跑完或失败），不再重复 startFlow（否则端口序列会跑两遍），
-      // 面板按 started 轮询只会看到凭证数量不变，自然收敛。
+      // doneRes is null (timeout) or failed: the flow already fired a failure notification;
+      // fall back to started here.
+      // The flow already started on the synchronous path (finished or failed), so don't call
+      // startFlow again (or the port sequence would run twice); the panel's started polling
+      // will simply see an unchanged credential count and converge naturally.
       try {
         sendResponse({ ok: true, phase: 'started', needLogin: false });
-      } catch (e) { /* 面板已离开 */ }
+      } catch (e) { /* panel already gone */ }
       return;
     }
-    // 未登录：立即响应并启动完整流程（自动导航 → 等待登录 → 自动导入）
+    // Not logged in: respond immediately and start the full flow (auto-navigate -> wait for
+    // login -> auto-import)
     try {
       sendResponse({ ok: true, phase: 'started', needLogin: true });
-    } catch (e) { /* 面板已离开，流程照跑 */ }
+    } catch (e) { /* panel already gone, the flow keeps running */ }
     startFlow(panelPort, panelApiKey);
   })();
-  return true; // 通道保持到上面 sendResponse 被调用（毫秒级）
+  return true; // keep the channel open until sendResponse is called above (milliseconds)
 });
 
-// ---------- 点击扩展图标：同一条流程（API Key 走选项页回退） ----------
+// ---------- Click the extension icon: same flow (API key falls back to the options page) ----------
 
 chrome.action.onClicked.addListener(function () {
   startFlow(0, '');

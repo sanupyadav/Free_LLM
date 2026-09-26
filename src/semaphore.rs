@@ -1,45 +1,47 @@
-//! 双桶并发信号量（v0.8 落地——README 宣称的能力在此补实）
+//! Dual-bucket concurrency semaphore (v0.8 — implements the capability the README already claimed)
 //!
-//! 上游 codebuff 免费层的并发墙按网关 IP/账号维度计算（逆向自桌面端 orchestrator.js）：
-//! - 免费层：`{slot:1, multi:3}` —— 单账号同刻最多 1 个"正式会话"，加上普通请求并发 3
-//! - 订阅层：`{slot:3, multi:8}` —— 订阅账号容量更高
+//! The upstream codebuff free tier's concurrency wall is computed per gateway IP/account
+//! (reverse-engineered from the desktop client's orchestrator.js):
+//! - Free tier: `{slot:1, multi:3}` -- at most 1 "formal session" per account at a time, plus 3 concurrent ordinary requests
+//! - Subscriber tier: `{slot:3, multi:8}` -- subscriber accounts get higher capacity
 //!
-//! 本模块以**网关全局级**信号量限制同时进入上游转发路径的请求数：
-//! - `TieredSemaphore` 含两个独立桶（free / subscriber），互不干扰
-//! - 每桶两个信号量（slots + multi）：`acquire` 对两者各占一个 permit——
-//!   **实际并发上限 = min(slots, multi)**（免费层 1、订阅层 3）；multi 是平行预留维度
-//!   （若未来上游策略修正为"槽位与会话并发分离"可独立放大，当前由更稀缺的槽位定上限）
-//! - `acquire(is_subscriber)` 在**首字节写出前**调用；超时 2s 返回 `AcquireError::Busy`
-//!   （429 语义，对齐 waiting_room），不无限排队
-//! - `TierGuard` 为 RAII：持 permit，Drop 时自动归还，杜绝泄漏
+//! This module uses a **gateway-global** semaphore to limit how many requests can enter the
+//! upstream forwarding path at once:
+//! - `TieredSemaphore` holds two independent buckets (free / subscriber) that don't interfere with each other
+//! - Each bucket has two semaphores (slots + multi): `acquire` takes one permit from each --
+//!   **the actual concurrency ceiling = min(slots, multi)** (1 for free tier, 3 for subscriber tier); multi is a parallel reserve dimension
+//!   (if upstream policy later separates "slot count" from "session concurrency", it can be scaled independently; for now the scarcer slots dimension sets the ceiling)
+//! - `acquire(is_subscriber)` is called **before the first byte is written out**; a 2s timeout returns `AcquireError::Busy`
+//!   (429 semantics, aligned with waiting_room), never queues indefinitely
+//! - `TierGuard` is RAII: holds the permit, returns it automatically on Drop, preventing leaks
 //!
-//! 配置（config.json / CONCURRENCY_* 环境变量）：
-//! - `concurrency_free_slots`    默认 1
-//! - `concurrency_free_multi`    默认 3
-//! - `concurrency_sub_slots`     默认 3
-//! - `concurrency_sub_multi`     默认 8
+//! Configuration (config.json / CONCURRENCY_* env vars):
+//! - `concurrency_free_slots`    default 1
+//! - `concurrency_free_multi`    default 3
+//! - `concurrency_sub_slots`     default 3
+//! - `concurrency_sub_multi`     default 8
 
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tokio::time::{timeout, Duration};
 
-/// 默认免费桶：付费槽 1 / 普通 3
+/// Default free bucket: 1 paid slot / 3 ordinary
 pub const DEFAULT_FREE_SLOTS: usize = 1;
 pub const DEFAULT_FREE_MULTI: usize = 3;
-/// 默认订阅桶：付费槽 3 / 普通 8
+/// Default subscriber bucket: 3 paid slots / 8 ordinary
 pub const DEFAULT_SUB_SLOTS: usize = 3;
 pub const DEFAULT_SUB_MULTI: usize = 8;
-/// acquire 超时（毫秒）：超时视为并发繁忙，返回 429 语义
+/// acquire timeout (milliseconds): a timeout is treated as concurrency-busy, returning 429 semantics
 pub const ACQUIRE_TIMEOUT_MS: u64 = 2000;
 
-/// 获取 permit 失败
+/// Failed to acquire a permit
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AcquireError {
-    /// 桶容量耗尽且超时未等到（429 语义）
+    /// Bucket capacity exhausted and the wait timed out (429 semantics)
     Busy,
 }
 
-/// 双桶信号量（网关全局级，Arc 共享）
+/// Dual-bucket semaphore (gateway-global, Arc-shared)
 pub struct TieredSemaphore {
     free_slots: Arc<Semaphore>,
     free_multi: Arc<Semaphore>,
@@ -47,10 +49,10 @@ pub struct TieredSemaphore {
     sub_multi: Arc<Semaphore>,
 }
 
-/// 单个 permit 的 RAII 守卫：Drop 时归还对应信号量
+/// RAII guard for a single permit: returns the corresponding semaphore on Drop
 #[derive(Debug)]
 pub struct TierGuard {
-    // 归还要看从哪个桶借的——用 Option 表示已借的 permit
+    // Which bucket to return to depends on which one it was borrowed from -- Option represents a borrowed permit
     slots: Option<tokio::sync::OwnedSemaphorePermit>,
     multi: Option<tokio::sync::OwnedSemaphorePermit>,
 }
@@ -66,14 +68,14 @@ impl TierGuard {
 
 impl Drop for TierGuard {
     fn drop(&mut self) {
-        // SemaphorePermit Drop 自动归还；显式清空以防二次借用
+        // SemaphorePermit returns itself automatically on Drop; explicitly cleared to prevent double-borrow
         self.slots.take();
         self.multi.take();
     }
 }
 
 impl TieredSemaphore {
-    /// 从四个容量构建
+    /// Builds from four capacities
     pub fn new(free_slots: usize, free_multi: usize, sub_slots: usize, sub_multi: usize) -> Self {
         Self {
             free_slots: Arc::new(Semaphore::new(free_slots.max(1))),
@@ -83,7 +85,7 @@ impl TieredSemaphore {
         }
     }
 
-    /// 默认容量（1/3/3/8）
+    /// Default capacities (1/3/3/8)
     pub fn default_capacity() -> Self {
         Self::new(
             DEFAULT_FREE_SLOTS,
@@ -93,7 +95,7 @@ impl TieredSemaphore {
         )
     }
 
-    /// 占用数快照（供面板/体检观测）
+    /// Snapshot of usage counts (for dashboard/health observation)
     pub fn usage(&self) -> serde_json::Value {
         serde_json::json!({
             "free_slots": self.free_slots.available_permits(),
@@ -103,17 +105,18 @@ impl TieredSemaphore {
         })
     }
 
-    /// 获取双桶 permit（槽位 + 普通各一）。`is_subscriber=true` 走订阅桶。
+    /// Acquires dual-bucket permits (one slot + one ordinary). `is_subscriber=true` uses the subscriber bucket.
     ///
-    /// 两个 permit 都必须拿到才返回守卫；先拿到的那个在任一失败/超时时已由内部 Drop 归还。
-    /// 超时返回 `AcquireError::Busy`（429 语义）。
+    /// Both permits must be obtained before a guard is returned; whichever was obtained first is already
+    /// returned by the internal Drop if the other fails/times out.
+    /// Returns `AcquireError::Busy` on timeout (429 semantics).
     pub async fn acquire(&self, is_subscriber: bool) -> Result<TierGuard, AcquireError> {
         let (slots, multi) = if is_subscriber {
             (self.sub_slots.clone(), self.sub_multi.clone())
         } else {
             (self.free_slots.clone(), self.free_multi.clone())
         };
-        // 先抢 slots（更稀缺），再抢 multi
+        // Grab slots first (scarcer), then multi
         let slot_permit = match timeout(
             Duration::from_millis(ACQUIRE_TIMEOUT_MS),
             slots.acquire_owned(),
@@ -130,12 +133,12 @@ impl TieredSemaphore {
         .await
         {
             Ok(Ok(p)) => Some(p),
-            _ => return Err(AcquireError::Busy), // slot_permit 在此 Drop 自动归还
+            _ => return Err(AcquireError::Busy), // slot_permit is automatically returned here via Drop
         };
         Ok(TierGuard::new(slot_permit, multi_permit))
     }
 
-    /// 仅占槽位（multi 不占）——保留给需要"只限会话数"的场景；当前未使用。
+    /// Takes only a slot (not multi) -- reserved for scenarios that need to "cap session count only"; currently unused.
     #[allow(dead_code)]
     pub async fn acquire_slots_only(&self, is_subscriber: bool) -> Result<TierGuard, AcquireError> {
         let slots = if is_subscriber {
@@ -155,12 +158,12 @@ impl TieredSemaphore {
     }
 }
 
-/// 判定一个账号凭证是否走订阅桶（保守策略：无明确订阅信号默认 free 桶）。
+/// Determines whether an account credential should use the subscriber bucket (conservative: defaults to the free bucket when there's no clear subscription signal).
 ///
-/// 信号来源（任一命中即订阅）：
-/// - token 明文含 `unique_subscription`（web 协议套餐字段）
-/// - token 明文含 `"subscription"` / `"access_tier"` 且非免费值
-/// - Bearer token 形态（长串）但会话快照 tier 为 paid/subscribed（由调用方传入）
+/// Signal sources (any match means subscriber):
+/// - token plaintext contains `unique_subscription` (a web protocol plan field)
+/// - token plaintext contains `"subscription"` / `"access_tier"` with a non-free value
+/// - Bearer token shape (long string) but the session snapshot tier is paid/subscribed (passed in by the caller)
 pub fn is_subscriber_token(token: &str, tier_hint: Option<&str>) -> bool {
     let t = token.to_lowercase();
     if t.contains("unique_subscription") {
@@ -183,11 +186,11 @@ mod tests {
     async fn free_bucket_caps_concurrency() {
         let sem = TieredSemaphore::new(1, 1, 3, 8);
         let g1 = sem.acquire(false).await.unwrap();
-        // 桶容量 1 → 第二个 acquire 超时应 Busy
+        // Bucket capacity 1 -> the second acquire should time out with Busy
         let r = tokio::time::timeout(Duration::from_millis(100), sem.acquire(false)).await;
-        assert!(r.is_err(), "容量 1 时第二个 acquire 必须超时");
+        assert!(r.is_err(), "the second acquire must time out at capacity 1");
         drop(g1);
-        // 归还后可再次获取
+        // Can acquire again after returning the permit
         assert!(sem.acquire(false).await.is_ok());
     }
 
@@ -195,10 +198,10 @@ mod tests {
     async fn subscriber_and_free_buckets_are_independent() {
         let sem = TieredSemaphore::new(1, 1, 3, 8);
         let g_free = sem.acquire(false).await.unwrap();
-        // free 桶耗尽不影响 subscriber 桶
+        // Exhausting the free bucket doesn't affect the subscriber bucket
         let g_sub = sem.acquire(true).await.unwrap();
         drop(g_sub);
-        // subscriber 桶有多余容量，可再进 2 个
+        // The subscriber bucket has spare capacity, 2 more can enter
         let s1 = sem.acquire(true).await.unwrap();
         let s2 = sem.acquire(true).await.unwrap();
         drop(s1);
@@ -211,13 +214,13 @@ mod tests {
         let sem = TieredSemaphore::new(1, 1, 3, 8);
         let _g = sem.acquire(false).await.unwrap();
         let start = std::time::Instant::now();
-        // ACQUIRE_TIMEOUT_MS 是内部 2s，测试用 3s 外窗确保 Busy 而非无限挂起
+        // ACQUIRE_TIMEOUT_MS is internally 2s; the test uses a 3s outer window to ensure Busy rather than hanging forever
         let r = tokio::time::timeout(Duration::from_millis(3000), sem.acquire(false)).await;
-        assert!(r.is_ok(), "不得无限阻塞");
+        assert!(r.is_ok(), "must not block indefinitely");
         assert_eq!(r.unwrap().unwrap_err(), AcquireError::Busy);
         assert!(
             start.elapsed() < Duration::from_millis(2500),
-            "应在 2s 超时内返回 Busy"
+            "should return Busy within the 2s timeout"
         );
     }
 
@@ -228,21 +231,21 @@ mod tests {
             let g = sem.acquire(false).await.unwrap();
             drop(g);
         }
-        // 循环后可用计数复原
+        // Available count is restored after the loop
         assert_eq!(sem.free_slots.available_permits(), 2);
         assert_eq!(sem.free_multi.available_permits(), 2);
     }
 
     #[test]
     fn subscriber_detection_is_conservative() {
-        // web 协议套餐字段 → 订阅
+        // web protocol plan field -> subscriber
         assert!(is_subscriber_token(
             "__Secure-next-auth.session-token=x; unique_subscription=true",
             None
         ));
-        // Bearer token + paid tier hint → 订阅
+        // Bearer token + paid tier hint -> subscriber
         assert!(is_subscriber_token("sk-abc", Some("paid")));
-        // 无信号 → 免费（保守）
+        // No signal -> free (conservative)
         assert!(!is_subscriber_token("sk-abc", None));
         assert!(!is_subscriber_token("sk-abc", Some("free")));
         assert!(!is_subscriber_token("sk-abc", Some("guest")));
@@ -250,16 +253,16 @@ mod tests {
 
     #[tokio::test]
     async fn multi_bucket_shared_with_slots() {
-        // multi 桶独立：free slots=2 / multi=2 时，2 个并发可同时通过（slots 不阻塞）
+        // multi bucket is independent: with free slots=2 / multi=2, 2 concurrent requests can pass at once (slots don't block)
         let sem = TieredSemaphore::new(2, 2, 3, 8);
         let g1 = sem.acquire(false).await.unwrap();
         let g2 = sem.acquire(false).await.unwrap();
         drop(g1);
         drop(g2);
-        // slots 容量 1 + multi 2：第 2 个并发被 slots 挡住（不是 multi）
+        // slots capacity 1 + multi 2: the 2nd concurrent request is blocked by slots (not multi)
         let sem2 = TieredSemaphore::new(1, 2, 3, 8);
         let _a = sem2.acquire(false).await.unwrap();
         let r = tokio::time::timeout(Duration::from_millis(100), sem2.acquire(false)).await;
-        assert!(r.is_err(), "slots 容量 1 时第 2 个并发必须超时");
+        assert!(r.is_err(), "the 2nd concurrent request must time out at slots capacity 1");
     }
 }

@@ -1,77 +1,77 @@
-# Freebuff2API 一键登录扩展（Chrome / Edge）
+# Freebuff2API One-Click Login Extension (Chrome / Edge)
 
-浏览器版无法用网页脚本读取 `__Secure-next-auth.session-token`——它是 **HttpOnly** Cookie，浏览器安全策略禁止 `document.cookie` 访问。本扩展通过官方的 `chrome.cookies` API 读取（这是浏览器唯一的合法途径），把登录凭证自动发送到本机网关。
+The browser edition can't read `__Secure-next-auth.session-token` with a page script — it's an **HttpOnly** cookie, and browser security policy forbids `document.cookie` access to it. This extension reads it via the official `chrome.cookies` API (the browser's only legitimate way to do so), and automatically sends the login credential to the local gateway.
 
-## 安装（30 秒）
+## Installation (30 seconds)
 
-1. 确认本目录存在（`Freebuff2API/browser-extension/`）
-2. 打开浏览器扩展页：
-   - Chrome：地址栏输入 `chrome://extensions`
-   - Edge：地址栏输入 `edge://extensions`
-3. 打开右上角 **开发者模式**
-4. 点 **加载已解压的扩展程序** → 选择本目录（`browser-extension`）
-5. 扩展栏出现 Freebuff2API 图标
-6. **刷新已打开的网关面板页面**（让扩展的 `bridge.js` 注入并完成握手）
+1. Confirm this directory exists (`Freebuff2API/browser-extension/`)
+2. Open your browser's extensions page:
+   - Chrome: enter `chrome://extensions` in the address bar
+   - Edge: enter `edge://extensions` in the address bar
+3. Turn on **Developer mode** in the top right
+4. Click **Load unpacked** → select this directory (`browser-extension`)
+5. The Freebuff2API icon appears in the extensions bar
+6. **Refresh the already-open gateway panel page** (so the extension's `bridge.js` injects and completes the handshake)
 
-## 使用方式 A：面板「一键登录」（推荐 · 全自动）
+## Method A: panel "one-click login" (recommended — fully automatic)
 
-1. 打开网关控制面板（如 `http://127.0.0.1:47821/ui`）→「账号」页
-2. 点 **🔑 一键登录**
-3. 若浏览器里已有 freebuff.com 登录态 → 凭证立即自动入库，面板刷新即可看到账号
-4. 若尚未登录 → 扩展自动打开 freebuff.com 登录页并提示「请完成 GitHub 登录」；**登录成功后无需任何操作**，扩展自动检测到会话并导入（最长等待 3 分钟）
-5. 通知栏出现「✅ 已自动导入 N 个凭证」
+1. Open the gateway control panel (e.g. `http://127.0.0.1:47821/ui`) → the "Accounts" page
+2. Click **🔑 One-click login**
+3. If the browser already has a freebuff.com login session → the credential is imported immediately; refresh the panel to see the account
+4. If not logged in yet → the extension automatically opens the freebuff.com login page and prompts "please complete GitHub login"; **no further action is needed after logging in successfully** — the extension automatically detects the session and imports it (waits up to 3 minutes)
+5. A notification appears: "✅ Automatically imported N credential(s)"
 
-重复导入不会重复入库（同值自动去重）。
+Repeated imports won't duplicate entries (identical values are automatically deduplicated).
 
-## 网关 API Key（可选）
+## Gateway API key (optional)
 
-网关配置了 `api_keys` 时，导入接口会校验 `Authorization: Bearer <key>`：
+When the gateway has `api_keys` configured, the import endpoint validates `Authorization: Bearer <key>`:
 
-- **从面板点「一键登录」**：你在面板顶部填的 Key 会随请求一起传给扩展，无需在扩展里再填一次。
-- **直接点扩展图标**：右键扩展图标 →「选项」→「网关 API Key」填入面板显示的 Key。
-- **网关未配置 `api_keys` 时留空即可**：扩展不发送 `Authorization` 头，本机直连照常可用。
-- 通知出现「🔑 网关已启用 API Key 校验」即表示 Key 缺失或不正确，按上面两步填写后重试。
+- **Clicking "one-click login" from the panel**: the key you filled in at the top of the panel is sent along with the request automatically, no need to fill it in again in the extension.
+- **Clicking the extension icon directly**: right-click the extension icon → "Options" → fill in the "Gateway API Key" shown in the panel.
+- **Leave it blank if the gateway has no `api_keys` configured**: the extension won't send an `Authorization` header, and local direct connections work as usual.
+- A notification saying "🔑 Gateway API key validation is enabled" means the key is missing or incorrect — follow the two steps above and retry.
 
-## 使用方式 B：点击扩展图标（等效路径）
+## Method B: clicking the extension icon (equivalent path)
 
-点扩展图标 = 上面同一条流程：能读到登录态就直接导入；读不到就自动打开 freebuff.com 等待登录，登录后自动导入。适合不想开面板、只想先把凭证存进网关的场景。
+Clicking the extension icon follows the same flow as above: if a login session can be read, it's imported directly; if not, it automatically opens freebuff.com and waits for login, then imports automatically once logged in. Useful when you don't want to open the panel and just want to store the credential into the gateway first.
 
-## 工作原理（为什么能全自动）
+## How it works (why it's fully automatic)
 
-- 扩展的 `bridge.js` 作为 content script 注入本机网关面板页面，通过 `window.postMessage` 把扩展 ID 告知面板；面板用 `chrome.runtime.sendMessage(扩展ID, ...)` 直连扩展（`externally_connectable` 只放行 `127.0.0.1` / `localhost`）。
-- 扩展收到请求后：先查 `__Secure-next-auth.session-token`；没有就打开 freebuff.com 并 **每 2 秒轮询一次**，拿到后立即 POST 到网关 `/api/tokens/import`（网关配置了 `api_keys` 时自动带 `Authorization: Bearer <key>`）。
-- 网关端口按 `面板传入 > 选项页设置 > 47821 → 47822 → 8787` 探测；**只有连接被拒才换端口**，网关有 HTTP 响应（含报错）就停在该端口并如实提示。
+- The extension's `bridge.js` is injected as a content script into the local gateway panel page, and uses `window.postMessage` to tell the panel the extension's ID; the panel then connects directly to the extension via `chrome.runtime.sendMessage(extensionId, ...)` (`externally_connectable` only allows `127.0.0.1` / `localhost`).
+- When the extension receives a request: it first checks `__Secure-next-auth.session-token`; if absent, it opens freebuff.com and **polls every 2 seconds**, and as soon as it gets the token it immediately POSTs it to the gateway's `/api/tokens/import` (if the gateway has `api_keys` configured, it automatically attaches `Authorization: Bearer <key>`).
+- The gateway port is probed in the order `passed in by panel > options page setting > 47821 → 47822 → 8787`; **the port only changes if the connection is refused** — if the gateway responds with any HTTP response (including an error), it stops at that port and reports honestly.
 
-## 常见问题
+## FAQ
 
-**面板点「一键登录」没反应 / 提示未检测到扩展**：确认扩展已启用、版本为 1.1.0，然后**刷新面板页面**（`Ctrl+F5`）让 `bridge.js` 重新注入。
+**Clicking "one-click login" in the panel does nothing / says the extension wasn't detected**: confirm the extension is enabled and at version 1.1.0, then **refresh the panel page** (`Ctrl+F5`) to let `bridge.js` re-inject.
 
-**提示「未找到登录凭证」后没有自动打开登录页**：多为浏览器拦截了新标签页，手动打开 [freebuff.com](https://freebuff.com) 登录即可；登录后扩展仍会在轮询中检测到并自动导入（或再点一次图标）。
+**"No login credential found" appears with no login page opening automatically**: often the browser blocked the new tab; manually open [freebuff.com](https://freebuff.com) and log in — the extension will still detect it during polling and import automatically (or click the icon again).
 
-**提示「连接本地网关失败」**：确认 Freebuff2API 已启动（默认端口 47821）。如果你改过端口：右键扩展图标 →「选项」→ 填入端口；或直接从网关面板点「一键登录」（面板会自动带上自己的端口）。
+**"Failed to connect to local gateway" appears**: confirm Freebuff2API is running (default port 47821). If you've changed the port: right-click the extension icon → "Options" → enter the port; or click "one-click login" directly from the gateway panel (the panel automatically attaches its own port).
 
-**提示「网关已启用 API Key 校验」（401）**：网关配置了 `api_keys`。在面板顶部填入 Key，并右键扩展图标 →「选项」→「网关 API Key」填入同一个 Key；从面板点「一键登录」时会自动携带，无需手填。
+**"Gateway API key validation is enabled" (401) appears**: the gateway has `api_keys` configured. Fill in the key at the top of the panel, and right-click the extension icon → "Options" → "Gateway API Key" and enter the same key; it's attached automatically when clicking "one-click login" from the panel, no manual entry needed.
 
-**提示「等待登录超时」**：3 分钟内没检测到登录。完成登录后再点一次图标或面板按钮即可立即导入。
+**"Login wait timed out" appears**: no login was detected within 3 minutes. After finishing login, click the icon or the panel button again to import immediately.
 
-**它会读取我的密码吗？** 不会。扩展只读取 freebuff.com 域下的 Cookie（其中包含登录会话标识），不接触账号密码，也不会把数据发往除你本机 `127.0.0.1` 之外的任何地方。
+**Does it read my password?** No. The extension only reads cookies under the freebuff.com domain (which include a login session identifier), never touches account passwords, and never sends data anywhere other than your own `127.0.0.1`.
 
-## 权限说明
+## Permissions
 
-| 权限 | 用途 |
+| Permission | Purpose |
 |------|------|
-| `cookies` | 读取 freebuff.com 的登录 Cookie（HttpOnly 只能这样读） |
-| `host_permissions: freebuff.com` | 限定只能读取该域 |
-| `host_permissions: 127.0.0.1/localhost` | 只能发送到你本机的网关 |
-| `notifications` | 导入结果/登录提醒通知 |
-| `storage` | 记住你设置的网关端口与（可选的）网关 API Key |
-| `content_scripts`（bridge.js，仅 127.0.0.1/localhost） | 把扩展 ID 告知本机网关面板，实现面板→扩展直连 |
-| `externally_connectable`（仅 127.0.0.1/localhost） | 只允许本机网关面板向扩展发消息 |
+| `cookies` | Read the freebuff.com login cookie (only way to read an HttpOnly cookie) |
+| `host_permissions: freebuff.com` | Restricted to reading only this domain |
+| `host_permissions: 127.0.0.1/localhost` | Can only send to your own local gateway |
+| `notifications` | Import result / login reminder notifications |
+| `storage` | Remembers your configured gateway port and (optional) gateway API key |
+| `content_scripts` (bridge.js, 127.0.0.1/localhost only) | Tells the local gateway panel the extension's ID, enabling a direct panel→extension connection |
+| `externally_connectable` (127.0.0.1/localhost only) | Only allows the local gateway panel to message the extension |
 
-## 源码文件（可自行审阅，纯原生 JS 无依赖）
+## Source files (freely auditable, plain native JS, no dependencies)
 
-| 文件 | 作用 |
+| File | Purpose |
 |------|------|
-| `background.js` | 主流程：读 Cookie、多端口导入、自动导航、轮询等待登录、面板消息处理 |
-| `bridge.js` | content script：面板 ↔ 扩展握手（只注入 127.0.0.1 / localhost） |
-| `options.html` / `options.js` | 端口与网关 API Key 设置页 |
+| `background.js` | Main flow: reading the cookie, multi-port import, auto-navigation, polling while waiting for login, panel message handling |
+| `bridge.js` | content script: panel ↔ extension handshake (only injected on 127.0.0.1 / localhost) |
+| `options.html` / `options.js` | port and gateway API key settings page |

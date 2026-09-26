@@ -1,328 +1,329 @@
 # Changelog
 
-本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
+This project follows [Semantic Versioning](https://semver.org/lang/zh-CN/).
 
 ## [0.10.3] - 2026-09-19
 
-### 测试/质量
+### Testing/Quality
 
-- **覆盖率提升闭环**：新增 22 个 Router 级集成用例（config 读写白名单/非法值、skills list+gate 注入检测、memory CRUD+toggle、tokens import+list、accounts health、usage totals/daily/models/cost/insights、logs recent、doctor、export schema、import 坏 schema、prompts list+toggle、threads cleanup、guide、models data+meta、web-chat 无凭证降级、upload 无凭证 400、usage accounts、account history、跨站写拒绝）
-  - router_test 11 -> **33 用例**；api.rs 行覆盖 30.6% -> **45.8%**；TOTAL 行覆盖 66.8% -> **72.25%**
-- **CI 覆盖率门禁收紧 65% -> 70%**（`--fail-under-lines 70` + `continue-on-error: false`；本机实测 72.25% 留 2.25pt 缓冲）
-- docs/TESTING.md 基线更新；提升路径（api.rs -> 60 再总体 75/80）为 backlog
+- **Coverage-improvement loop closed**: added 22 Router-level integration cases (config read/write allowlist/invalid values, skills list+gate injection detection, memory CRUD+toggle, tokens import+list, accounts health, usage totals/daily/models/cost/insights, logs recent, doctor, export schema, import bad schema, prompts list+toggle, threads cleanup, guide, models data+meta, web-chat degrade without credentials, upload 400 without credentials, usage accounts, account history, cross-site write rejection)
+  - router_test 11 -> **33 cases**; api.rs line coverage 30.6% -> **45.8%**; TOTAL line coverage 66.8% -> **72.25%**
+- **CI coverage gate tightened 65% -> 70%** (`--fail-under-lines 70` + `continue-on-error: false`; local measurement 72.25% leaves a 2.25pt buffer)
+- docs/TESTING.md baseline updated; the path to improve further (api.rs -> 60, then overall 75/80) is tracked as backlog
 
 ## [0.10.2] - 2026-09-19
 
-### 新增
+### Added
 
-- Dockerfile 容器健康检查：运行阶段安装 `curl` + `HEALTHCHECK`（`/healthz`，interval 30s / start_period 10s）
-- CI 覆盖率**真门禁**：`--fail-under-lines 65` + `continue-on-error: false`（替代原 always-true；本机基线 66.8%，关键模块 ≥80%）
-- `docs/DOCKER.md` 容器实跑指南（本机无 Docker 时由 CI docker.yml 多架构构建 → ghcr.io/lza6/freebuff2api）
+- Dockerfile container health check: installs `curl` in the run stage + `HEALTHCHECK` (`/healthz`, interval 30s / start_period 10s)
+- CI coverage **real gate**: `--fail-under-lines 65` + `continue-on-error: false` (replacing the previous always-true gate; local baseline 66.8%, key modules >= 80%)
+- `docs/DOCKER.md` guide for running the container locally (when Docker isn't available locally, CI's docker.yml does the multi-arch build → ghcr.io/lza6/freebuff2api)
 
-### 工程
+### Engineering
 
-- 覆盖率基线记录于 `docs/TESTING.md`（TOTAL 66.8%；提升路径 70→75→80 为 backlog）
+- Coverage baseline recorded in `docs/TESTING.md` (TOTAL 66.8%; improvement path 70→75→80 tracked as backlog)
 
 ## [0.10.1] - 2026-09-19
 
-### 修复（代码审计闭环：CRITICAL 0 / HIGH 1 / MEDIUM 2 / LOW 6 / NIT 5）
+### Fixed (code-audit loop closed: CRITICAL 0 / HIGH 1 / MEDIUM 2 / LOW 6 / NIT 5)
 
-- **[HIGH] 生产接线**：`main.rs` 启动路径加载 vendored 上游模型快照 → `refresh_strategy_from_snapshot`（时间窗/efforts/fallback 策略真正生效；失败静默降级 warn，不阻断启动）
-- **[MEDIUM] availableAt 归因**：仅"不可用由时间窗导致"时给出恢复时刻；静态暂停模型不编造 availableAt
-- **[MEDIUM] 兜底模型校验**：`resolve_at` 兜底 DEFAULT_MODEL 也做可用性校验，全不可用才原样返回默认（让上游给出可读错误）
-- **[LOW] SQLite 鲁棒性**：telemetry `open_db` 设 busy_timeout(5s)；`/api/usage/insights` 改 `spawn_blocking` 不占 tokio worker
-- **[LOW] 未知策略不过度拒绝**：`availability_now` 对未识别策略按可用处理（避免上游新增策略静默禁用模型），文案与"已暂停"区分
-- **[LOW] XSS 面**：推荐表 `price`/`usable_today` 补 `esc()`（上游字段半可信）
-- **[LOW] ARIA 完整性**：11 个面板补 `role=tabpanel`+`aria-labelledby`；tabs 实现 roving tabindex（激活项 0 / 其余 -1）
-- **[LOW] CI E2E 可靠性**：健康轮询超时显式 `::error::`+exit 1；`trap` 兜底清理网关进程
-- **[NIT]** 快照输出确定性排序；空策略覆盖跳过；上传 filename 日志净化（去 CR/LF）；冷却到期文案"已到期"
+- **[HIGH] Production wiring**: `main.rs` startup path now loads the vendored upstream model snapshot → `refresh_strategy_from_snapshot` (time-window/efforts/fallback strategy now actually takes effect; failure degrades silently with a warning, doesn't block startup)
+- **[MEDIUM] availableAt attribution**: only gives a recovery time when unavailability is actually caused by a time window; statically paused models no longer fabricate an availableAt
+- **[MEDIUM] Fallback model validation**: `resolve_at`'s fallback to DEFAULT_MODEL now also runs availability validation, only returning the default as-is when everything is unavailable (letting upstream produce a readable error)
+- **[LOW] SQLite robustness**: telemetry's `open_db` now sets busy_timeout(5s); `/api/usage/insights` switched to `spawn_blocking` so it doesn't occupy a tokio worker
+- **[LOW] Unknown strategies no longer over-rejected**: `availability_now` now treats unrecognized strategies as available (avoiding silently disabling models when upstream adds a new strategy), with wording distinct from "paused"
+- **[LOW] XSS surface**: the recommendation table's `price`/`usable_today` now get `esc()` (upstream fields are only semi-trusted)
+- **[LOW] ARIA completeness**: 11 panels now have `role=tabpanel`+`aria-labelledby`; tabs implement roving tabindex (active item 0 / others -1)
+- **[LOW] CI E2E reliability**: health-poll timeout now explicitly emits `::error::`+exit 1; a `trap` cleans up the gateway process as a fallback
+- **[NIT]** deterministic ordering for snapshot output; empty strategy overrides are skipped; upload filename log sanitization (strips CR/LF); cooldown-expired wording changed to "expired"
 
-### 验证
+### Verification
 
-- 275 单测 + core 8 + router 11 + web_pool 5 + model_meta 7 全绿；clippy `-D warnings` 零警告；fmt 通过；check_panel_js 通过
-- 真实 E2E（v0_8 26 + v0_9 26）在 CI e2e-win job 全绿；Release v0.10.1 由 CI 自动构建
+- 275 unit tests + core 8 + router 11 + web_pool 5 + model_meta 7 all green; clippy `-D warnings` zero warnings; fmt passes; check_panel_js passes
+- Real E2E (v0_8 26 + v0_9 26) all green in the CI e2e-win job; Release v0.10.1 auto-built by CI
 
 ## [0.10.0] - 2026-09-19
 
-### 新增
+### Added
 
-- **上游模型策略合同实时化**（`src/models.rs` / `src/router.rs`，对照上游 freebuff-models.ts 快照）：
-  - `ModelMeta` 新增 `availability`（always/deployment_hours/off_peak_only）+ `available_at`（off_peak_only 窗口内给出 ISO 恢复时刻，与上游 freebuffModelUnavailableAt 对齐，不编造时间）
-  - DeepSeek 高价窗 00:00–10:00 UTC（北京周末豁免）；`refresh_strategy_from_snapshot` 快照同步（幂等、失败降级静态底座）
-  - `resolve/resolve_available/unavailable_reason` 时间感知，降级链跳过暂停/高峰模型
-  - 目录对齐：收录 `mimo/mimo-v2.5`（上游免费无限、FALLBACK 落点）；按上游快照修正 5 处漂移（deepseek-v4-flash premium、kimi premium、ox-alpha premium/multimodal、fable multimodal、glm-5.2 multimodal）
-  - 新增 `tests/fixtures/freebuff-models.snapshot.json`（21 行）+ `scripts/check_model_contract.mjs` + `scripts/extract_upstream_models.mjs` 漂移检测
-- **面板可访问性与体验**（`src/web.rs`）：ARIA tabs（role=tablist/aria-selected/键盘 ←/→/Home/End）、日志 aria-live、focus-visible、44px 触控目标；日志页级别筛选按钮组/暂停滚动/导出 JSON/错误计数徽标；推荐卡可用性列（暂停/高峰 + availableAt + 未经策略验证）；凭证冷却警告条（一键去账号页）；上传白名单/20MB/空文件校验 + 发送中/上传中按钮态
-- **遥测"三最"聚合**：`src/telemetry.rs::insights()` + `/api/usage/insights`（最慢账号 Top3/最常用模型 Top5/错误率最高时段 Top3）
-- **web 凭证池全冷却结构化降级**：`web_pool_exhausted`（503 + code=web_pool_exhausted + 最短恢复秒）；`cooldown_until` 输出 ISO + 新增 `cooldown_seconds`
-- **请求热路径 panic 收窄**：api.rs 7 处运行时 unwrap → unwrap_or_default
-- **CI/工程**：新增 `e2e-win` job（真实网关 E2E + 面板 JS 检查）、`cargo test --doc` 门禁（rust-docs 组件）、覆盖率纪律注释；`docs/TESTING.md`、`scripts/verify_release.ps1`、`scripts/check_artifacts.ps1`（只报告不删）
+- **Real-time upstream model strategy contract** (`src/models.rs` / `src/router.rs`, checked against the upstream freebuff-models.ts snapshot):
+  - `ModelMeta` adds `availability` (always/deployment_hours/off_peak_only) + `available_at` (gives an ISO recovery time within an off_peak_only window, aligned with upstream's freebuffModelUnavailableAt, never fabricated)
+  - DeepSeek high-price window 00:00–10:00 UTC (exempted on Beijing-time weekends); `refresh_strategy_from_snapshot` snapshot sync (idempotent, falls back to the static baseline on failure)
+  - `resolve/resolve_available/unavailable_reason` are now time-aware; the downgrade chain skips paused/peak-hour models
+  - Catalog alignment: added `mimo/mimo-v2.5` (unlimited free upstream, a FALLBACK landing spot); corrected 5 drift points against the upstream snapshot (deepseek-v4-flash premium, kimi premium, ox-alpha premium/multimodal, fable multimodal, glm-5.2 multimodal)
+  - Added `tests/fixtures/freebuff-models.snapshot.json` (21 lines) + `scripts/check_model_contract.mjs` + `scripts/extract_upstream_models.mjs` drift detection
+- **Panel accessibility and UX** (`src/web.rs`): ARIA tabs (role=tablist/aria-selected/keyboard ←/→/Home/End), log aria-live, focus-visible, 44px touch targets; log page level-filter button group/pause scrolling/export JSON/error-count badge; recommendation card availability column (paused/peak-hour + availableAt + not yet strategy-verified); credential-cooldown warning bar (one click to the accounts page); upload allowlist/20MB/empty-file validation + sending/uploading button states
+- **Telemetry "top three" aggregation**: `src/telemetry.rs::insights()` + `/api/usage/insights` (top 3 slowest accounts / top 5 most-used models / top 3 highest error-rate time slots)
+- **Structured degradation when the entire web credential pool is cooling down**: `web_pool_exhausted` (503 + code=web_pool_exhausted + shortest recovery in seconds); `cooldown_until` now output as ISO + new `cooldown_seconds`
+- **Narrowed panics on the request hot path**: 7 runtime unwraps in api.rs → unwrap_or_default
+- **CI/engineering**: new `e2e-win` job (real gateway E2E + panel JS check), `cargo test --doc` gate (rust-docs component), coverage discipline comments; `docs/TESTING.md`, `scripts/verify_release.ps1`, `scripts/check_artifacts.ps1` (report only, never deletes)
 
-### 测试
+### Testing
 
-- 单测 253 → **275**（models 时间窗/同步器/路由时间感知 + telemetry insights + router 3 项时间路由）
-- model_meta_test 4 → **7**（mimo 目录/meta 全盖/fixture 零漂移）；router_test 11、web_pool_test 5、core_test 8 保持
-- `cargo clippy --all-targets -- -D warnings` 零警告；`cargo fmt --check` 通过
+- Unit tests 253 → **275** (models time-window/synchronizer/route time-awareness + telemetry insights + 3 router time-routing items)
+- model_meta_test 4 → **7** (mimo catalog/full meta coverage/fixture zero drift); router_test 11, web_pool_test 5, core_test 8 unchanged
+- `cargo clippy --all-targets -- -D warnings` zero warnings; `cargo fmt --check` passes
 
-### 文档
+### Docs
 
-- `docs/API_GUIDE.md` 补 /api/usage/insights、/api/accounts/health、/api/export、/api/import、/api/login/embed/result、/v1/models meta
-- `README_zh.md` 模型矩阵补 mimo/glm-5.2；v0.10 特性说明；`计划书/0-项目全景与版本路线图.md` 刷新至 v0.10
-- `workflow_status.md` 开 Phase M
+- `docs/API_GUIDE.md` adds /api/usage/insights, /api/accounts/health, /api/export, /api/import, /api/login/embed/result, /v1/models meta
+- `README_zh.md` model matrix adds mimo/glm-5.2; v0.10 feature description; `plans/0-project-overview-and-roadmap.md` refreshed to v0.10
+- `workflow_status.md` opens Phase M
 
 ## [0.9.0] - 2026-09-18
 
-### 新增
+### Added
 
-- **web Cookie 凭证池化 + 多账号轮询**（`src/web_pool.rs`，修复 README 长期承认的"桥接路径只用第一个有效凭证"）：
-  - 复用 Bearer 池熔断语义（Closed/Open/HalfOpen、指数冷却封顶 10 分钟、HalfOpen 探测闸门）
-  - 全部 web Cookie 路径（chat/messages 桥接、余额、详情、上传、会话清理）改从池内按健康分/熔断/冷却挑选
-  - 401/403 确定性失效立即冷却，网络/5xx 连续失败累计熔断；成功 mark_ok 逐步恢复
-  - 导入/删除凭证后热刷新（`reload` 保留既有健康状态）；账号列表与健康看板展示 web 凭证
-- **上游模型元数据契约**（`src/models.rs` / `src/router.rs`，对照上游 freebuff-models.ts 当前快照）：
-  - 新增 `ModelMeta` 静态权威表：premium / multimodal / available / efforts 阶梯 / fallback
-  - 已暂停/下架模型标记不可用并给回落：gemini-3.8-flash、deepseek-v4-pro、minimax-m3、muse-spark-1.3、ox-alpha、glm-5.2
-  - GLM 5.3 阶梯对齐当前上游 `['low','high','max']`（max 原样保留）；solar/minimax/kimi/glm-5.2 无阶梯自动剥离
-  - `/v1/models` 响应带 `meta`（字段稳定，`data` 保持兼容）；`router::resolve_available/unavailable_reason` 供路由与面板消费
-- **面板（v0.9）**：
-  - 对话测试台升级：多轮会话上下文、system 提示词、reasoning_effort 下拉（按模型阶梯联动）、图片上传（拖拽/粘贴/选择 → /v1/uploads，失败自动降级 base64）、复制回复 / 导出 Markdown / 新会话
-  - 凭证健康看板：Bearer + web Cookie 合并展示（熔断徽章/评分/失败次数/冷却 + 每账号历史时间线）
-  - 总览"今日推荐"卡片：按 rateLimitsByModel 剩余排序（已暂停模型自动靠后）
-  - 设置页"数据迁移"：一键导出/导入（导入前二次确认 + 自动备份）
-  - 请求详情加耗时时间线（首字节 / 总耗时）
-- **鉴权纵深**：`inject_peer` 中间件把真实 TCP 对端（ConnectInfo）写入 `x-fb-peer`，`is_loopback_request` 改为"无代理头 && 对端回环"才算本机（127.0.0.1 默认行为不变）；`/api/doctor` 新增 `listen_scope` 检查（监听非回环且未配 api_keys → fault + 修复建议）
-- **全配置导出/导入**（`src/export.rs` + `/api/export` + `/api/import`）：schema 版本校验、大小上限 5MB、写前自动备份 `data/backup-<ts>/`、安全最小集（绝不覆盖 api_keys/auth_tokens）
+- **Web-cookie credential pooling + multi-account rotation** (`src/web_pool.rs`, fixing the long-standing README-acknowledged issue that "the bridging path only used the first valid credential"):
+  - Reuses the Bearer pool's circuit-breaker semantics (Closed/Open/HalfOpen, exponential cooldown capped at 10 minutes, HalfOpen probe gate)
+  - All web-cookie paths (chat/messages bridging, balance, detail, upload, session cleanup) now pick from the pool by health score/circuit state/cooldown
+  - Deterministic 401/403 failures cool down immediately; consecutive network/5xx failures accumulate toward tripping the breaker; success calls mark_ok to recover gradually
+  - Hot-reload after importing/deleting credentials (`reload` preserves existing health state); account list and health dashboard show web credentials
+- **Upstream model-metadata contract** (`src/models.rs` / `src/router.rs`, checked against the current upstream freebuff-models.ts snapshot):
+  - Added a static authoritative `ModelMeta` table: premium / multimodal / available / efforts ladder / fallback
+  - Paused/retired models are marked unavailable with a fallback: gemini-3.8-flash, deepseek-v4-pro, minimax-m3, muse-spark-1.3, ox-alpha, glm-5.2
+  - GLM 5.3 ladder aligned to the current upstream `['low','high','max']` (max kept as-is); solar/minimax/kimi/glm-5.2 have no ladder and are stripped automatically
+  - `/v1/models` response includes `meta` (stable fields, `data` stays backward compatible); `router::resolve_available/unavailable_reason` consumed by routing and the panel
+- **Panel (v0.9)**:
+  - Chat test bench upgraded: multi-turn conversation context, system prompt, reasoning_effort dropdown (linked to each model's ladder), image upload (drag/paste/select → /v1/uploads, falls back to base64 automatically on failure), copy reply / export Markdown / new conversation
+  - Credential health dashboard: Bearer + web cookie shown together (circuit-breaker badge/score/failure count/cooldown + per-account history timeline)
+  - Overview "today's recommendations" card: sorted by rateLimitsByModel remaining (paused models automatically sink to the bottom)
+  - Settings page "data migration": one-click export/import (import requires a second confirmation + automatic backup)
+  - Request detail adds a timing timeline (time to first byte / total duration)
+- **Deeper auth hardening**: the `inject_peer` middleware writes the real TCP peer (ConnectInfo) into `x-fb-peer`; `is_loopback_request` now requires "no proxy headers && peer is loopback" to count as local (the default 127.0.0.1 behavior is unchanged); `/api/doctor` adds a `listen_scope` check (fault + remediation advice if listening on a non-loopback address without api_keys configured)
+- **Full config export/import** (`src/export.rs` + `/api/export` + `/api/import`): schema version validation, 5MB size cap, automatic backup to `data/backup-<ts>/` before writing, safe minimal set (never overwrites api_keys/auth_tokens)
 
-### 测试
+### Testing
 
-- 新增 `src/web_pool.rs` 7 项单测（多号优选/冷却跳过/半开恢复/连续失败熔断/脱敏快照/空池）
-- 新增 `src/models.rs` 4 项单测（元数据全量覆盖/单模型查询/暂停清单/meta_snapshot 字段）
-- 新增 `tests/model_meta_test.rs` 4 项（阶梯对齐/可用性回落/可读原因/未知模型默认可用）
-- 新增 `tests/web_pool_test.rs` 5 项；`tests/router_test.rs` 增至 11 项（含新端点）
-- 新增 `tests/e2e_phase_v0_9.cjs` **26 断言真实网关全绿**；`tests/e2e_phase_v0_8.cjs` 26 断言回归全绿
-- 真实浏览器（headless Chrome）渲染面板：JS 完整执行（model-count 占位符 → 20、模型 chips 渲染、全部 v0.9 控件在 DOM）
-- **规模：253 单测 + 8 core + 4 model_meta + 11 router + 5 web_pool 全绿**；`cargo clippy --all-targets -- -D warnings` 零警告；`cargo fmt --check` 通过
+- Added 7 unit tests in `src/web_pool.rs` (multi-account preference/cooldown skip/half-open recovery/consecutive-failure trip/redacted snapshot/empty pool)
+- Added 4 unit tests in `src/models.rs` (full metadata coverage/single-model lookup/paused list/meta_snapshot fields)
+- Added `tests/model_meta_test.rs` with 4 cases (ladder alignment/availability fallback/readable reason/unknown model defaults to available)
+- Added `tests/web_pool_test.rs` with 5 cases; `tests/router_test.rs` grew to 11 cases (including new endpoints)
+- Added `tests/e2e_phase_v0_9.cjs` **26 assertions, all green against a real gateway**; `tests/e2e_phase_v0_8.cjs` 26-assertion regression all green
+- Real browser (headless Chrome) rendering of the panel: full JS execution (model-count placeholder → 20, model chips render, all v0.9 controls present in the DOM)
+- **Scale: 253 unit tests + 8 core + 4 model_meta + 11 router + 5 web_pool, all green**; `cargo clippy --all-targets -- -D warnings` zero warnings; `cargo fmt --check` passes
 
-### 修复
+### Fixed
 
-- `tests/e2e_phase_v0_9.cjs` 契约对齐：健康端点返回合并 accounts（含 kind + 每条 history 时间线）
-- 文档：README 测试计数 236→253；旧 v0.1.0 验收报告移入 `docs/archive/`（顶部标注历史归档）
-- CI：`cargo fmt --check` + llvm-cov 覆盖率门禁（首次 continue-on-error 收集基线）
+- `tests/e2e_phase_v0_9.cjs` contract alignment: the health endpoint returns merged accounts (including kind + per-record history timeline)
+- Docs: README test count 236→253; the old v0.1.0 acceptance report moved to `docs/archive/` (marked as historical archive at the top)
+- CI: `cargo fmt --check` + llvm-cov coverage gate (first run continue-on-error to collect a baseline)
 
 ## [0.8.0] - 2026-09-15
 
-### 新增
+### Added
 
-- **双桶并发信号量落地**（README 宣称的能力补实，`src/semaphore.rs`）：
-  - tokio `Semaphore` 零新依赖；免费 `{槽:1, 并发:3}`、订阅 `{槽:3, 并发:8}`（可配：`concurrency_free_slots/free_multi/sub_slots/sub_multi`，环境变量 `CONCURRENCY_*`）
-  - 接入 `/v1/chat/completions`、`/v1/messages`、web 桥接三路径，**首字节写出前 acquire**；`TierGuard` RAII 自动归还（流式任务结束才释放）
-  - 2s 超时返回 429（`concurrency_busy`），不无限排队；订阅判定保守（账号池任一凭证含套餐特征走订阅桶）
-  - 注：每请求同时占"槽"与"并发"各一，实际并发上限 = 槽位容量（免费 1 / 订阅 3），"并发"桶为上游策略预留维度
-- **Claude 路径补齐重试 + 记账 + 记忆**（`/v1/messages`，此前三缺）：
-  - 请求级重试循环（与 OpenAI 同策略）：失败换号、5xx/限流/网络自动重试、熔断冷却
-  - waiting_room 排队返回 503 + `overloaded_error` 可读消息（不再裸 502）
-  - 非流式成功补 `usage_db.record_ex` + `telemetry.record`；流式补 usage 落库；成功路径补 `memory.observe`
-- **面板现代化**（`src/web.rs`）：
-  - 新增 **对话测试台**（调 `/v1/chat/completions` 流式渲染回复）、**设置页**（监听地址/记忆开关/token_saver/脱敏/技能模式/预算/代理/清理间隔/信号量容量 UI 化写回 config.json）、**关于页**（版本/运行时长/上游/免责声明）
-  - 新增 `GET /api/config` + `POST /api/config/save`：白名单校验 + 类型/合法值检查 + 原子写回；`memory_enabled` 热生效
-  - 视觉品牌化：CSS 分层 token（色板/间距/圆角/阴影/动效）、`prefers-reduced-motion` 尊重、`focus-visible` 焦点环、窄屏导航横向滚动
-  - 大日志 **windowed 虚拟滚动**（只渲染可视区 + 缓冲，>1000 条流畅）
-- **安全加固**：
-  - 全部响应加 `X-Content-Type-Options: nosniff`、`Referrer-Policy: strict-origin-when-cross-origin`；面板页加 CSP `default-src 'self'`
-  - **日志/遥测脱敏**（`src/redact.rs`，`redact_logs` 默认开）：Cookie 值 / Bearer / authorization / sk- 长串在写入日志总线与遥测前替换为 `***`
-  - 跨站 Origin 拦截改为 **403 Forbidden**（CSRF，语义区别于 401）
-- **桌面壳加固**：
-  - 多开保护：`app.requestSingleInstanceLock()`，二次启动激活已有窗口，不重复拉起网关
-  - 托盘「系统体检」改用 hash 跳转（`location.hash='#doctor'`），不再全页刷新
-- **健壮性**：
-  - 端口绑定失败给出明确中文错误（含占用进程排查提示 `netstat -ano | findstr :port`）
-  - `web_threads` 绑定表加容量上限（2000）与 TTL 清理（24h），防文件/内存膨胀
-  - Cookie 判定收窄：`handle_account_balance` 不再用 `%3A` 兜底（防 URL 编码串误判）
+- **Dual-bucket concurrency semaphore shipped** (backfilling a capability the README already claimed, `src/semaphore.rs`):
+  - Uses tokio `Semaphore`, zero new dependencies; free tier `{slots:1, concurrency:3}`, subscriber tier `{slots:3, concurrency:8}` (configurable via `concurrency_free_slots/free_multi/sub_slots/sub_multi`, env vars `CONCURRENCY_*`)
+  - Wired into all three paths — `/v1/chat/completions`, `/v1/messages`, web bridging — **acquired before the first byte is written**; `TierGuard` RAII returns it automatically (released only when the streaming task ends)
+  - 2s timeout returns 429 (`concurrency_busy`) instead of queueing forever; subscriber detection is conservative (routed to the subscriber bucket if any credential in the account pool has plan characteristics)
+  - Note: each request holds one "slot" and one "concurrency" permit at the same time, so the real concurrency cap equals slot capacity (free 1 / subscriber 3); the "concurrency" bucket is a dimension reserved for upstream's own strategy
+- **Claude path now has retry + accounting + memory** (`/v1/messages`, previously missing all three):
+  - Request-level retry loop (same strategy as OpenAI): switches account on failure, auto-retries on 5xx/rate-limit/network errors, circuit-breaker cooldown
+  - waiting_room queueing now returns 503 + a readable `overloaded_error` message (no longer a bare 502)
+  - Non-streaming success now records `usage_db.record_ex` + `telemetry.record`; streaming records usage too; success path now calls `memory.observe`
+- **Panel modernization** (`src/web.rs`):
+  - New **chat test bench** (calls `/v1/chat/completions` and streams the reply), **settings page** (listen address/memory toggle/token_saver/redaction/skills mode/budget/proxy/cleanup interval/semaphore capacity, all UI-editable and written back to config.json), **about page** (version/uptime/upstream/disclaimer)
+  - New `GET /api/config` + `POST /api/config/save`: allowlist validation + type/valid-value checks + atomic write-back; `memory_enabled` takes effect immediately
+  - Visual branding: layered CSS tokens (palette/spacing/radius/shadow/motion), respects `prefers-reduced-motion`, `focus-visible` focus ring, horizontal-scroll nav on narrow screens
+  - Large logs now use **windowed virtual scrolling** (renders only the visible area + buffer, smooth past 1000 entries)
+- **Security hardening**:
+  - All responses get `X-Content-Type-Options: nosniff`, `Referrer-Policy: strict-origin-when-cross-origin`; panel pages get CSP `default-src 'self'`
+  - **Log/telemetry redaction** (`src/redact.rs`, `redact_logs` on by default): cookie values / Bearer / authorization / long sk- strings are replaced with `***` before hitting the log bus and telemetry
+  - Cross-site Origin blocking changed to **403 Forbidden** (CSRF, semantically distinct from 401)
+- **Desktop shell hardening**:
+  - Multi-instance protection: `app.requestSingleInstanceLock()`; a second launch activates the existing window instead of starting a second gateway
+  - Tray "System check" now uses a hash navigation (`location.hash='#doctor'`) instead of a full page reload
+- **Robustness**:
+  - Port-binding failures now give a clear error message (with a hint to check the occupying process via `netstat -ano | findstr :port`)
+  - `web_threads` binding table gets a capacity cap (2000) and TTL cleanup (24h) to prevent file/memory growth
+  - Cookie detection tightened: `handle_account_balance` no longer falls back on `%3A` (prevents misidentifying URL-encoded strings)
 
-### 测试
+### Testing
 
-- 新增 `src/semaphore.rs` 6 项单测（桶独立/超时/RAII 无泄漏/订阅判定）
-- 新增 `src/redact.rs` 6 项单测（Cookie/Bearer/sk- 脱敏、普通文本不误伤）
-- 新增 `tests/router_test.rs` **10 项 Router 级集成测试**（Mock TCP 上游）：chat 非流式/流式、messages 非流式、排队 503、401、跨站 403、healthz、桥接触发、5xx 重试耗尽、401 凭证失效
-- 补充 api 单测（Cookie 判定收窄回归、Claude tool 往返语义）、web_threads 单测（TTL/容量）
-- **测试规模：238 单测 + 8 集成 + 10 路由级集成全绿**；`cargo clippy -- -D warnings` 零警告
-- 新增 `tests/e2e_phase_v0_8.cjs`（26 断言真实网关冒烟：安全头/CSP/配置读写/新 tab/windowed 渲染/脱敏）+ headless Edge 真实浏览器面板验证
+- Added 6 unit tests in `src/semaphore.rs` (bucket independence/timeout/RAII no-leak/subscriber detection)
+- Added 6 unit tests in `src/redact.rs` (cookie/Bearer/sk- redaction, normal text unaffected)
+- Added `tests/router_test.rs` with **10 router-level integration tests** (mock TCP upstream): chat non-streaming/streaming, messages non-streaming, queueing 503, 401, cross-site 403, healthz, bridging trigger, 5xx retries exhausted, 401 credential invalidation
+- Added more api unit tests (cookie-detection tightening regression, Claude tool round-trip semantics), web_threads unit tests (TTL/capacity)
+- **Test scale: 238 unit tests + 8 integration + 10 router-level integration, all green**; `cargo clippy -- -D warnings` zero warnings
+- Added `tests/e2e_phase_v0_8.cjs` (26-assertion smoke test against a real gateway: security headers/CSP/config read-write/new tab/windowed rendering/redaction) + real-browser panel verification with headless Edge
 
-### 修复
+### Fixed
 
-- `desktop/main.js` 托盘「系统体检」跳转失效（`loadURL('#doctor')` 不触发 hash 路由 → 改 `executeJavaScript` 设 hash）
-- README 版本失真（`Setup 0.3.0` → 当前版本；信号量表述与实现对齐）
+- `desktop/main.js` tray "System check" navigation was broken (`loadURL('#doctor')` doesn't trigger hash routing → switched to `executeJavaScript` to set the hash)
+- README version was stale (`Setup 0.3.0` → current version; semaphore description aligned with the implementation)
 
 ## [0.7.3] - 2026-09-11
 
-### 修复
+### Fixed
 
-- **web 流不再被 300s 总超时截断**（`ERR_INCOMPLETE_CHUNKED_ENCODING`）：`WebClient` 由 reqwest `.timeout(300s)`（总请求超时，流式增量还在吐也会被整点掐断）改为 `read_timeout(300s)`（单次读块超时，与上游客户端同款）——只要增量还在就一直收，仅完全静默 5 分钟才断。
-- **桥接 token 记账不再永远为 0**：上游 web 协议 SSE 不返回 usage（done 事件为空），改为按内容长度估算输入/输出 token（输入=发出内容，输出=转换后 chunk 正文+推理；每 2 字符≈1 token，偏保守不虚报）。面板用量、趋势、请求详情恢复正常展示。
+- **Web streams no longer truncated by the 300s total timeout** (`ERR_INCOMPLETE_CHUNKED_ENCODING`): `WebClient` changed from reqwest's `.timeout(300s)` (total request timeout, which cuts off a stream even while it's still emitting increments) to `read_timeout(300s)` (per-read-chunk timeout, matching the upstream client). As long as increments keep arriving the connection stays open; it's only closed after 5 minutes of complete silence.
+- **Bridged token accounting no longer always shows 0**: the upstream web protocol's SSE doesn't return usage (the done event is empty), so token counts are now estimated from content length (input = content sent, output = the converted chunk body + reasoning; roughly 1 token per 2 characters, deliberately conservative rather than overreporting). Panel usage, trends, and request detail display correctly again.
 
-### 变更
+### Changed
 
-- **记忆层独立总开关（默认关闭）**：
-  - `config.rs` 默认 `memory_enabled: false`（用户批注：记忆不是每个人都需要的）
-  - 新增 `POST /api/memory/toggle`：热切换关/开，关闭后既不自动记录也不注入 system；写回 config.json 立即生效，无需重启
-  - `GET /api/memory` 回传 `enabled` 状态；面板「记忆」页顶部新增 switch 开关
-  - 新增 `MEMORY_ENABLED` 环境变量覆盖
+- **Memory layer gets its own independent master switch (off by default)**:
+  - `config.rs` now defaults `memory_enabled: false` (per user note: not everyone needs memory)
+  - Added `POST /api/memory/toggle`: hot-toggle on/off; when off, nothing is recorded or injected into the system prompt; writes back to config.json and takes effect immediately, no restart needed
+  - `GET /api/memory` now returns an `enabled` status; panel's "Memory" page gets a switch at the top
+  - Added a `MEMORY_ENABLED` environment variable override
 
 ## [0.7.0] - 2026-09-11
 
-### 新增
+### Added
 
-- **内嵌浏览器一键登录（方案 A · 零安装零复制）**：浏览器版用户不再必须装扩展——
-  - 面板「一键登录」→ `POST /api/login/embed` → 网关派生 `--login-window` 子进程（tao 窗口 + wry WebView2，独立进程不阻塞网关 tokio 运行时）
-  - 窗口里正常完成 GitHub 登录 → 子进程通过 WebView2 CookieManager 抓取**全部 Cookie（含 HttpOnly 的 session-token，OS 级组件不受网页 JS 限制）** → 自动 POST `/api/tokens/import` 入库 → 窗口自关
-  - 多端口探测（面板端口 > 47821/47822/8787，连接失败换端口、明确拒绝即停）；600ms 轮询登录态 + 10 分钟超时；结果通过进程退出码协议汇报（0 成功 / 1 失败）
-  - WebView2 不可用时明确报错并引导降级（扩展 / 剪贴板 / 手动）
-- **面板登录向导重组**（四条路径按体验排序）：
-  - **方案 A · 内嵌窗口**（最推荐 · 零安装零复制）
-  - **方案 B · 剪贴板自动检测**（推荐 · 无需安装 · 约 30 秒）：复制 Cookie 回来点一下按钮，自动填框导入并**即贴即验**（自动检查新凭证有效性、显示账号名/邮箱；空剪贴板/权限拒绝/无 clipboard API 三种降级均引导手动粘贴）
-  - **方案 C · Chrome/Edge 扩展**（全自动 · 装一次以后都不用管 · 首次约 2 分钟）
-  - 手动粘贴兜底（Cookie 串 / cURL / HAR，约 1 分钟）
-  - 向导降级高亮描边动画；HttpOnly 原理说明随方案引用同步更新
+- **Embedded-browser one-click login (Plan A — zero install, zero copy-paste)**: browser users no longer have to install the extension —
+  - Panel "one-click login" → `POST /api/login/embed` → the gateway spawns a `--login-window` child process (tao window + wry WebView2, a separate process that doesn't block the gateway's tokio runtime)
+  - Complete the GitHub login normally in the window → the child process reads **all cookies (including the HttpOnly session-token, an OS-level component not subject to page JS restrictions)** via the WebView2 CookieManager → auto POSTs to `/api/tokens/import` → the window closes itself
+  - Multi-port probing (panel port > 47821/47822/8787, tries the next port on connection failure, stops on explicit rejection); polls login state every 600ms with a 10-minute timeout; result reported via the process exit-code protocol (0 success / 1 failure)
+  - Clear error and fallback guidance (extension / clipboard / manual) when WebView2 is unavailable
+- **Panel login wizard reorganized** (four paths ordered by experience):
+  - **Plan A — embedded window** (most recommended, zero install zero copy-paste)
+  - **Plan B — clipboard auto-detect** (recommended, no install needed, about 30 seconds): copy the cookie, click the button, it auto-fills and imports, **validating immediately on paste** (automatically checks the new credential's validity, shows account name/email; falls back to guided manual paste for empty clipboard / permission denied / no clipboard API)
+  - **Plan C — Chrome/Edge extension** (fully automatic, install once and forget it, about 2 minutes the first time)
+  - Manual paste fallback (cookie string / cURL / HAR, about 1 minute)
+  - Animated outline highlight for wizard fallbacks; the HttpOnly explanation is kept in sync with the referenced plan
 
-### Phase I 存档（随 v0.6.0 已交付）
+### Phase I archive (shipped with v0.6.0)
 
-- 全功能真实 E2E 矩阵 `tests/e2e_phase_i.cjs`（18 断言：保活/模型列表/工具调用/多轮记忆/长 agent/Anthropic 流式）
+- Full-feature real E2E matrix `tests/e2e_phase_i.cjs` (18 assertions: keepalive/model list/tool calls/multi-turn memory/long agent/Anthropic streaming)
 
 ## [0.6.0] - 2026-09-11
 
-### 收尾（Phase G 审查遗留项全清）
+### Wrap-up (all Phase G review findings cleared)
 
-- **`/v1/models` 鉴权补齐**：配置 `api_keys` 时模型清单不再对未授权方公开（未配置时保持本机直连语义）。实测：无 Key 401 / 对 Key 200 / 错 Key 401 / 清除后恢复直连。
-- **config.json 原子写**：面板生成/清除 API Key 的写回改为临时文件 + rename，写入中途崩溃不再损坏配置。
-- **密码学随机 API Key**：一键生成从 UUIDv4（122 位、格式可识别）升级为 OsRng 全熵随机（`sk-fb-` + 32 字符 base64url 字符集，192 位有效熵）。
-- **桥接错误判定去误报**：web 桥接流的成功判定不再因响应正文出现 "Unauthorized" 字样而误标失败（旧逻辑会把模型正文提及该词的成功请求误记 502）；错误分类函数 `detect_bridge_error` 按既有错误规则表实现（当前转换管线中上游 error envelope 不进入判定文本，检测点前移列入后续项）。
-- **E2E 基础设施**：`tests/e2e_phase_g.cjs` 增加 finally 强制恢复（脚本崩溃也不残留测试 Key）；新增 `tests/e2e_phase_i.cjs` 全功能真实 E2E 矩阵（token 保活 / 模型列表 / 工具调用 / 多轮上下文记忆 / 长 agent / Anthropic 流式，18 断言）。
+- **`/v1/models` auth completed**: when `api_keys` is configured, the model list is no longer exposed to unauthorized callers (unchanged direct-access semantics when unconfigured). Verified: no key → 401 / correct key → 200 / wrong key → 401 / cleared → direct access restored.
+- **Atomic config.json writes**: the panel's generate/clear API key writes now use temp-file + rename, so a crash mid-write no longer corrupts the config.
+- **Cryptographically random API keys**: one-click generation upgraded from UUIDv4 (122 bits, recognizable format) to OsRng full-entropy randomness (`sk-fb-` + 32 base64url characters, 192 bits of effective entropy).
+- **Fixed a false-positive in bridging error detection**: the web-bridging stream's success check no longer misfires just because the response body happens to contain the word "Unauthorized" (the old logic would mark a successful request as a 502 if the model's own reply text mentioned that word); the error-classification function `detect_bridge_error` now follows the existing error-rule table (the upstream error envelope currently doesn't reach the classified text in the conversion pipeline — moving the detection point earlier is tracked as a follow-up).
+- **E2E infrastructure**: `tests/e2e_phase_g.cjs` now force-restores state in a finally block (no leftover test key even if the script crashes); added `tests/e2e_phase_i.cjs`, a full-feature real E2E matrix (token keepalive / model list / tool calls / multi-turn context memory / long agent / Anthropic streaming, 18 assertions).
 
-### Phase G（v0.5.0）——见 [0.5.0] 段；其全部审查发现（含 4 个 P1、4 个 P2、3 个 LOW）已在此前提交修复并实测。
+### Phase G (v0.5.0) — see the [0.5.0] section; all of its review findings (including 4 P1, 4 P2, 3 LOW) were fixed and verified in earlier commits.
 
 ## [0.5.0] - 2026-09-11
 
-### 新增
+### Added
 
-- **Web-Cookie 桥接（关键链路补全）**：只导入 web Cookie（一键登录路径）、账号池为空时，`/v1/chat/completions` 与 `/v1/messages` **自动桥接到上游 web 协议**，浏览器用户"照指南填 /v1"即可直接对话（此前会报 `no healthy upstream auth token available`）。
-  - **上游会话复用**：续聊轮次只发最后一条用户消息并复用同一 thread（`data/web_threads.json` 绑定），避免每请求新开 thread 烧光每日会话准入（免费 6 次/天）——这是"用一会儿就 429"的直接原因
-  - Anthropic 流式实时转换为标准事件流（message_start → content_block_delta → message_stop）；非流式做完整消息转换
-  - 绑定的 thread 被上游清理时自动重置，客户端重试即恢复
-  - 全链路遥测（路由原因标注 continue/new thread、usage、threadId 进自动清理清单）
+- **Web-cookie bridging (closing a critical gap)**: when only web cookies (from the one-click login path) are imported and the account pool is empty, `/v1/chat/completions` and `/v1/messages` **automatically bridge to the upstream web protocol**, so browser users can chat directly just by pointing at `/v1` per the guide (previously this returned `no healthy upstream auth token available`).
+  - **Upstream session reuse**: follow-up turns send only the latest user message and reuse the same thread (bound via `data/web_threads.json`), avoiding burning through the daily session quota (free tier: 6 sessions/day) by opening a new thread on every request — this was the direct cause of "starts 429'ing after a little use"
+  - Anthropic streaming is converted in real time into the standard event stream (message_start → content_block_delta → message_stop); non-streaming gets a full message conversion
+  - A bound thread is reset automatically if upstream clears it; the client's retry recovers transparently
+  - Full-path telemetry (route reason tagged continue/new thread, usage, threadId added to the auto-cleanup list)
 
-- **浏览器一键登录扩展**（`browser-extension/`，Chrome/Edge MV3）：读取 freebuff.com 登录凭证（含 **HttpOnly** Cookie，网页 JS 无法读取）并发送到本机网关；含选项页（自定义端口 / 可选 API Key）与安全说明（仅读取 freebuff.com、仅发送本机）。
-- **浏览器「真·一键登录」闭环**（面板 ↔ 扩展直连）：
-  - 扩展通过 `externally_connectable` + content script 广播自身 id，面板拿到 id 后即可直接指挥扩展
-  - 面板点「一键登录」→ 扩展**自动打开 freebuff.com** → 轮询等待登录（最长 3 分钟）→ 登录成功**自动把凭证写回网关** → 面板轮询到新凭证自动刷新账号信息
-  - 未安装扩展时自动降级为 3 步手动向导（三条路径都在 UI 中说明）；扩展与面板的请求会带上网关 API Key（面板透传），`Origin: chrome-extension://` 已纳入 CSRF 白名单
-- **扩展一键分发**：`GET /api/extension/bundle` 把扩展（编译期内嵌，单文件分发同样可用）打包为 zip 下载，面板「⬇ 下载扩展」直接可用。
-- **凭证管理增强**：
-  - 每条凭证稳定 `id`（FNV-1a 64，跨版本可重现）
-  - 凭证列表直接显示**账号昵称 / 邮箱 / 类型 / 套餐 / 今日剩余积分 / 入库时间**，并可展开详情（逐模型额度、连续天数、近 7 天 token、地区限制、错误原因）
-  - **旧数据入库时间回填**：早于该字段引入的凭证用 `tokens.json` 的 mtime 回填并落盘，不再显示"—"
-  - `POST /api/tokens/check` 单条凭证检查；`POST /api/tokens/delete` 删除凭证（同时移出运行中的账号池）
-  - 同值自动去重（重复导入明确提示）
-- **账号使用记录**（用户批注："每个账号当然你也要有记录查询"）：每次检查/刷新写入一条 JSONL 快照，`GET /api/account/history?cred_id=&limit=` 按账号查询，面板「使用记录」页可视化（套餐/剩余/已用/token/连续天数/成败）。
-- **「立刻开始请求」接入卡 + 运行时 API Key 管理**：总览页首屏直接给出 Base URL、OpenAI/Anthropic 两个地址与 API Key，全部可一键复制；`GET /api/guide` 提供真实监听地址、Key 状态与模型数；面板可**一键生成/清除 API Key**，**热生效无需重启**（同时写回 `config.json`，非本机监听时禁止清空）。
-- **协议指纹补全**：按账号派生 `x-freebuff-instance-id`（上游网页版每个请求都带，此前网关完全不发，是最容易被风控识别的差异之一）；gravity `client_context` 的 screen/viewport/DPR/内存/核数也改为按账号派生，不再所有账号共用同一套环境。
-- **上游会话自动清理**（用户批注："我们要做到自动清理，防止反代给上游制造压力"）：每小时自动清理超过 24 小时的旧会话（`thread_cleanup_interval_sec` / `thread_max_age_hours` 可调，间隔 0 关闭）；手动端点 `POST /api/threads/cleanup` 保留预演模式；「原理」页新增说明。
-- **账号全貌面板**（「账号」页，全中文呈现）：
-  - 身份：昵称 / 邮箱 / 头像 / 用户 ID / 凭证有效期
-  - 使用统计：连续使用天数（streak）/ 累计活跃天数 / 近 7 天消息数与 token 消耗（输入/输出/缓存/合计）/ 各模型会话数
-  - 今日额度：账号层级 / 订阅套餐 / 积分剩余与上限 / 重置时间（太平洋时间午夜，隔天自动刷新）/ **逐模型今日剩余次数、限额、已用、积分价、下次重置**
-- **凭证保活检查**（`POST /api/account/refresh`）：调上游 convex-token 验证 Cookie 是否仍有效，失效时给出重新登录提示。
-- **账号全貌 API**（`GET /api/account/overview`）：并发聚合上游 4 个端点（auth/session、usage-summary、subscriptions、freebuff-session），任一失败降级不整体失败。
-- **接入指南强化**：三步走总览、API Key 说明（含实际是否启用校验）、Node.js SDK 与 curl 示例，全部用真实地址与真实 Key 填充。
+- **Browser one-click-login extension** (`browser-extension/`, Chrome/Edge MV3): reads freebuff.com login credentials (including **HttpOnly** cookies, unreadable by page JS) and sends them to the local gateway; includes an options page (custom port / optional API key) and security notes (only reads freebuff.com, only sends to localhost).
+- **Browser "true one-click login" loop** (panel ↔ extension direct connection):
+  - The extension broadcasts its own id via `externally_connectable` + a content script; once the panel has the id it can command the extension directly
+  - Panel "one-click login" click → extension **auto-opens freebuff.com** → polls for login (up to 3 minutes) → on success **auto-writes the credential back to the gateway** → panel polling picks up the new credential and refreshes account info automatically
+  - Falls back to a 3-step manual wizard automatically if the extension isn't installed (all three paths are documented in the UI); requests between the extension and panel carry the gateway API key (relayed by the panel); `Origin: chrome-extension://` is now on the CSRF allowlist
+- **One-click extension distribution**: `GET /api/extension/bundle` packages the extension (embedded at compile time, also usable as a single-file distribution) into a downloadable zip; panel's "⬇ Download extension" works out of the box.
+- **Credential management improvements**:
+  - Each credential gets a stable `id` (FNV-1a 64, reproducible across versions)
+  - The credential list now shows **account nickname / email / type / plan / today's remaining credits / import time** directly, and can expand for detail (per-model quota, streak days, last-7-days tokens, regional restrictions, error reason)
+  - **Backfilled import time for old data**: credentials imported before this field existed are backfilled from `tokens.json`'s mtime and persisted, no longer showing "—"
+  - `POST /api/tokens/check` checks a single credential; `POST /api/tokens/delete` deletes a credential (also removing it from the running account pool)
+  - Duplicate values are auto-deduplicated (re-importing the same one gives a clear notice)
+- **Per-account usage history** (per user note: "of course you also need a usage log for each account"): every check/refresh writes a JSONL snapshot; `GET /api/account/history?cred_id=&limit=` queries by account; the panel's "Usage history" page visualizes it (plan/remaining/used/tokens/streak days/success-failure).
+- **"Start requesting right now" onboarding card + runtime API key management**: the overview page's first screen shows the Base URL, the OpenAI/Anthropic endpoints, and the API key directly, all one-click copyable; `GET /api/guide` returns the real listen address, key status, and model count; the panel can **generate/clear the API key with one click**, taking effect **immediately with no restart** (also written back to `config.json`; clearing is blocked when not listening locally).
+- **Protocol-fingerprint completeness**: derive `x-freebuff-instance-id` per account (the upstream web client sends this on every request; the gateway previously never sent it at all — one of the easiest tells for risk control); gravity's `client_context` screen/viewport/DPR/memory/core-count are now also derived per account instead of every account sharing the same fake environment.
+- **Automatic upstream session cleanup** (per user note: "we need automatic cleanup, so as not to put pressure on upstream through the proxy"): sessions older than 24 hours are cleaned up automatically every hour (`thread_cleanup_interval_sec` / `thread_max_age_hours` configurable, interval 0 disables it); the manual endpoint `POST /api/threads/cleanup` still supports dry-run mode; the "How it works" page documents this.
+- **Full account overview panel** ("Account" page, rendered entirely in Chinese):
+  - Identity: nickname / email / avatar / user ID / credential expiry
+  - Usage stats: consecutive-use streak / total active days / last-7-days message count and token consumption (input/output/cached/total) / per-model session counts
+  - Today's quota: account tier / subscription plan / remaining and max credits / reset time (midnight Pacific time, refreshes automatically the next day) / **per-model remaining count today, limit, used, credit price, next reset**
+- **Credential keepalive check** (`POST /api/account/refresh`): calls the upstream convex-token endpoint to verify the cookie is still valid, prompting re-login if it isn't.
+- **Full account overview API** (`GET /api/account/overview`): concurrently aggregates 4 upstream endpoints (auth/session, usage-summary, subscriptions, freebuff-session); a single failure degrades gracefully instead of failing the whole call.
+- **Stronger onboarding guide**: a three-step overview, API key explanation (including whether validation is actually enabled), Node.js SDK and curl examples, all filled in with real addresses and a real key.
 
-### 修复（浏览器一键登录 / 凭证判定）
+### Fixed (browser one-click login / credential detection)
 
-- **web-cookie 凭证不再污染账号池**：导入的 session-token 此前会被塞进桌面版 Bearer 账号池，/v1 请求被路由到必然失败的桌面协议（熔断后报"no healthy token"），还会阻止 web 桥接触发——现在 web Cookie 只由桥接路径使用，导入后 /v1 立即可用。
-- **数据面 CSRF 防线补齐**：`/v1/chat/completions`、`/v1/messages`、`/v1/uploads` 此前不校验 Origin，恶意网页可用 `text/plain` 简单请求盲打（借用户 Cookie 消耗上游额度/触发风控）——现已与 `handle_web_chat` 一致拦截跨站 Origin（SDK/curl 不带 Origin 不受影响）。
-- **tokens.json 并发安全**：导入/删除/回填改为进程内互斥 + 临时文件原子替换——并发导入不再互相覆盖丢凭证（实测 7 路并发零丢失），写入中途崩溃不再损坏全部凭证。
-- **threads.json 并发安全**：会话清理的回写改为锁内重读合并——sweep 跨网络删除期间新产生的 thread 记录不再被旧快照覆盖（该会话此前会永不清理）。
-- **history/绑定文件原子化**：使用记录压缩与追加串行化；web 会话绑定快照在锁内 clone 后原子写盘，消除旧快照覆盖窗口。
-- **loopback 判定精确化**：`localhost.evil.com:47821` 这类前缀伪装地址不再被当作本机（改为 host 精确匹配 + IP 解析判定）。
-- **E2E 配置隔离**：`tests/e2e_phase_g.config.json` 加入 .gitignore（测试生成的 Key 永不进 git）。
-- **无效凭证被误判为「有效」**：上游 `/api/auth/session` 对未登录/失效凭证返回的是 **HTTP 200 + `{}`**（不是 401），此前只判断"请求是否成功"，导致任何伪造 Cookie 都显示"凭证有效"（实测确认）。改为必须检查响应里真的有 user 主体（id/email/name），额度端点作为辅助信号。
-- **`/healthz` 信息泄露**：配置 `api_keys` 后，未授权请求不再返回账号名与模型构成，只回存活时长与版本。
-- **扩展请求被 CSRF 防护拒绝**：`Origin: chrome-extension://` 此前不在白名单，扩展导入会被拒——现已放行（配置了 api_keys 时扩展仍需携带 Key）。
-- **短凭证脱敏泄漏**：`mask()` 对 ≤8 字符的凭证会把"末尾 4 位"回显出来（如 `sk-local` → 泄漏 5/8 字符）。改为短串只露 2 位、≤4 字符全遮（借鉴参考项目 freellmapi 的 maskKey 修复记录）。
-- **删除会话端点实证**：`DELETE /api/chat/threads/{id}` 经真实凭证探针确认存在（不存在 thread 返回 JSON 404，未知路由返回 HTML）；移除无效的 `POST /api/chat/threads/delete` 回退（实测 405）。
-- **面板鉴权失败体验**：网关启用 API Key 后首次打开面板不再"红灯 + toast 每 6 秒狂闪"，改为一次性引导横幅并暂停自动刷新，填 Key 后自动恢复；凭证已存在时的一键登录不再空转轮询 3 分钟报"超时"（扩展同步完成路径直接回显结果）。
+- **Web-cookie credentials no longer pollute the account pool**: imported session-tokens used to get stuffed into the desktop Bearer account pool, so /v1 requests would get routed to the desktop protocol where they were bound to fail (reporting "no healthy token" once tripped), and this also blocked bridging from triggering — now web cookies are only used by the bridging path, and /v1 works immediately after import.
+- **Data-plane CSRF gap closed**: `/v1/chat/completions`, `/v1/messages`, `/v1/uploads` previously didn't check Origin, so a malicious page could blind-fire simple `text/plain` requests (burning the user's upstream quota / triggering risk control using their cookie) — these now block cross-site Origin the same way `handle_web_chat` already did (SDK/curl calls without an Origin header are unaffected).
+- **tokens.json concurrency safety**: import/delete/backfill now use an in-process mutex + atomic temp-file replace — concurrent imports no longer overwrite each other and lose credentials (tested with 7-way concurrency, zero loss); a crash mid-write no longer corrupts all credentials.
+- **threads.json concurrency safety**: session-cleanup writeback now re-reads and merges inside the lock — thread records created during a cross-network sweep-and-delete are no longer overwritten by the stale snapshot (previously that session would never get cleaned up again).
+- **history/binding file atomicity**: usage-history compaction and appending are now serialized; the web session-binding snapshot is cloned inside the lock before an atomic write, closing the stale-snapshot-overwrite window.
+- **Loopback detection tightened**: prefix-spoofed addresses like `localhost.evil.com:47821` are no longer treated as local (now uses exact host matching + IP resolution).
+- **E2E config isolation**: `tests/e2e_phase_g.config.json` added to .gitignore (test-generated keys never enter git).
+- **Invalid credentials were misjudged as "valid"**: upstream `/api/auth/session` returns **HTTP 200 + `{}`** for an unauthenticated/invalid credential (not 401) — previously only "did the request succeed" was checked, so any forged cookie showed as "credential valid" (confirmed by testing). Now it requires an actual user subject in the response (id/email/name), with the quota endpoint used only as a secondary signal.
+- **`/healthz` information disclosure**: once `api_keys` is configured, unauthorized requests no longer return account names and model composition, only uptime and version.
+- **Extension requests rejected by CSRF protection**: `Origin: chrome-extension://` wasn't previously on the allowlist, so extension imports were rejected — now allowed (the extension still needs to send the key if api_keys is configured).
+- **Short-credential redaction leak**: `mask()` used to reveal the "last 4 characters" for credentials <=8 characters long (e.g. `sk-local` → leaking 5 of 8 characters). Changed so short strings only reveal 2 characters, and anything <=4 characters is fully masked (borrowing the maskKey fix noted in the reference project freellmapi).
+- **Delete-thread endpoint verified**: `DELETE /api/chat/threads/{id}` confirmed to exist via a real-credential probe (a nonexistent thread returns JSON 404, an unknown route returns HTML); removed the ineffective `POST /api/chat/threads/delete` fallback (tested, returns 405).
+- **Panel auth-failure experience**: after enabling an API key, first opening the panel no longer shows a "red light + toast flashing every 6 seconds" — instead a one-time guidance banner appears and auto-refresh pauses, resuming once the key is entered; one-click login no longer spins for 3 minutes reporting "timeout" when a credential already exists (the extension's already-synced path echoes the result immediately).
 
-### 修复（web 协议对齐上游抓包）
+### Fixed (web protocol alignment with upstream captures)
 
-- **`agent_delta` 正文不再丢弃**：上游工具（web_search/read_url）产出的研究结果正文在 agent_delta 事件中，此前被静默丢弃导致用户只看到工具调用不见结果。
-- **并行工具调用 `index` 递增**：此前恒为 0，并行 5 个工具时客户端互相覆盖。
-- **流结束发送 `finish_reason` chunk**（stop / tool_calls），严格客户端不再判为异常结束。
-- **threadId 透出**（meta/title 事件）：多轮续聊可用（`WebClient::last_thread_id()`）。
-- **title 二次更新采用后到覆盖**（保留模型生成的摘要而非用户原文）。
-- **上传支持任意文件类型**：此前 mime 白名单只放行 image/pdf，文档上传被改写为 image/png，上游返回不了 `kind:"document"`——文档链路名存实亡。
-- **上传响应透出完整字段**：`kind`（image/document）/ `url`（图片）/ `chars`、`truncated`（文档）/ `descriptionStorageId`，并附用途说明。
-- **`attachments` 解析**：`/v1/web/chat` 支持文档附件引用（此前恒为空数组）。
+- **`agent_delta` body no longer dropped**: upstream tool (web_search/read_url) research results arrive in the agent_delta event body, which was previously silently discarded, so users only saw the tool call and not its result.
+- **Parallel tool-call `index` now increments**: it was previously always 0, so 5 parallel tool calls would overwrite each other on the client.
+- **A `finish_reason` chunk is now sent at stream end** (stop / tool_calls), so strict clients no longer treat it as an abnormal end.
+- **threadId now surfaced** (meta/title events): enables multi-turn follow-up (`WebClient::last_thread_id()`).
+- **Second title update now wins on arrival** (keeps the model-generated summary rather than the user's original text).
+- **Uploads now support arbitrary file types**: the mime allowlist previously only permitted image/pdf, so document uploads got rewritten to image/png and upstream couldn't return `kind:"document"` — the document path was effectively dead.
+- **Upload response now surfaces full fields**: `kind` (image/document) / `url` (image) / `chars`, `truncated` (document) / `descriptionStorageId`, with usage notes attached.
+- **`attachments` parsing**: `/v1/web/chat` now supports document attachment references (previously always an empty array).
 
 ## [0.4.0] - 2026-09-11
 
-### 新增
+### Added
 
-- **记忆层（AI 更懂用户）**：`data/memory.sqlite` 独立库；**零 LLM 规则 observe**（自动记录常用模型偏好、推理档位降级、用户纠正信号"记住…/别再…/always/never"）；trigram FTS5 中文检索；有界注入（512 token 预算、低权威标记、marker 转义、按 id 排序保字节稳定）；面板「记忆」页可查看/新增/删除/置为稳定事实。
-- **熔断三态**：账号池从"裸冷却时间戳"升级为 Closed/Open/HalfOpen 熔断器（连续失败 4 次断开，冷却随次数指数增长封顶 10 分钟，半开探测连续成功 2 次恢复）；`mark_success`/`mark_failure` 全程接线。
-- **请求级重试循环**：上游失败自动换号重试（最多 3 次，含 429/5xx/网络错误；401/403 冷却该账号后换号）；严格 committed 边界——只在尚未向客户端写出任何字节前重试。
-- **错误规则表**：文本优先 + 状态码兜底的上游错误分类（waiting_room/rate_limit/model_unavailable/auth_expired 等 8 类），带可重试判定与 Retry-After 提示。
-- **MCP 最小暴露**：`POST /mcp`（JSON-RPC 2.0，手写零新依赖）提供 3 个只读工具：`list_models` / `list_accounts` / `usage_summary`，供外部 agent（Claude Code/Cursor）直接查询网关状态。
-- **成本/速率可视化**：`GET /api/usage/cost`（30 分钟滑窗请求数/错误率/平均延迟/速率）；面板总览页显示速率行（诚实标注"免费层无货币成本"）。
-- **教学页（原理速览）**：面板新增「原理」Tab，6 节讲清网关工作原理（请求链路/多账号轮询/注入机制/黑匣子/广告保活/数据位置）。
-- **配置正式生效**：此前解析但零消费的 `fallback_models`（降级链）、`token_saver`（tool_result 压缩）已接线；新增 `memory_path` 配置。
+- **Memory layer (the AI understands you better)**: `data/memory.sqlite` is an independent store; **zero-LLM rule-based observe** (automatically records frequently used model preferences, reasoning-effort downgrades, user correction signals like "remember...", "stop doing...", "always/never") plus manual entries; trigram FTS5 search for Chinese text; bounded injection (512-token budget, low-authority tagging, marker escaping, sorted by id for byte-stable output); panel's "Memory" page can view/add/delete/pin-as-stable-fact.
+- **Three-state circuit breaker**: the account pool upgraded from a bare cooldown timestamp to a Closed/Open/HalfOpen circuit breaker (opens after 4 consecutive failures, cooldown grows exponentially capped at 10 minutes, half-open recovers after 2 consecutive successful probes); `mark_success`/`mark_failure` wired throughout.
+- **Request-level retry loop**: automatically switches accounts and retries on upstream failure (up to 3 attempts, covering 429/5xx/network errors; 401/403 cools down that account then switches); strict committed-boundary semantics — only retries before any bytes have been written to the client.
+- **Error-rule table**: text-first with status-code fallback for classifying upstream errors (8 categories including waiting_room/rate_limit/model_unavailable/auth_expired), with a retryable flag and Retry-After hints.
+- **Minimal MCP exposure**: `POST /mcp` (JSON-RPC 2.0, hand-written, zero new dependencies) exposes 3 read-only tools: `list_models` / `list_accounts` / `usage_summary`, so external agents (Claude Code/Cursor) can query gateway state directly.
+- **Cost/rate visualization**: `GET /api/usage/cost` (30-minute sliding-window request count/error rate/average latency/rate); panel overview page shows a rate row (honestly noting "the free tier has no monetary cost").
+- **Explainer page (how it works)**: panel adds a "How it works" tab, 6 sections explaining the gateway's mechanics (request path/multi-account rotation/injection mechanism/black box/ad-based keepalive/where data lives).
+- **Config options wired up for real**: `fallback_models` (downgrade chain) and `token_saver` (tool_result compression), previously parsed but never consumed, are now wired in; added a `memory_path` config option.
 
-### 修复
+### Fixed
 
-- **`compress_tool_result` 多字节 panic**：按字符边界切分（中文 tool_result 不再 panic；与 v0.3.0 修复的 tail 截断同类问题）。
-- **skills 库路径**：避开 `with_extension` 截断（目录名含 `.` 时路径错误）。
-- **`/v1/uploads` 错误体截断**：上游错误消息限 300 字符（防回显账号/内部细节）。
+- **`compress_tool_result` multi-byte panic**: now splits on character boundaries (no longer panics on Chinese tool_result text; the same class of issue as the tail-truncation fix in v0.3.0).
+- **Skills library path**: avoids `with_extension` truncation (wrong path when the directory name contains a `.`).
+- **`/v1/uploads` error body truncation**: upstream error messages capped at 300 characters (prevents leaking account/internal detail via echo).
 
-### 工程
+### Engineering
 
-- 新增模块：`memory.rs`（记忆层）、`mcp.rs`（MCP 只读服务）、`errors.rs`（错误规则表）、`pool.rs` 熔断器。
-- 测试：108 → **130+ 单元测试**（新增熔断器 4 / 记忆 9 / MCP 10 / 错误表 12 / 压缩多字节回归 1），clippy 零警告。
+- New modules: `memory.rs` (memory layer), `mcp.rs` (read-only MCP service), `errors.rs` (error-rule table), `pool.rs` circuit breaker.
+- Tests: 108 → **130+ unit tests** (added circuit breaker 4 / memory 9 / MCP 10 / error table 12 / multi-byte compression regression 1), clippy zero warnings.
 
 ## [0.3.0] - 2026-09-11
 
-### 新增
+### Added
 
-- **技能系统（持久化）**：面板「技能」页可新建/编辑/启停/删除技能；文件（`data/skills/<id>/SKILL.md`）为真相源 + SQLite 索引；**roster 模式**按需注入（只注入名称与描述，预算 2000 token，可配置）；内置质量门（注入短语、超长、格式检查）；重启持久化。
-- **黑匣子日志（可观测）**：
-  - `GET /api/logs/stream`（SSE 实时日志）+ `GET /api/logs/recent`（历史回放），面板「实时日志」页；
-  - 请求详情抽屉：`GET /api/usage/requests/{id}` 返回路由/账号/延迟/首字节/tokens/错误 + 人话解释（如"上游免费队列排队中，不是网关故障"）；
-  - `GET /api/doctor` 系统体检（四态：ok / fault / unknown / fact），面板「系统体检」页。
-- **真实用量统计**：流式/非流式 token 真实采集（此前恒为 0）；Claude 路径 `/v1/messages` 用量记录（此前完全缺失）；上游错误分类落库（`error_kind`）。
-- **Claude 流式协议转换**：`/v1/messages` 流式请求不再透传 OpenAI SSE，按 canonical event 转换为 Anthropic 事件流（`message_start` / `content_block_start|delta|stop` / `message_delta` / `message_stop`），工具调用块完整支持。
-- **多模态上传**：`POST /v1/uploads`（裸 body + `x-file-name` 头换取 storageId）；`/v1/web/chat` 支持 `images` 参数（storageId 数组或对象数组）。
-- **面板重写**：Tab 导航（总览 / 账号 / 技能 / 实时日志 / 系统体检 / 接入指南）；账号页支持粘贴 Cookie/cURL/HAR 导入（此前无导入入口）；接入指南内置 Claude Code / Cursor / OpenAI SDK / LobeChat 配置片段一键复制。
-- **配置项**：`telemetry_path`、`skills_dir`、`skills_inject_mode`、`max_roster_tokens`（均有默认值，旧配置兼容）。
+- **Skills system (persistent)**: panel's "Skills" page can create/edit/enable-disable/delete skills; files (`data/skills/<id>/SKILL.md`) are the source of truth + a SQLite index; **roster mode** injects on demand (only name and description, 2000-token budget, configurable); built-in quality gates (injection phrases, oversized content, format checks); persists across restarts.
+- **Black-box logging (observability)**:
+  - `GET /api/logs/stream` (real-time SSE logs) + `GET /api/logs/recent` (historical replay), panel's "Live logs" page;
+  - Request detail drawer: `GET /api/usage/requests/{id}` returns route/account/latency/first-byte/tokens/error plus a plain-language explanation (e.g. "queued in the upstream free tier, not a gateway fault");
+  - `GET /api/doctor` system check (four states: ok / fault / unknown / fact), panel's "System check" page.
+- **Real usage stats**: streaming/non-streaming token counts now actually collected (previously always 0); Claude path `/v1/messages` usage recording (previously entirely missing); upstream error classification persisted (`error_kind`).
+- **Claude streaming protocol conversion**: `/v1/messages` streaming requests no longer pass through raw OpenAI SSE; converted into the canonical Anthropic event stream (`message_start` / `content_block_start|delta|stop` / `message_delta` / `message_stop`), with full tool-call block support.
+- **Multimodal upload**: `POST /v1/uploads` (raw body + `x-file-name` header, returns a storageId); `/v1/web/chat` supports an `images` parameter (an array of storageIds or objects).
+- **Panel rewrite**: tab navigation (Overview / Accounts / Skills / Live logs / System check / Onboarding guide); accounts page supports pasting Cookie/cURL/HAR to import (previously no import entry point); onboarding guide has one-click-copy config snippets built in for Claude Code / Cursor / OpenAI SDK / LobeChat.
+- **Config options**: `telemetry_path`, `skills_dir`, `skills_inject_mode`, `max_roster_tokens` (all have defaults, backward compatible with old configs).
 
-### 修复
+### Fixed
 
-- **README_zh.md** 从 Go 旧版重写为 Rust 版（端口 47821 / `--config` / cargo 命令 / 客户端接入指南 / FAQ）——此前中文用户第一步即被带错。
-- **面板 4 个旧 bug**：`{model_count}` 占位符字面量；两个按钮 `location.href` 把用户带离面板进 JSON 裸页；每次刷新 DOM 无限堆积；空态渲染出字符串 "undefined"。
-- **桌面端**：启动/登录失败弹窗（此前仅 console.error）；托盘新增「系统体检 / 打开日志 / 打开配置 / 打开数据目录」；网关 stdout/stderr 落盘 `userData/logs/gateway.log`；自动更新闭环（自动下载 + 下载完成提示安装）；非默认端口检测。
-- **启动健壮性**：模型注册表网络同步增加超时保护（connect 5s / total 10s）——此前网络异常时阻塞启动 30 秒以上。
+- **README_zh.md** rewritten from the old Go version to the Rust version (port 47821 / `--config` / cargo commands / client onboarding guide / FAQ) — previously Chinese users were misdirected on their very first step.
+- **4 old panel bugs**: literal `{model_count}` placeholder; two buttons using `location.href` that navigated users away from the panel to a raw JSON page; DOM piling up endlessly on every refresh; empty state rendering the literal string "undefined".
+- **Desktop client**: startup/login failures now show a popup (previously only console.error); tray gains "System check / Open logs / Open config / Open data folder"; gateway stdout/stderr now written to `userData/logs/gateway.log`; auto-update loop closed (auto-download + prompt to install once downloaded); non-default port detection.
+- **Startup robustness**: model-registry network sync now has timeout protection (connect 5s / total 10s) — previously a network hiccup could block startup for 30+ seconds.
 
-### 工程
+### Engineering
 
-- 新增模块：`protocol/`（流式转换）、`skills/`（技能持久化）、`retry.rs`（失败分类/退避/committed 语义）、`logbus.rs`（日志广播+环形缓冲）、`telemetry.rs`（独立写线程遥测库）。
-- 测试：单元测试 24 → **105**，集成测试 8；`cargo clippy --all-targets -- -D warnings` 零警告。
-- 新增 E2E 验收脚本 `tests/e2e_phase_d.cjs`（29 项断言：面板元素 / 技能 CRUD / SSE / 体检 / 鉴权 / 上传错误码 / 模型列表）。
-- 桌面壳新增 `preload.js`（contextBridge 白名单 IPC）。
+- New modules: `protocol/` (streaming conversion), `skills/` (skills persistence), `retry.rs` (failure classification/backoff/committed semantics), `logbus.rs` (log broadcast + ring buffer), `telemetry.rs` (dedicated-writer-thread telemetry store).
+- Tests: unit tests 24 → **105**, integration tests 8; `cargo clippy --all-targets -- -D warnings` zero warnings.
+- Added E2E acceptance script `tests/e2e_phase_d.cjs` (29 assertions: panel elements / skills CRUD / SSE / doctor / auth / upload error codes / model list).
+- Desktop shell adds `preload.js` (contextBridge allowlisted IPC).
 
-### 已知限制（下一批次）
+### Known limitations (next batch)
 
-- 请求级「换号重试」仅落地失败分类 + 冷却接线，完整重试循环待接入。
-- 遥测 events 表目前仅在失败路径写入（成功路径事件链为增强项）。
-- web 协议（`/v1/web/chat`）上游不返回 usage 字段，token 记为 0（延迟/字节/首字节正常记录）。
-- `data/tokens.json` 路径仍为硬编码（其他路径均已可配置）。
+- Request-level "switch account and retry" only has failure classification + cooldown wiring landed; the full retry loop is still pending.
+- The telemetry events table is currently only written on the failure path (success-path event chaining is an enhancement item).
+- The web protocol (`/v1/web/chat`) doesn't return a usage field from upstream, so tokens are recorded as 0 (latency/bytes/first-byte are recorded correctly).
+- `data/tokens.json`'s path is still hardcoded (every other path is already configurable).
 
 ## [0.2.0] - 2026-09-10
 
-- CI 修复（Docker 多架构 / GHCR 命名 / rust 1.95 锁定 / .cargo 代理移出 git）。
-- 安全与工程质量加固：管理端点鉴权、API key 脱敏、跨域 token 导入拒绝、熔断接线、Claude 非流式协议转换。
-- 默认端口 8787 → 47821；面板内置提示词/技能管理；上游错误透传；流式长连接无整体超时。
+- CI fixes (Docker multi-arch / GHCR naming / rust 1.95 pin / .cargo proxy removed from git).
+- Security and engineering hardening: admin endpoint auth, API key redaction, cross-origin token import rejected, circuit breaker wired in, Claude non-streaming protocol conversion.
+- Default port changed 8787 → 47821; panel has built-in prompt/skills management; upstream errors passed through; streaming long connections have no overall timeout.
+</content>

@@ -1,4 +1,4 @@
-//! 模型元数据契约集成测试（v0.9）：元数据表 / efforts 阶梯 / 可用性回落
+//! Model metadata contract integration tests (v0.9): metadata table / effort ladders / availability fallback
 use freebuff2api::models::{ModelRegistry, HARDCODED_MODELS};
 use freebuff2api::router::{ModelRouter, RouterConfig};
 use std::sync::Arc;
@@ -12,14 +12,14 @@ fn meta_snapshot_covers_hardcoded_models() {
     let reg = ModelRegistry::new();
     let snap = reg.meta_snapshot();
     for m in HARDCODED_MODELS {
-        assert!(snap.iter().any(|x| x.id == *m), "缺元数据：{m}");
+        assert!(snap.iter().any(|x| x.id == *m), "missing metadata: {m}");
     }
 }
 
 #[test]
 fn clamp_effort_aligned_with_upstream_ladders() {
     let r = router();
-    // GLM 5.3：当前上游阶梯 low/high/max（GLM_V53_FLASH_REASONING_EFFORTS），max 原样保留
+    // GLM 5.3: current upstream ladder is low/high/max (GLM_V53_FLASH_REASONING_EFFORTS); max is kept as-is
     assert_eq!(
         r.clamp_effort("z-ai/glm-5.3-flash", "max").as_deref(),
         Some("max")
@@ -36,34 +36,34 @@ fn clamp_effort_aligned_with_upstream_ladders() {
         r.clamp_effort("z-ai/glm-5.3-flash", "xhigh").as_deref(),
         Some("max")
     );
-    // deepseek 保持 low/high/max
+    // deepseek keeps low/high/max
     assert_eq!(
         r.clamp_effort("deepseek/deepseek-v4-flash", "high")
             .as_deref(),
         Some("high")
     );
-    // muse 阶梯 minimal..xhigh，max → xhigh
+    // muse ladder is minimal..xhigh, max -> xhigh
     assert_eq!(
         r.clamp_effort("meta/muse-spark-1.2-contributor", "max")
             .as_deref(),
         Some("xhigh")
     );
-    // 无阶梯模型剥离（solar/minimax/kimi/glm-5.2）
+    // Models without a ladder are stripped (solar/minimax/kimi/glm-5.2)
     assert!(r.clamp_effort("upstage/solar-pro4", "max").is_none());
     assert!(r.clamp_effort("minimax/minimax-m3", "high").is_none());
     assert!(r.clamp_effort("crof/kimi-k3-eco", "max").is_none());
     assert!(
         r.clamp_effort("z-ai/glm-5.2", "max").is_none(),
-        "glm-5.2 上游无阶梯（忽略 reasoning_effort）"
+        "glm-5.2 has no upstream ladder (reasoning_effort is ignored)"
     );
 }
 
 #[test]
 fn availability_resolution() {
     let r = router();
-    // 可用模型 → None
+    // Available model -> None
     assert_eq!(r.resolve_available("z-ai/glm-5.3-flash"), None);
-    // 暂停模型 → 回落
+    // Paused model -> falls back
     assert_eq!(
         r.resolve_available("google/gemini-3.8-flash").as_deref(),
         Some("google/gemini-3.1-flash-lite")
@@ -72,11 +72,11 @@ fn availability_resolution() {
         r.resolve_available("deepseek/deepseek-v4-pro").as_deref(),
         Some("z-ai/glm-5.3-flash")
     );
-    // 未知模型 → None（不误伤）
+    // Unknown model -> None (no false positives)
     assert_eq!(r.resolve_available("unknown/x"), None);
-    // 可读原因
+    // Human-readable reason
     let reason = r.unavailable_reason("stealth/ox-alpha").unwrap();
-    assert!(reason.contains("暂停/下架"));
+    assert!(reason.contains("paused/discontinued"));
     assert!(reason.contains("z-ai/glm-5.3-flash"));
     assert!(r.unavailable_reason("z-ai/glm-5.3-flash").is_none());
 }
@@ -88,16 +88,16 @@ fn model_available_defaults_true_for_unknown() {
     assert!(!r.model_available("stealth/ox-alpha"));
     assert!(
         r.model_available("upstream/dynamic-new-model"),
-        "上游动态新增不应被误伤"
+        "a dynamically added upstream model should not be falsely flagged"
     );
 }
 
-// —— v0.10 T1.2：目录/契约对齐 ——
+// —— v0.10 T1.2: catalog/contract alignment ——
 
 #[test]
 fn mimo_in_catalog_and_meta() {
     let reg = ModelRegistry::new();
-    let m = reg.meta_for("mimo/mimo-v2.5").expect("mimo 应有元数据");
+    let m = reg.meta_for("mimo/mimo-v2.5").expect("mimo should have metadata");
     assert!(m.available);
     assert!(!m.premium);
     assert!(m.multimodal);
@@ -109,35 +109,35 @@ fn mimo_in_catalog_and_meta() {
 fn fixture_catalog_rows_covered_by_meta() {
     let fixture: serde_json::Value =
         serde_json::from_str(include_str!("fixtures/freebuff-models.snapshot.json"))
-            .expect("fixture 可解析");
+            .expect("fixture should be parseable");
     let reg = ModelRegistry::new();
-    let models = fixture["models"].as_array().expect("models 数组");
+    let models = fixture["models"].as_array().expect("models array");
     let mut checked = 0usize;
     for row in models {
         if row["catalog"].as_bool().unwrap_or(false) {
             let id = row["id"].as_str().unwrap();
             let meta = reg
                 .meta_for(id)
-                .unwrap_or_else(|| panic!("catalog 行缺 meta: {id}"));
+                .unwrap_or_else(|| panic!("catalog row missing meta: {id}"));
             assert_eq!(
                 meta.availability,
                 row["availability"].as_str().unwrap(),
-                "availability 漂移: {id}"
+                "availability drift: {id}"
             );
             checked += 1;
         }
     }
     assert!(
         checked >= 18,
-        "catalog 行数应 ≥18（含 mimo），实际 {checked}"
+        "catalog row count should be >=18 (including mimo), got {checked}"
     );
 }
 
 #[test]
 fn vendored_snapshot_refresh_keeps_zero_drift() {
     let reg = ModelRegistry::new();
-    let snap = freebuff2api::models::load_local_snapshot().expect("内置快照");
+    let snap = freebuff2api::models::load_local_snapshot().expect("built-in snapshot");
     let (added, updated) = reg.refresh_strategy_from_snapshot(&snap).unwrap();
-    assert_eq!(added, 0, "快照不应新增静态表外 catalog 行");
-    assert_eq!(updated, 0, "快照与静态表应零漂移");
+    assert_eq!(added, 0, "the snapshot should not add catalog rows outside the static table");
+    assert_eq!(updated, 0, "the snapshot and the static table should have zero drift");
 }

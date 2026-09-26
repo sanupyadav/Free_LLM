@@ -1,13 +1,15 @@
-//! Web 协议桥接用的「凭证 → 上游会话」映射。
+//! "Credential -> upstream session" mapping used by the Web protocol bridge.
 //!
-//! 为什么需要它：上游的免费额度是按**会话（thread）**给的吗？不是——是按每个模型的每日
-//! **admission（会话准入）**给（`rateLimitsByModel[m].limit` 默认 6/天，`recentCount` 计已用）。
-//! 在同一个 thread 里连续对话不会消耗新的 admission；**每请求新建 thread 会迅速烧光每日额度**。
+//! Why it's needed: is upstream's free quota given per **session (thread)**? No -- it's given per
+//! **admission (session admission)** per model per day (`rateLimitsByModel[m].limit` defaults to 6/day,
+//! `recentCount` tracks usage). Continuing a conversation in the same thread doesn't consume a new
+//! admission; **creating a new thread per request will burn through the daily quota fast**.
 //!
-//! 因此把 OpenAI/Anthropic 客户端接进来的桥接层必须**尽量复用同一个上游 thread**：
-//! 首轮发完整上下文开新会话，后续轮次只发最新一条用户消息、复用同一个 thread。
+//! So the bridge layer that connects OpenAI/Anthropic clients in must **reuse the same upstream thread
+//! as much as possible**: send the full context to open a new session on the first turn, then send only
+//! the latest user message and reuse the same thread on subsequent turns.
 //!
-//! 落盘：`data/web_threads.json`（`{ "<cred_id>": { "thread_id": "...", "last_user_text": "..." } }`）。
+//! Persisted to: `data/web_threads.json` (`{ "<cred_id>": { "thread_id": "...", "last_user_text": "..." } }`).
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -15,24 +17,24 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-/// 某条凭证当前使用中的上游会话
+/// The upstream session currently in use for a given credential
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ThreadBinding {
     #[serde(default)]
     pub thread_id: String,
-    /// 上一次发出去的用户文本；用于判断客户端的这次请求是"新一轮"还是"重试同一轮"
+    /// The last user text sent out; used to determine whether the client's current request is "a new turn" or "a retry of the same turn"
     #[serde(default)]
     pub last_user_text: String,
     #[serde(default)]
     pub turns: u64,
-    /// 最近一次绑定时间（epoch 秒）。用于 TTL 清理与容量裁剪。
+    /// Timestamp of the most recent binding (epoch seconds). Used for TTL cleanup and capacity trimming.
     #[serde(default)]
     pub last_seen_sec: i64,
 }
 
-/// 绑定表最大条目数（超出后按最旧裁剪）
+/// Max number of entries in the binding table (oldest trimmed first once exceeded)
 pub const MAX_BINDINGS: usize = 2000;
-/// 绑定条目的最大存活时长（秒）；超时即清除（上游 thread 也会被全局清理回收）
+/// Max lifetime of a binding entry (seconds); cleared on expiry (the upstream thread also gets reclaimed by global cleanup)
 pub const BINDING_TTL_SECS: i64 = 24 * 3600;
 
 pub struct WebThreadMap {
@@ -51,7 +53,7 @@ impl WebThreadMap {
             path,
             cache: Mutex::new(cache),
         };
-        // 载入时做一次裁剪（旧数据可能已超限）
+        // Trim once on load (old data may already be over the limit)
         let _ = this.prune(None);
         this
     }
@@ -60,16 +62,17 @@ impl WebThreadMap {
         self.cache.lock().ok().and_then(|c| c.get(cred_id).cloned())
     }
 
-    /// 记下一个会话绑定（首轮拿到 threadId，或后续轮次刷新 last_user_text）
-    /// 记下一个会话绑定（首轮拿到 threadId，或后续轮次刷新 last_user_text）。
-    /// 快照 clone 与更新在**同一临界区**内完成，消除"锁外 clone 旧快照后写盘覆盖新绑定"的窗口。
+    /// Record a session binding (first turn gets a threadId, or subsequent turns refresh last_user_text)
+    /// Record a session binding (first turn gets a threadId, or subsequent turns refresh last_user_text).
+    /// The snapshot clone and the update happen in **the same critical section**, eliminating the window
+    /// where a snapshot cloned outside the lock could overwrite a newer binding on write.
     pub fn bind(&self, cred_id: &str, thread_id: &str, last_user_text: &str) -> Result<()> {
         let json = {
             let mut c = self
                 .cache
                 .lock()
-                .map_err(|_| anyhow::anyhow!("web_threads 锁中毒"))?;
-            // turns 统计的是"文本变化次数-1"（首次 bind 是初始轮，不算续聊）
+                .map_err(|_| anyhow::anyhow!("web_threads lock poisoned"))?;
+            // turns counts "number of text changes - 1" (the first bind is the initial turn, not a continuation)
             let was_new = c.get(cred_id).is_none();
             let e = c.entry(cred_id.to_string()).or_default();
             e.thread_id = thread_id.to_string();
@@ -84,27 +87,27 @@ impl WebThreadMap {
         self.atomic_write(&json)
     }
 
-    /// 会话失效（上游已删/404/错误）时清掉绑定，下次会重新开一个
+    /// Clear the binding when the session is invalid (deleted upstream / 404 / error), so a new one is opened next time
     pub fn clear(&self, cred_id: &str) -> Result<()> {
         let json = {
             let mut c = self
                 .cache
                 .lock()
-                .map_err(|_| anyhow::anyhow!("web_threads 锁中毒"))?;
+                .map_err(|_| anyhow::anyhow!("web_threads lock poisoned"))?;
             c.remove(cred_id);
             serde_json::to_string_pretty(&*c)?
         };
         self.atomic_write(&json)
     }
 
-    /// 触发一次清理：移除 TTL 过期条目 + 按容量裁剪最旧条目（若 len 超过 limit）。
-    /// 返回被清理的凭证 id 数。`limit=None` 时用默认 `MAX_BINDINGS`。
+    /// Trigger a cleanup pass: remove TTL-expired entries + trim the oldest entries by capacity (if len exceeds limit).
+    /// Returns the number of credential ids removed. `limit=None` uses the default `MAX_BINDINGS`.
     pub fn prune(&self, limit: Option<usize>) -> Result<usize> {
         let (json, removed) = {
             let mut c = self
                 .cache
                 .lock()
-                .map_err(|_| anyhow::anyhow!("web_threads 锁中毒"))?;
+                .map_err(|_| anyhow::anyhow!("web_threads lock poisoned"))?;
             let removed = self.prune_locked(&mut c, limit);
             if removed > 0 {
                 (serde_json::to_string_pretty(&*c)?, removed)
@@ -120,16 +123,16 @@ impl WebThreadMap {
         }
     }
 
-    /// 内部裁剪（调用方需已持锁）：按 `limit` 截断 + TTL 过期清除，返回移除条目数
+    /// Internal trim (caller must already hold the lock): truncate by `limit` + remove TTL-expired entries, returns count removed
     fn prune_locked(&self, c: &mut HashMap<String, ThreadBinding>, limit: Option<usize>) -> usize {
         let now = unix_now_sec();
         let limit = limit.unwrap_or(MAX_BINDINGS);
         let mut removed = 0usize;
-        // 1) TTL 过期清除（无论是否超限都执行）
+        // 1) Remove TTL-expired entries (runs regardless of whether the limit is exceeded)
         let before_ttl = c.len();
         c.retain(|_, e| now.saturating_sub(e.last_seen_sec) < BINDING_TTL_SECS);
         removed += before_ttl - c.len();
-        // 2) 容量裁剪：仍超限则按最旧(last_seen_sec 升序)移除
+        // 2) Capacity trim: if still over the limit, remove the oldest (ascending by last_seen_sec)
         if c.len() > limit {
             let over = c.len() - limit;
             let mut entries: Vec<(String, i64)> = c
@@ -145,7 +148,7 @@ impl WebThreadMap {
         removed
     }
 
-    /// 原子替换写（临时文件 + rename），防写入中途崩溃留下截断文件
+    /// Atomic replace write (temp file + rename), prevents a truncated file being left behind by a mid-write crash
     fn atomic_write(&self, json: &str) -> Result<()> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent).ok();
@@ -161,7 +164,7 @@ impl WebThreadMap {
     }
 }
 
-/// 当前 unix 秒
+/// Current unix seconds
 fn unix_now_sec() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -169,10 +172,11 @@ fn unix_now_sec() -> i64 {
         .unwrap_or(0)
 }
 
-/// 把 OpenAI 风格的 `messages` 摊平成上游 web 协议要的单个 `content` 字符串。
+/// Flatten OpenAI-style `messages` into the single `content` string the upstream web protocol expects.
 ///
-/// 返回 `(prompt, 最后一条用户消息)`：后者用于判断能否复用上游 thread 只发增量。
-/// `only_last_user=true` 时只取最后一条用户消息（用于复用会话的续聊轮次）。
+/// Returns `(prompt, last user message)`: the latter is used to determine whether the upstream thread
+/// can be reused by sending only the increment.
+/// `only_last_user=true` takes only the last user message (used for continuation turns that reuse a session).
 pub fn flatten_messages(
     messages: &serde_json::Value,
     only_last_user: bool,
@@ -184,7 +188,7 @@ pub fn flatten_messages(
             serde_json::Value::Array(items) => items
                 .iter()
                 .filter_map(|it| {
-                    // 兼容 Anthropic 风格 content blocks（text 字段）与 OpenAI 多模态（type=text）
+                    // Compatible with Anthropic-style content blocks (text field) and OpenAI multimodal (type=text)
                     it.get("text").and_then(|x| x.as_str()).map(String::from)
                 })
                 .collect::<Vec<_>>()
@@ -227,9 +231,9 @@ pub fn flatten_messages(
         .collect();
 
     if let Some(sys) = systems.first() {
-        parts.push(format!("[系统指令]\n{sys}"));
+        parts.push(format!("[System instructions]\n{sys}"));
     }
-    // 只有一条非系统消息（最常见：客户端只发当前这句）→ 不标题号，原样发
+    // Only one non-system message (most common case: the client only sends the current message) -> no heading, sent verbatim
     let rest: Vec<String> = non_system.iter().filter_map(|m| text_of(m)).collect();
     if rest.len() == 1 {
         parts.push(rest[0].clone());
@@ -238,9 +242,9 @@ pub fn flatten_messages(
             let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("user");
             let Some(t) = text_of(m) else { continue };
             let label = match role {
-                "assistant" => "[助手]",
-                "tool" => "[工具结果]",
-                _ => "[用户]",
+                "assistant" => "[Assistant]",
+                "tool" => "[Tool result]",
+                _ => "[User]",
             };
             parts.push(format!("{label}\n{t}"));
         }
@@ -263,21 +267,21 @@ mod tests {
 
     #[test]
     fn single_user_message_is_passed_verbatim() {
-        let m = msgs(serde_json::json!([{ "role": "user", "content": "你好" }]));
+        let m = msgs(serde_json::json!([{ "role": "user", "content": "hello" }]));
         let (p, last) = flatten_messages(&m, false).unwrap();
-        assert_eq!(p, "你好");
-        assert_eq!(last, "你好");
+        assert_eq!(p, "hello");
+        assert_eq!(last, "hello");
     }
 
     #[test]
     fn system_prompt_and_single_user_keeps_system_prefix() {
         let m = msgs(serde_json::json!([
-            { "role": "system", "content": "你是助手" },
-            { "role": "user", "content": "写首诗" }
+            { "role": "system", "content": "you are an assistant" },
+            { "role": "user", "content": "write a poem" }
         ]));
         let (p, _) = flatten_messages(&m, false).unwrap();
-        assert!(p.starts_with("[系统指令]\n你是助手"));
-        assert!(p.ends_with("写首诗"));
+        assert!(p.starts_with("[System instructions]\nyou are an assistant"));
+        assert!(p.ends_with("write a poem"));
     }
 
     #[test]
@@ -285,43 +289,43 @@ mod tests {
         let m = msgs(serde_json::json!([
             { "role": "user", "content": "1+1" },
             { "role": "assistant", "content": "2" },
-            { "role": "user", "content": "再加一" }
+            { "role": "user", "content": "add one more" }
         ]));
         let (p, last) = flatten_messages(&m, false).unwrap();
-        assert!(p.contains("[用户]\n1+1"));
-        assert!(p.contains("[助手]\n2"));
-        assert!(p.ends_with("[用户]\n再加一"));
+        assert!(p.contains("[User]\n1+1"));
+        assert!(p.contains("[Assistant]\n2"));
+        assert!(p.ends_with("[User]\nadd one more"));
         assert_eq!(
-            last, "再加一",
-            "最后一条用户消息必须能被单独取出（续聊只发它）"
+            last, "add one more",
+            "the last user message must be extractable on its own (continuation only sends it)"
         );
     }
 
     #[test]
     fn only_last_user_returns_just_that() {
         let m = msgs(serde_json::json!([
-            { "role": "user", "content": "旧问题" },
-            { "role": "assistant", "content": "旧回答" },
-            { "role": "user", "content": "新问题" }
+            { "role": "user", "content": "old question" },
+            { "role": "assistant", "content": "old answer" },
+            { "role": "user", "content": "new question" }
         ]));
         let (p, last) = flatten_messages(&m, true).unwrap();
-        assert_eq!(p, "新问题");
-        assert_eq!(last, "新问题");
+        assert_eq!(p, "new question");
+        assert_eq!(last, "new question");
     }
 
     #[test]
     fn anthropic_style_blocks_are_supported() {
         let m = msgs(serde_json::json!([
-            { "role": "user", "content": [{ "type": "text", "text": "块内容" }] }
+            { "role": "user", "content": [{ "type": "text", "text": "block content" }] }
         ]));
-        assert_eq!(flatten_messages(&m, false).unwrap().0, "块内容");
+        assert_eq!(flatten_messages(&m, false).unwrap().0, "block content");
     }
 
     #[test]
     fn empty_or_missing_content_yields_none() {
         assert!(flatten_messages(&serde_json::json!([]), false).is_none());
         assert!(flatten_messages(
-            &serde_json::json!([{ "role": "assistant", "content": "只有助手" }]),
+            &serde_json::json!([{ "role": "assistant", "content": "assistant only" }]),
             false
         )
         .is_none());
@@ -339,15 +343,15 @@ mod tests {
         let map = WebThreadMap::new(&path);
         map.bind("cred1", "t-1", "hello").unwrap();
         assert_eq!(map.get("cred1").unwrap().thread_id, "t-1");
-        // 续聊同一轮不重复计 turn（同 thread + 同文本）
+        // Continuing the same turn doesn't count a repeat turn (same thread + same text)
         map.bind("cred1", "t-1", "hello").unwrap();
         assert_eq!(map.get("cred1").unwrap().turns, 0);
-        // 新文本（哪怕 thread 相同）算新的一轮
+        // New text (even with the same thread) counts as a new turn
         map.bind("cred1", "t-1", "next").unwrap();
         assert_eq!(
             map.get("cred1").unwrap().turns,
             1,
-            "文本变化必须计为新的一轮"
+            "a text change must count as a new turn"
         );
 
         let reopened = WebThreadMap::new(&path);
@@ -364,7 +368,7 @@ mod tests {
         let map = WebThreadMap::new(&path);
         map.bind("cred1", "t-1", "hello").unwrap();
         let b = map.get("cred1").unwrap();
-        assert!(b.last_seen_sec > 0, "绑定必须记录时间戳");
+        assert!(b.last_seen_sec > 0, "a binding must record a timestamp");
         assert!(b.last_seen_sec <= unix_now_sec());
     }
 
@@ -373,16 +377,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("web_threads.json");
         let map = WebThreadMap::new(&path);
-        // 用一个小容量上限触发裁剪（避免真的写 2000 条——构造等价条件）
+        // Use a small capacity limit to trigger trimming (avoid actually writing 2000 entries -- construct an equivalent condition)
         let small_limit = 10usize;
         for i in 0..(small_limit + 5) {
             map.bind(&format!("cred-{i}"), &format!("t-{i}"), "x")
                 .unwrap();
         }
-        // 手动用大容量语义检查：注入 2001 条时最旧被裁剪（用较小 limit 模拟 2000 上限行为）
+        // Manually check the large-capacity semantics: injecting 2001 entries evicts the oldest (use a small limit to simulate the 2000 cap's behavior)
         let removed = {
             let mut c = map.cache.lock().unwrap();
-            // 注入超出上限的条目
+            // Inject entries beyond the limit
             for i in 0..25 {
                 c.insert(
                     format!("extra-{i}"),
@@ -390,15 +394,15 @@ mod tests {
                         thread_id: format!("te-{i}"),
                         last_user_text: String::new(),
                         turns: 0,
-                        last_seen_sec: unix_now_sec() - (25 - i) as i64, // 编号小=更旧
+                        last_seen_sec: unix_now_sec() - (25 - i) as i64, // smaller index = older
                     },
                 );
             }
             map.prune_locked(&mut c, Some(small_limit))
         };
-        assert!(removed >= 20, "超出容量部分应被裁剪，实际移除 {removed}");
+        assert!(removed >= 20, "entries over capacity should be trimmed, actually removed {removed}");
         let size = map.cache.lock().unwrap().len();
-        assert!(size <= small_limit, "裁剪后不应超过上限，实际 {size}");
+        assert!(size <= small_limit, "should not exceed the limit after trimming, actual {size}");
     }
 
     #[test]
@@ -409,7 +413,7 @@ mod tests {
         map.bind("fresh", "t-1", "x").unwrap();
         {
             let mut c = map.cache.lock().unwrap();
-            // 伪造一个已过期的条目（25h 前）
+            // Fake an already-expired entry (25h ago)
             c.insert(
                 "stale".into(),
                 ThreadBinding {
@@ -421,8 +425,8 @@ mod tests {
             );
         }
         let removed = map.prune(None).unwrap();
-        assert!(removed >= 1, "过期条目应被 TTL 清理，实际移除 {removed}");
+        assert!(removed >= 1, "expired entries should be cleared by TTL, actually removed {removed}");
         assert!(map.get("stale").is_none());
-        assert!(map.get("fresh").is_some(), "未过期条目应保留");
+        assert!(map.get("fresh").is_some(), "non-expired entries should be kept");
     }
 }

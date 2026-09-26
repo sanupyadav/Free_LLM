@@ -1,4 +1,4 @@
-// 合成最终 fixture：从 extract 输出 + 网关静态表补全 efforts + 手工补漏行
+// Composes the final fixture: extract output + gateway static table fills in efforts + manually added missing rows
 import fs from 'node:fs';
 const draft = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
 const outFile = process.argv[3];
@@ -42,7 +42,7 @@ for (const r of draft.models) {
     catalog: true,
   });
 }
-// 手工补漏行（多行常量解析失败，证据：freebuff-models.ts L456-459 / L502-506 / L549-553）
+// Manually added missing rows (multi-line constant parsing failed, evidence: freebuff-models.ts L456-459 / L502-506 / L549-553)
 const manualCatalog = [
   { id: 'deepseek/deepseek-v4-pro-max', availability: 'always', premium: true, multimodal: false, efforts: EFF.glm, fallback: null },
   { id: 'deepseek/deepseek-v4-flash-max', availability: 'always', premium: true, multimodal: false, efforts: EFF.glm, fallback: null },
@@ -52,11 +52,11 @@ const manualCatalog = [
 for (const r of manualCatalog) {
   if (!rows.some(x => x.id === r.id)) rows.push({ id: r.id, displayName: null, availability: r.availability, premium: r.premium, multimodal: r.multimodal, efforts: r.efforts, reasoningEffort: null, defaultEffort: null, unavailableFallback: r.fallback, experimental: false, catalog: true });
 }
-// 网关自管/registry 行（不属于上游 SUPPORTED_FREEBUFF_MODELS 合同）
+// Gateway self-managed/registry rows (not part of the upstream SUPPORTED_FREEBUFF_MODELS contract)
 const agentRows = [
-  { id: 'google/gemini-3.1-flash-lite', availability: 'always', premium: false, multimodal: true, efforts: EFF.full, note: 'free-agents 历史 file-picker/root 行；上游当前 file-picker 已切换 gemini-2.5-flash-lite' },
-  { id: 'google/gemini-3.5-flash-lite', availability: 'always', premium: false, multimodal: true, efforts: EFF.full, note: '网关 root 免费行；上游目录暂无同 id' },
-  { id: 'google/gemini-2.5-flash-lite', availability: 'always', premium: false, multimodal: true, efforts: EFF.full, note: '上游 free-agents.ts file-picker 当前模型；网关动态 registry 行，无静态 meta → "未经策略验证"' },
+  { id: 'google/gemini-3.1-flash-lite', availability: 'always', premium: false, multimodal: true, efforts: EFF.full, note: 'free-agents historical file-picker/root row; upstream file-picker has since switched to gemini-2.5-flash-lite' },
+  { id: 'google/gemini-3.5-flash-lite', availability: 'always', premium: false, multimodal: true, efforts: EFF.full, note: 'gateway root free row; no matching id in the upstream catalog yet' },
+  { id: 'google/gemini-2.5-flash-lite', availability: 'always', premium: false, multimodal: true, efforts: EFF.full, note: 'current model for upstream free-agents.ts file-picker; gateway dynamic registry row with no static meta -> "not policy-verified"' },
 ];
 for (const r of agentRows) {
   rows.push({ id: r.id, displayName: null, availability: r.availability, premium: r.premium, multimodal: r.multimodal, efforts: r.efforts, reasoningEffort: null, defaultEffort: null, unavailableFallback: null, experimental: false, catalog: false, note: r.note });
@@ -65,10 +65,10 @@ for (const r of agentRows) {
 const out = {
   _source: draft._source,
   _vended_at: draft._vended_at,
-  _note: '脚本生成：scripts/extract_upstream_models.mjs + scripts/compose_fixture.mjs；catalog=true=上游合同行（与 src/models.rs MODEL_META_ROWS 做漂移比对），catalog=false=网关自管/registry 行（仅信息）。',
+  _note: 'Script-generated: scripts/extract_upstream_models.mjs + scripts/compose_fixture.mjs; catalog=true=upstream contract row (drift-compared against src/models.rs MODEL_META_ROWS), catalog=false=gateway self-managed/registry row (informational only).',
   models: rows,
 };
-// 排序：catalog true 先行，按 id
+// Sort: catalog=true rows first, then by id
 rows.sort((a, b) => (a.catalog === b.catalog ? a.id.localeCompare(b.id) : a.catalog ? -1 : 1));
 fs.writeFileSync(outFile, JSON.stringify(out, null, 2) + '\n', 'utf8');
 console.log('fixture rows=' + rows.length + ' -> ' + outFile);

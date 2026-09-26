@@ -1,70 +1,70 @@
-//! 内置提示词与技能（system prompts + built-in skills）
-//! 供开发者在面板/API 中选择启用，注入到聊天请求的 system 前缀。
+//! Built-in prompts and skills (system prompts + built-in skills)
+//! For developers to enable via the panel/API, injected into the chat request's system prefix.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-/// 内置系统提示词模板（可自由启用/自定义）
+/// Built-in system prompt templates (freely enable/customize)
 pub const BUILTIN_PROMPTS: &[(&str, &str, &str)] = &[
     (
         "default",
-        "通用助手（默认）",
+        "General Assistant (default)",
         "You are a helpful AI coding assistant. Follow the user's instructions precisely. Write clean, working code. When asked to explain, be concise and correct.",
     ),
     (
         "coding-expert",
-        "资深工程师",
+        "Senior Engineer",
         "You are a senior software engineer with deep expertise in system design, algorithms, and production-grade engineering. Provide pragmatic solutions, flag trade-offs, and prefer simple working code unless complexity is justified.",
     ),
     (
         "code-reviewer",
-        "代码审查员",
+        "Code Reviewer",
         "You are a meticulous code reviewer. Analyze code for correctness, security (injection, secrets, auth), performance, and style. Report issues by severity (CRITICAL/HIGH/MEDIUM/LOW) with evidence and concrete fixes. Never approve without evidence.",
     ),
     (
         "security-auditor",
-        "安全审计员",
+        "Security Auditor",
         "You are a security auditor following OWASP Top 10. Review for injection, XSS, CSRF, auth bypass, IDOR, SSRF, and secret leaks. For each finding: attack scenario, impact, and fix. Verify findings; do not report theory as fact.",
     ),
     (
         "debug-master",
-        "调试专家",
-        "You are a systematic debugger. Follow the scientific method: form hypotheses, gather evidence (logs, repro, code paths), test the cheapest hypothesis first, and only then fix. Never guess-fix without reproducing. After fixing, explain root cause我的 document",
+        "Debugging Expert",
+        "You are a systematic debugger. Follow the scientific method: form hypotheses, gather evidence (logs, repro, code paths), test the cheapest hypothesis first, and only then fix. Never guess-fix without reproducing. After fixing, explain root cause in the document",
     ),
     (
         "test-tdd",
-        "TDD 工程师",
+        "TDD Engineer",
         "You follow Test-Driven Development strictly: write failing test first (RED), implement minimal code to pass (GREEN), then refactor (IMPROVE). Aim for 80%+ coverage on core logic. Name tests by behavior.",
     ),
 ];
 
-/// 内置技能（可启用/禁用）
+/// Built-in skills (enable/disable)
 pub const BUILTIN_SKILLS: &[(&str, &str, &str)] = &[
     (
         "git-guru",
-        "Git 专家",
+        "Git Expert",
         "Proficient with git workflows (branch, rebase, cherry-pick, bisect, reflog). Prefer small atomic commits with conventional messages. Help resolve conflicts and write clean PR descriptions.",
     ),
     (
         "docker-deploy",
-        "Docker 部署",
+        "Docker Deployment",
         "Expert in Docker and Docker Compose: multi-stage builds, healthchecks, volumes, secrets, and zero-downtime deploys. Prefer distroless images and minimal attack surface.",
     ),
     (
         "api-designer",
-        "API 设计",
+        "API Design",
         "Designs clean REST/OpenAPI APIs: consistent envelope, versioning, pagination, rate limiting, idempotency, and auth. Prefer battle-tested patterns over bespoke abstractions.",
     ),
     (
         "perf-tuner",
-        "性能优化",
+        "Performance Tuning",
         "Profiles and optimizes: identifies bottlenecks (N+1, cache misses, allocations), measures before/after, and prefers compositor-friendly or algorithmic wins over micro-tuning.",
     ),
     (
         "refactor-clean",
-        "重构清理",
+        "Refactor Cleanup",
         "Refactors for clarity and maintainability while preserving behavior: extracts functions, removes dead code, applies immutable patterns, and keeps diffs small and reviewable.",
     ),
 ];
@@ -119,7 +119,7 @@ impl PromptManager {
         }
     }
 
-    /// 启用的提示词（按 id 排序拼接）
+    /// Enabled prompts (concatenated in id order)
     pub async fn active_prompts(&self) -> String {
         let p = self.prompts.read().await;
         let mut s = String::new();
@@ -132,7 +132,7 @@ impl PromptManager {
         s
     }
 
-    /// 启用的技能
+    /// Enabled skills
     pub async fn active_skills(&self) -> String {
         let s = self.skills.read().await;
         let mut out = String::new();
@@ -144,10 +144,10 @@ impl PromptManager {
         out
     }
 
-    /// 组装最终 system 前缀（默认提示词 + 启用的自定义提示词 + 技能）
+    /// Assemble the final system prefix (default prompt + enabled custom prompts + skills)
     pub async fn system_prefix(&self) -> String {
         let mut s = self.system_prefix_prompts_only().await;
-        // 技能（含各自约束）
+        // Skills (with their own constraints)
         let skills = self.active_skills().await;
         if !skills.is_empty() {
             s.push_str("You have these active skills available. Use them as guidance for how you respond in relevant situations:\n");
@@ -156,16 +156,16 @@ impl PromptManager {
         s
     }
 
-    /// 仅提示词部分（默认提示词 + 启用的自定义提示词）——供技能系统 roster 模式复用，
-    /// 避免与 skills 模块的技能注入重复。
+    /// Prompts-only portion (default prompt + enabled custom prompts) -- reused by the skills system's roster mode,
+    /// to avoid duplicating the skill injection done by the skills module.
     pub async fn system_prefix_prompts_only(&self) -> String {
         let mut s = String::new();
-        // 默认提示词始终启用当 base
+        // Default prompt is always enabled as the base
         if let Some(base) = self.prompts.read().await.get("default") {
             s.push_str(&base.content);
             s.push_str("\n\n");
         }
-        // 启用的其他提示词
+        // Other enabled prompts
         let extra = self.active_prompts().await;
         if !extra.is_empty() {
             s.push_str(&extra);
@@ -187,7 +187,7 @@ impl PromptManager {
         v
     }
 
-    /// 启用/禁用（通过 API 面板）
+    /// Enable/disable (via API panel)
     pub async fn set_prompt_enabled(&self, id: &str, enabled: bool) -> bool {
         let mut p = self.prompts.write().await;
         match p.get_mut(id) {
@@ -235,7 +235,7 @@ mod tests {
         let m = PromptManager::new();
         assert!(m.set_skill_enabled("git-guru", true).await);
         let prefix = m.system_prefix().await;
-        assert!(prefix.contains("Git 专家"));
+        assert!(prefix.contains("Git Expert"));
         assert!(prefix.contains("active skills"));
     }
 }

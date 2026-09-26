@@ -7,10 +7,11 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  # GHCR 包名规则：${github.repository}/${name} → ghcr.io/lza6/freebuff2api。
-  # 直接用小写子串是不行的（漏掉 owner），所以在此组合成完整小写全名。
-  # 注意：github.repository 是 lza6/Freebuff-2API（含大写）不能用，
-  # 需要显式 owner 如下。
+  # GHCR package name rule: ${github.repository}/${name} -> ghcr.io/lza6/freebuff2api.
+  # A plain lowercased substring doesn't work (drops the owner), so it's composed here as
+  # the full lowercase name instead.
+  # Note: github.repository is lza6/Freebuff-2API (contains uppercase) and can't be used
+  # directly, hence the explicit owner below.
   IMAGE_NAME: lza6/freebuff2api
 
 jobs:

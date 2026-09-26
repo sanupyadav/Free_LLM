@@ -15,18 +15,18 @@ fn duration_parsing() {
 
 #[test]
 fn config_validates() {
-    // 空 token 时 load 应报错（构造明确错误场景）
+    // load should error with an empty token (deliberately construct a clear error scenario)
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config.json");
     std::fs::write(&path, r#"{"auth_tokens":[]}"#).unwrap();
     let r = Config::load(Some(path.to_str().unwrap()));
     assert!(r.is_err());
 
-    // 重复 token 检测（走 Config::load 的自动探测路径）
+    // Duplicate token detection (via Config::load's auto-detection path)
     std::fs::write(&path, r#"{"auth_tokens":["a","a"]}"#).unwrap();
     let r = Config::load(Some(path.to_str().unwrap()));
     assert!(r.is_err());
-    assert!(r.unwrap_err().to_string().contains("重复"));
+    assert!(r.unwrap_err().to_string().contains("duplicate"));
 }
 
 #[test]
@@ -44,7 +44,7 @@ fn registry_init() {
 
 #[test]
 fn free_agents_parser() {
-    // 模拟上游 free-agents.ts 片段
+    // Simulate an upstream free-agents.ts fragment
     let src = r#"
 const agents = {
   'base2-free': new Set(['google/gemini-2.5-flash-lite']),
@@ -53,14 +53,14 @@ const agents = {
 }
 "#;
     let parsed = parse_free_agents(src);
-    // 内联 Set/数组可解析
+    // Inline Set/array literals are parseable
     assert!(parsed.contains_key("base2-free"));
     assert!(parsed.contains_key("basher"));
     assert!(parsed
         .get("basher")
         .unwrap()
         .contains(&"z-ai/glm-5.3-flash".to_string()));
-    // 常量引用无法内联解析（上游已改用常量，回归时由硬编码清单兜底）
+    // Constant references can't be parsed inline (upstream switched to a constant; the hardcoded list is the regression fallback)
     assert!(!parsed.contains_key("researcher-web"));
 }
 
@@ -69,7 +69,7 @@ fn compress_long_tool_result() {
     let long = String::from_utf8(vec![b'a'; 10_000]).unwrap();
     let compressed = compress_tool_result(&long, 500);
     assert!(compressed.len() < long.len());
-    assert!(compressed.contains("已压缩"));
+    assert!(compressed.contains("compressed"));
     assert!(compressed.starts_with(&long[..100]));
 
     let short = "hello";
@@ -120,7 +120,7 @@ fn usage_db_roundtrip() {
 
 #[test]
 fn timeout_env_duration() {
-    // 回归：REQUEST_TIMEOUT=15m 应解析为 900s
+    // Regression: REQUEST_TIMEOUT=15m should parse to 900s
     let cfg = Config {
         request_timeout_sec: parse_duration_sec("15m").unwrap(),
         ..Default::default()
@@ -166,38 +166,38 @@ fn pool_pick_best_and_cooldown() {
             breaker: tokio::sync::RwLock::new(freebuff2api::pool::CircuitBreaker::new()),
         };
         let pool = Pool::new(&cfg, client.clone());
-        // 池为空（Config::default 无 token）时 pick_best 应返回 None
+        // Pool is empty (Config::default has no tokens), pick_best should return None
         assert!(pool.pick_best().await.is_none());
 
         assert!(pool.add_account(mk("a1", "tok-a")).await);
         assert!(pool.add_account(mk("a2", "tok-b")).await);
-        // 重复 token 不得再次加入
+        // Duplicate token must not be added again
         assert!(!pool.add_account(mk("a1dup", "tok-a")).await);
 
-        // 评分高者优先
+        // Higher score wins
         pool.update_score("a2", 50.0).await;
         let best = pool.pick_best().await.unwrap();
         assert_eq!(best.name, "a2");
 
-        // 冷却后应被跳过，回落到 a1
+        // After cooldown it should be skipped, falling back to a1
         pool.mark_cooldown("a2", Duration::from_secs(600), "test")
             .await;
         let best2 = pool.pick_best().await.unwrap();
         assert_eq!(best2.name, "a1");
 
-        // 快照反映总数与熔断三态
+        // Snapshot reflects the total count and circuit-breaker state
         let snap = pool.snapshot().await;
         assert_eq!(snap.total, 2);
         let a2 = snap.accounts.iter().find(|x| x.name == "a2").unwrap();
-        assert_eq!(a2.circuit_state, "open", "mark_cooldown 后应为 open");
+        assert_eq!(a2.circuit_state, "open", "should be open after mark_cooldown");
         assert!(a2.trips >= 1);
 
-        // 熔断三态：连续失败达阈值自动断开
+        // Circuit-breaker states: consecutive failures past the threshold trip it open automatically
         for _ in 0..4 {
             pool.mark_failure("a1", "boom").await;
         }
         let snap2 = pool.snapshot().await;
         let a1 = snap2.accounts.iter().find(|x| x.name == "a1").unwrap();
-        assert_eq!(a1.circuit_state, "open", "连续失败 4 次应自动熔断");
+        assert_eq!(a1.circuit_state, "open", "4 consecutive failures should auto-trip the breaker");
     });
 }

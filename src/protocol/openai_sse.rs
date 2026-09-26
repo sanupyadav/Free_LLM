@@ -1,18 +1,18 @@
-//! 上游 OpenAI 兼容 `chat.completions` 流式 chunk → [`CanonicalEvent`]。
+//! Upstream OpenAI-compatible `chat.completions` streaming chunk → [`CanonicalEvent`].
 //!
-//! 兼容要点：
+//! Compatibility notes:
 //! - `delta.content` → [`CanonicalEvent::TextDelta`]
-//! - `delta.tool_calls[]` 分片：首次（携带 id/name）→ `ToolUseStart`，
-//!   `function.arguments` 分片 → `ToolUseInputDelta`（按 `index` 对应）
-//! - `finish_reason`：`stop`→`end_turn`、`length`→`max_tokens`、`tool_calls`→`tool_use`
-//! - `usage`（`stream_options.include_usage` 时末尾 chunk 才有）→ `Usage`
-//! - `data: [DONE]` → `MessageStop`；上游未给 `finish_reason` 时回落 `end_turn`
+//! - `delta.tool_calls[]` fragments: first one (carrying id/name) → `ToolUseStart`,
+//!   `function.arguments` fragments → `ToolUseInputDelta` (matched by `index`)
+//! - `finish_reason`: `stop`→`end_turn`, `length`→`max_tokens`, `tool_calls`→`tool_use`
+//! - `usage` (only present on the final chunk when `stream_options.include_usage` is set) → `Usage`
+//! - `data: [DONE]` → `MessageStop`; falls back to `end_turn` when upstream didn't send `finish_reason`
 
 use std::collections::HashMap;
 
 use super::stream::{CanonicalEvent, SseLineParser};
 
-/// 单个上游工具调用的累积状态（id/name 可能分片到达）。
+/// Accumulated state for a single upstream tool call (id/name may arrive in fragments).
 #[derive(Debug, Default, Clone)]
 struct ToolCallState {
     id: String,
@@ -20,7 +20,7 @@ struct ToolCallState {
     started: bool,
 }
 
-/// OpenAI 兼容 SSE 解码器。
+/// OpenAI-compatible SSE decoder.
 #[derive(Debug, Default)]
 pub struct OpenAiSseDecoder {
     parser: SseLineParser,
@@ -28,9 +28,9 @@ pub struct OpenAiSseDecoder {
     model: String,
     started: bool,
     stopped: bool,
-    /// 上游给出的 finish_reason（已映射为 Anthropic 取值）
+    /// Upstream's finish_reason (already mapped to an Anthropic value)
     finish_reason: Option<String>,
-    /// 上游工具调用 index → 累积状态
+    /// Upstream tool call index → accumulated state
     tools: HashMap<u64, ToolCallState>,
 }
 
@@ -39,10 +39,10 @@ impl OpenAiSseDecoder {
         Self::default()
     }
 
-    /// 输入上游 SSE 字节，输出 0..n 个 canonical 事件。
+    /// Feed upstream SSE bytes in, emit 0..n canonical events out.
     ///
-    /// 遇到 `data: [DONE]` 输出 [`CanonicalEvent::MessageStop`]
-    /// （若上游没给 `finish_reason` 则 `stop_reason = "end_turn"`）。
+    /// On `data: [DONE]`, emits [`CanonicalEvent::MessageStop`]
+    /// (`stop_reason = "end_turn"` if upstream didn't give a `finish_reason`).
     pub fn feed(&mut self, chunk: &[u8]) -> Vec<CanonicalEvent> {
         let mut out = Vec::new();
         for (_event, data) in self.parser.feed(chunk) {
@@ -51,16 +51,16 @@ impl OpenAiSseDecoder {
         out
     }
 
-    /// 上游未发送 `[DONE]` 就断流时的兜底：补发一条 `MessageStop`。
+    /// Fallback for when the stream drops without upstream sending `[DONE]`: emits a `MessageStop`.
     ///
-    /// 已停止过则返回空；未收到任何 chunk 时也会先补 `MessageStart`。
+    /// Returns empty if already stopped; also emits a preceding `MessageStart` if no chunk was ever received.
     pub fn finish(&mut self) -> Vec<CanonicalEvent> {
         let mut out = Vec::new();
         self.emit_stop(&mut out);
         out
     }
 
-    /// 处理单条 SSE data 负载。
+    /// Handle a single SSE data payload.
     fn handle_payload(&mut self, data: &str, out: &mut Vec<CanonicalEvent>) {
         if data.is_empty() {
             return;
@@ -87,7 +87,7 @@ impl OpenAiSseDecoder {
             return;
         }
         self.absorb_identity(&value);
-        // usage 先于 choices 处理：若本 chunk 同时携带两者，message_start 可用上 input_tokens
+        // Handle usage before choices: if this chunk carries both, message_start can use input_tokens
         if let Some(usage) = value.get("usage").filter(|u| !u.is_null()) {
             let input = json_u64(usage.get("prompt_tokens"));
             let output = json_u64(usage.get("completion_tokens"));
@@ -98,13 +98,13 @@ impl OpenAiSseDecoder {
             });
         }
         self.handle_choices(&value, out);
-        // 首个合法 chat chunk 即使暂无内容也先发 MessageStart，让下游尽早拿到消息头
+        // Emit MessageStart on the first valid chat chunk even without content yet, so downstream gets the message header early
         if !self.started && (value.get("choices").is_some() || !self.message_id.is_empty()) {
             self.ensure_started(out, 0);
         }
     }
 
-    /// 记录上游 message id / model（后续 MessageStart 使用）。
+    /// Record upstream message id / model (used later by MessageStart).
     fn absorb_identity(&mut self, value: &serde_json::Value) {
         if let Some(id) = value.get("id").and_then(|v| v.as_str()) {
             if !id.is_empty() {
@@ -118,7 +118,7 @@ impl OpenAiSseDecoder {
         }
     }
 
-    /// 解析 `choices[0]` 的 delta 与 finish_reason。
+    /// Parse `choices[0]`'s delta and finish_reason.
     fn handle_choices(&mut self, value: &serde_json::Value, out: &mut Vec<CanonicalEvent>) {
         let Some(choice) = value
             .get("choices")
@@ -145,7 +145,7 @@ impl OpenAiSseDecoder {
         }
     }
 
-    /// 解析单个工具调用分片（id/name/arguments 均可能分片到达）。
+    /// Parse a single tool call fragment (id/name/arguments may all arrive in fragments).
     fn handle_tool_call(&mut self, call: &serde_json::Value, out: &mut Vec<CanonicalEvent>) {
         let index = json_u64(call.get("index"));
         let incoming_id = call.get("id").and_then(|v| v.as_str()).unwrap_or("");
@@ -185,7 +185,7 @@ impl OpenAiSseDecoder {
         }
     }
 
-    /// 发送 MessageStop（幂等）。
+    /// Emit MessageStop (idempotent).
     fn emit_stop(&mut self, out: &mut Vec<CanonicalEvent>) {
         if self.stopped {
             return;
@@ -201,7 +201,7 @@ impl OpenAiSseDecoder {
         });
     }
 
-    /// 确保 MessageStart 已发出（仅一次）。
+    /// Ensure MessageStart has been emitted (only once).
     fn ensure_started(&mut self, out: &mut Vec<CanonicalEvent>, input_tokens: u64) {
         if self.started {
             return;
@@ -220,22 +220,22 @@ impl OpenAiSseDecoder {
     }
 }
 
-/// OpenAI finish_reason → Anthropic stop_reason。
+/// OpenAI finish_reason → Anthropic stop_reason.
 fn map_finish_reason(reason: &str) -> &'static str {
     match reason {
         "length" => "max_tokens",
         "tool_calls" | "function_call" => "tool_use",
-        // "stop" 及 content_filter 等其余取值统一按正常结束处理
+        // "stop" and other values like content_filter are all treated as a normal end
         _ => "end_turn",
     }
 }
 
-/// 从 `Value` 取 u64（缺省 0）。
+/// Extract a u64 from a `Value` (defaults to 0).
 fn json_u64(value: Option<&serde_json::Value>) -> u64 {
     value.and_then(|v| v.as_u64()).unwrap_or(0)
 }
 
-/// 提取错误消息（无 message 字段时退化为整个 JSON 文本）。
+/// Extract an error message (falls back to the whole JSON text if there's no message field).
 fn extract_error_message(err: &serde_json::Value) -> String {
     err.get("message")
         .and_then(|m| m.as_str())
@@ -243,7 +243,7 @@ fn extract_error_message(err: &serde_json::Value) -> String {
         .unwrap_or_else(|| err.to_string())
 }
 
-/// 截断过长文本（按字符边界，避免 panic）。
+/// Truncate overly long text (on a char boundary, to avoid panicking).
 fn truncate(text: &str, max_chars: usize) -> String {
     if text.chars().count() <= max_chars {
         text.to_string()

@@ -1,11 +1,12 @@
-//! 浏览器扩展的内嵌分发。
+//! Embedded distribution of the browser extension.
 //!
-//! 扩展文件在编译期用 `include_str!` / `include_bytes!` 打进二进制，运行时按需打包成 zip，
-//! 这样即使用户只拿到单个可执行文件（没有源码目录），也能从面板「下载扩展」拿到可用的一键登录扩展。
+//! Extension files are baked into the binary at compile time with `include_str!` / `include_bytes!`,
+//! and packaged into a zip on demand at runtime. This way, even a user who only has the single
+//! executable (no source tree) can get a working one-click-login extension from the panel's "Download extension".
 //!
-//! zip 采用 **stored（不压缩）** 模式手写：扩展总共几十 KB，省掉一个压缩库依赖更划算。
+//! The zip is hand-written in **stored (uncompressed)** mode: the extension is only a few dozen KB total, so skipping a compression library dependency is worth it.
 
-/// 文本类文件（zip 内路径 → 内容）
+/// Text files (zip path -> content)
 const TEXT_FILES: &[(&str, &str)] = &[
     (
         "manifest.json",
@@ -27,13 +28,13 @@ const TEXT_FILES: &[(&str, &str)] = &[
     ("README.md", include_str!("../browser-extension/README.md")),
 ];
 
-/// 二进制类文件
+/// Binary files
 const BIN_FILES: &[(&str, &[u8])] = &[(
     "icons/icon128.png",
     include_bytes!("../browser-extension/icons/icon128.png"),
 )];
 
-/// 扩展版本号（从内嵌 manifest.json 解析，避免和扩展本体不同步）
+/// Extension version (parsed from the embedded manifest.json, to avoid drifting out of sync with the extension itself)
 pub fn version() -> String {
     let manifest = TEXT_FILES
         .iter()
@@ -48,7 +49,7 @@ pub fn version() -> String {
         .unwrap_or_else(|| "unknown".into())
 }
 
-/// CRC-32（IEEE 802.3，zip 要求）；逐位实现，几十 KB 数据量下开销可忽略
+/// CRC-32 (IEEE 802.3, required by zip); bitwise implementation, negligible overhead at this data size (tens of KB)
 fn crc32(data: &[u8]) -> u32 {
     let mut crc: u32 = 0xFFFF_FFFF;
     for &byte in data {
@@ -61,7 +62,7 @@ fn crc32(data: &[u8]) -> u32 {
     !crc
 }
 
-/// 当前时间的 DOS 时间戳 (time, date)
+/// DOS timestamp for the current time (time, date)
 fn dos_datetime() -> (u16, u16) {
     use chrono::{Datelike, Timelike};
     let now = chrono::Local::now();
@@ -72,7 +73,7 @@ fn dos_datetime() -> (u16, u16) {
     (time, date)
 }
 
-/// 把内嵌的扩展文件打包成 zip（stored 模式）
+/// Packages the embedded extension files into a zip (stored mode)
 pub fn build_zip() -> Vec<u8> {
     let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
     for (name, content) in TEXT_FILES {
@@ -158,14 +159,14 @@ mod tests {
     #[test]
     fn zip_has_magic_and_eocd() {
         let z = build_zip();
-        assert!(z.len() > 1000, "zip 太小，可能没打进扩展文件");
+        assert!(z.len() > 1000, "zip too small, extension files may not have been packed in");
         assert_eq!(
             &z[0..4],
             &[0x50, 0x4b, 0x03, 0x04],
-            "缺少 zip 局部文件头魔数"
+            "missing zip local file header magic"
         );
         let eocd = &z[z.len() - 22..];
-        assert_eq!(&eocd[0..4], &[0x50, 0x4b, 0x05, 0x06], "缺少 EOCD 魔数");
+        assert_eq!(&eocd[0..4], &[0x50, 0x4b, 0x05, 0x06], "missing EOCD magic");
     }
 
     #[test]
@@ -173,9 +174,9 @@ mod tests {
         let z = build_zip();
         let text = String::from_utf8_lossy(&z);
         for (name, _) in TEXT_FILES {
-            assert!(text.contains(name), "zip 内缺少 {name}");
+            assert!(text.contains(name), "zip is missing {name}");
         }
-        assert!(text.contains("icons/icon128.png"), "zip 内缺少图标");
+        assert!(text.contains("icons/icon128.png"), "zip is missing the icon");
     }
 
     #[test]
@@ -189,10 +190,10 @@ mod tests {
     #[test]
     fn version_is_parsed_from_manifest() {
         let v = version();
-        assert_ne!(v, "unknown", "未能从内嵌 manifest.json 解析出版本号");
+        assert_ne!(v, "unknown", "failed to parse version from embedded manifest.json");
         assert!(
             v.chars().next().unwrap().is_ascii_digit(),
-            "版本号格式异常: {v}"
+            "unexpected version format: {v}"
         );
     }
 }

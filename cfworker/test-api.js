@@ -36,33 +36,33 @@ function show(title, res) {
 }
 
 (async () => {
-  console.log('=== Freebuff2API Worker E2E 测试 ===');
+  console.log('=== Freebuff2API Worker E2E test ===');
 
-  // 1. 模型列表
+  // 1. Model list
   show('1. GET /v1/models', curlReq('GET', '/v1/models'));
 
-  // 2. Chat — base2-free 用 minimax
+  // 2. Chat - base2-free using minimax
   show('2. Chat glm-5.1 (base2-free)', curlReq('POST', '/v1/chat/completions', {
     model: 'z-ai/glm-5.1',
     messages: [{ role: 'user', content: 'Say hello' }],
     max_tokens: 50,
   }));
 
-  // 3. Chat — base2-free 用 minimax
+  // 3. Chat - base2-free using minimax
   show('3. Chat minimax-m2.7 (base2-free)', curlReq('POST', '/v1/chat/completions', {
     model: 'minimax/minimax-m2.7',
     messages: [{ role: 'user', content: 'Say hello' }],
     max_tokens: 50,
   }));
 
-  // 4. Chat — file-picker 用 gemini
+  // 4. Chat - file-picker using gemini
   show('4. Chat gemini-2.5-flash-lite (file-picker)', curlReq('POST', '/v1/chat/completions', {
     model: 'google/gemini-2.5-flash-lite',
     messages: [{ role: 'user', content: 'Say hello' }],
     max_tokens: 50,
   }));
 
-  // 5. Chat — 流式
+  // 5. Chat - streaming
   show('5. Chat glm-5.1 stream', curlReq('POST', '/v1/chat/completions', {
     model: 'z-ai/glm-5.1',
     messages: [{ role: 'user', content: 'Say hello' }],
@@ -70,5 +70,5 @@ function show(title, res) {
     stream: true,
   }));
 
-  console.log('\n=== 测试完成 ===');
+  console.log('\n=== Test complete ===');
 })();

@@ -1,35 +1,35 @@
 # Freebuff2API
 
-> 中文文档（Rust 版）。English version: [README_en.md](README_en.md)
+> English documentation (Rust version). Chinese docs: [README_zh.md](README_zh.md)
 
-Freebuff2API 将 [Freebuff](https://freebuff.com) 免费层逆向为 **OpenAI 兼容** 与 **Anthropic 兼容** 的本地 API 网关。**Rust(axum) 实现**，单二进制零依赖，可在任意 OpenAI/Claude 客户端（Claude Code、Codex、Cursor、LobeChat 等）中使用 Freebuff 免费模型。
+Freebuff2API reverse-engineers the [Freebuff](https://freebuff.com) free tier into a local **OpenAI-compatible** and **Anthropic-compatible** API gateway. **Implemented in Rust (axum)** — single binary, zero dependencies — so you can use Freebuff's free models from any OpenAI/Claude client (Claude Code, Codex, Cursor, LobeChat, etc.).
 
-## 核心特性
+## Core features
 
-- **双协议出口** — `POST /v1/chat/completions`（OpenAI，流式/非流式）+ `POST /v1/messages`（Claude），适配任意 OpenAI SDK。
-- **多账号智能轮询** — 多 Bearer token / web Cookie，健康评分 + 冷却熔断 + 最优账号选择。
-- **双桶并发信号量** — 逆向自桌面端并已落地（v0.8）：免费 `{槽:1, 并发:3}`、订阅 `{槽:3, 并发:8}`，网关全局级。每个请求同时占用"槽"与"并发"各一，**实际并发上限 = 槽位容量**（免费层 1、订阅层 3），超时 2s 返回 429。
-- **会话保活** — 45s 心跳 + 广告刷新延长额度；排队返回 Retry-After；401 自动冷却。
-- **思考程度降级** — 逆向自上游 efforts 字段：glm/deepseek 支持 `low/high/max`，solar/minimax/mimo 不支持自动剥离；Codex 选超范围 effort 自动降级。
-- **余额/积分查询** — `GET /api/account/balance`：freebucks 积分、每模型每日剩余、套餐、地区限制。
-- **token 一键导入** — 粘贴 curl / HAR / Cookie 串自动解析入库；桌面版托盘「一键登录」内置浏览器自动抓 Cookie。
-- **web 版协议适配** — `POST /api/chat/stream`（Cookie 鉴权 SSE 11 事件）、多模态上传、工具调用映射。
-- **用量统计** — SQLite 记录请求/token/延迟/错误 + 内置控制面板（`/ui`）。
-- **桌面安装包** — Electron 壳自动拉起网关 + 托盘 + OAuth 一键登录 + 检查更新。
-- **Docker / CI** — 多阶段镜像 + GitHub Actions 自动构建安装包。
+- **Dual-protocol egress** — `POST /v1/chat/completions` (OpenAI, streaming/non-streaming) + `POST /v1/messages` (Claude), works with any OpenAI SDK.
+- **Smart multi-account rotation** — multiple Bearer tokens / web cookies, health scoring + cooldown circuit-breaking + best-account selection.
+- **Dual-bucket concurrency semaphore** — reverse-engineered from the desktop client and shipped (v0.8): free tier `{slots:1, concurrency:3}`, subscriber tier `{slots:3, concurrency:8}`, gateway-global. Each request holds one "slot" and one "concurrency" permit at the same time, so the **real concurrency cap equals slot capacity** (1 for free tier, 3 for subscribers); a 2s timeout returns 429.
+- **Session keepalive** — 45s heartbeat + ad refresh to extend quota; queued requests return Retry-After; 401 triggers automatic cooldown.
+- **Reasoning-effort downgrade** — reverse-engineered from the upstream `efforts` field: glm/deepseek support `low/high/max`, solar/minimax/mimo don't support it and have it stripped automatically; Codex requests with an out-of-range effort are auto-downgraded.
+- **Balance/credit query** — `GET /api/account/balance`: freebucks credits, daily remaining per model, plan, regional restrictions.
+- **One-click token import** — paste a curl / HAR / Cookie string and it's parsed and stored automatically; the desktop tray's "one-click login" opens an embedded browser and captures cookies automatically.
+- **Web-protocol adapter** — `POST /api/chat/stream` (cookie-authenticated SSE, 11 event types), multimodal upload, tool-call mapping.
+- **Usage stats** — SQLite records requests/tokens/latency/errors + a built-in control panel (`/ui`).
+- **Desktop installer** — Electron shell auto-starts the gateway + tray icon + one-click OAuth login + update checking.
+- **Docker / CI** — multi-stage image + GitHub Actions auto-builds the installer.
 
-## 快速开始
+## Quick start
 
-### 桌面版（推荐）
-1. 下载最新版 `Freebuff2API Setup x64.exe`（Release 页，当前 v0.8.x）
-2. 安装后双击 → 自动拉起网关 + 打开控制台
-3. 托盘「一键登录新账号」→ 浏览器登录 freebuff.com → 自动抓 Cookie 入库
+### Desktop (recommended)
+1. Download the latest `Freebuff2API Setup x64.exe` (Releases page, currently v0.8.x)
+2. Install and double-click → the gateway auto-starts and the console opens
+3. Tray "One-click login for new account" → log in to freebuff.com in the browser → cookies are captured and stored automatically
 
-### 源码
+### From source
 ```bash
-build.bat                      # Windows 编译
-./target/release/freebuff2api  # Linux/macOS 编译 cargo build --release
-start.bat                      # Windows 启动
+build.bat                      # Windows build
+./target/release/freebuff2api  # Linux/macOS build via cargo build --release
+start.bat                      # Windows start
 ```
 
 ### Docker
@@ -38,7 +38,7 @@ docker build -t freebuff2api -f docker/Dockerfile .
 docker run -d -p 47821:47821 -v /data:/data freebuff2api
 ```
 
-## 配置（config.json）
+## Configuration (config.json)
 
 ```jsonc
 {
@@ -54,76 +54,77 @@ docker run -d -p 47821:47821 -v /data:/data freebuff2api
 }
 ```
 
-环境变量优先：`AUTH_TOKENS` / `API_KEYS` / `HTTP_PROXY` / `LISTEN_ADDR` / `AD_PROVIDERS` / `SQLITE_PATH` / `MEMORY_ENABLED`。
+Environment variables take precedence: `AUTH_TOKENS` / `API_KEYS` / `HTTP_PROXY` / `LISTEN_ADDR` / `AD_PROVIDERS` / `SQLITE_PATH` / `MEMORY_ENABLED`.
 
-### 记忆层（可选，默认关闭）
+### Memory layer (optional, off by default)
 
-网关内置一个**零 LLM 规则**的本地记忆库（SQLite，`data/memory.sqlite`）：纯确定性规则自动记录「常用模型 / 推理档位降级 / 你的纠正（"记住…"、"别再…"、"always/never"）」与手动条目，并在相关对话时以低权威注入 system 前缀。
+The gateway ships a **zero-LLM, rule-based** local memory store (SQLite, `data/memory.sqlite`): purely deterministic rules automatically record "frequently used models / reasoning-effort downgrades / your corrections (`remember...`, `stop doing...`, `always/never`)" plus manual entries, and inject them as a low-authority system prefix into relevant conversations.
 
-- **默认关闭**：`memory_enabled: false`。记忆不是每个人都需要的，不需要时保持关闭，请求零额外注入。
-- **开启方式**：
-  1. 面板「记忆」页顶部 switch 一键开启（`POST /api/memory/toggle`，写回 config.json **立即热生效，无需重启**）；
-  2. 或 config.json 设 `"memory_enabled": true` 后重启；
-  3. 或环境变量 `MEMORY_ENABLED=true`。
-- 关闭状态既不自动记录也不注入任何记忆内容；数据保留在 `data/memory.sqlite`，重新开启后继续可用。
+- **Off by default**: `memory_enabled: false`. Not everyone needs memory — keep it off when you don't, for zero extra injection into requests.
+- **How to enable it**:
+  1. The switch at the top of the panel's "Memory" page (`POST /api/memory/toggle`, writes back to config.json and **takes effect immediately, no restart needed**);
+  2. Or set `"memory_enabled": true` in config.json and restart;
+  3. Or set the `MEMORY_ENABLED=true` environment variable.
+- While off, nothing is recorded or injected automatically; existing data stays in `data/memory.sqlite` and becomes usable again once re-enabled.
 
 ## API
 
-| 端点 | 方法 | 说明 |
+| Endpoint | Method | Description |
 |------|------|------|
-| `/v1/chat/completions` | POST | OpenAI 聊天 |
-| `/v1/messages` | POST | Claude 聊天 |
-| `/v1/models` | GET | 模型列表 |
-| `/api/tokens/import` | POST | 导入 curl/HAR/Cookie |
-| `/api/account/balance` | GET | 账号积分/每模型剩余 |
-| `/api/account/detail` | POST | 账号详情卡片 |
-| `/api/usage/*` | GET | 用量统计 |
-| `/ui` | GET | 控制面板 |
-| `/healthz` | GET | 健康检查 |
+| `/v1/chat/completions` | POST | OpenAI chat |
+| `/v1/messages` | POST | Claude chat |
+| `/v1/models` | GET | Model list |
+| `/api/tokens/import` | POST | Import curl/HAR/Cookie |
+| `/api/account/balance` | GET | Account credits / per-model remaining |
+| `/api/account/detail` | POST | Account detail card |
+| `/api/usage/*` | GET | Usage stats |
+| `/ui` | GET | Control panel |
+| `/healthz` | GET | Health check |
 
-完整教程见 [docs/API_GUIDE.md](docs/API_GUIDE.md)。
+Full guide: [docs/API_GUIDE.md](docs/API_GUIDE.md).
 
-## 多账号轮询与并发
-- 每请求自动选健康度最高的账号
-- 上游双桶并发限制（v0.8 已落地实现）：免费 `{槽:1, 并发:3}`、订阅 `{槽:3, 并发:8}`（实际并发上限=槽位，见上）
-- 等待室：429 + retry-after 自动退避
+## Multi-account rotation and concurrency
+- Each request automatically picks the healthiest account
+- Upstream dual-bucket concurrency limit (shipped in v0.8): free tier `{slots:1, concurrency:3}`, subscriber tier `{slots:3, concurrency:8}` (real concurrency cap = slot count, see above)
+- Waiting room: 429 + retry-after automatic backoff
 
-## 思考程度支持矩阵（逆向自上游）
+## Reasoning-effort support matrix (reverse-engineered from upstream)
 
-| 模型 | 支持 efforts |
+| Model | Supported efforts |
 |------|-------------|
-| deepseek/*、z-ai/glm、stealth/ox-alpha | `low, high, max` |
-| openai/gpt-5.6*、gemini-3.8、claude-fable-5 | `low, medium, high, xhigh, max` |
+| deepseek/*, z-ai/glm, stealth/ox-alpha | `low, high, max` |
+| openai/gpt-5.6*, gemini-3.8, claude-fable-5 | `low, medium, high, xhigh, max` |
 | meta/muse-spark* | `minimal, low, medium, high, xhigh` |
-| solar-pro4、minimax-m3、mimo-v2.5、kimi-k3 | 不支持（自动剥离） |
+| solar-pro4, minimax-m3, mimo-v2.5, kimi-k3 | Not supported (stripped automatically) |
 
-## 测试与验证
+## Testing and verification
 
 ```bash
-cargo test        # 253 单测 + 8 集成 + 11 路由级集成全绿（v0.9.0）
-cargo clippy --all-targets -- -D warnings  # 零警告
+cargo test        # 253 unit tests + 8 integration + 11 router-level integration, all green (v0.9.0)
+cargo clippy --all-targets -- -D warnings  # zero warnings
 ```
 
-真实 E2E 已实测：token 导入（curl/HAR/Cookie）✅、余额查询 ✅、账号详情 ✅、面板 ✅、上游冒烟 ✅。
+Real E2E has been verified: token import (curl/HAR/Cookie) OK, balance query OK, account detail OK, panel OK, upstream smoke test OK.
 
-## 目录结构
+## Directory layout
 
 ```
-src/                Rust 网关源码
-  api.rs            HTTP 路由
-  web_protocol.rs   web 版协议（Cookie 鉴权 chat/stream/余额）
-  import.rs         token 导入解析
-  usage.rs          SQLite 用量统计
-desktop/            Electron 桌面壳
-legacy-go/          旧 Go 版实现（归档）
-reference/          上游逆向源码归档
-docs/               API 教程
+src/                Rust gateway source
+  api.rs            HTTP routes
+  web_protocol.rs   web-version protocol (cookie auth chat/stream/balance)
+  import.rs         token import parsing
+  usage.rs          SQLite usage stats
+desktop/            Electron desktop shell
+legacy-go/          old Go implementation (archived)
+reference/          archived upstream reverse-engineering sources
+docs/               API guides
 ```
 
-## 免责声明
+## Disclaimer
 
-本项目与 OpenAI、Codebuff、Freebuff 无官方关联。仅供交流、实验与学习使用，按"原样"提供，使用者自行承担风险。
+This project has no official affiliation with OpenAI, Codebuff, or Freebuff. It is provided "as is" for communication, experimentation, and learning purposes only; use at your own risk.
 
-## 开源协议
+## License
 
 MIT
+</content>

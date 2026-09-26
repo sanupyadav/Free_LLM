@@ -1,11 +1,11 @@
-//! HTTP 路由：OpenAI 兼容 / Anthropic 兼容 / 控制面板 / 用量 API
+//! HTTP routes: OpenAI-compatible / Anthropic-compatible / control panel / usage API
 //!
-//! 依赖上游逆向协议：
-//! - POST /v1/chat/completions → 选 token→建会话→注入 codebuff_metadata→转发→SSE 流回
-//! - POST /v1/messages → Claude 协议转 OpenAI
-//! - GET  /v1/models → 注册表
-//! - GET  /healthz → 含账号健康快照
-//! - /ui 面板 + /api/usage/* 统计
+//! Depends on the upstream's reverse-engineered protocol:
+//! - POST /v1/chat/completions -> pick token -> create session -> inject codebuff_metadata -> forward -> stream back over SSE
+//! - POST /v1/messages -> Claude protocol converted to OpenAI
+//! - GET  /v1/models -> registry
+//! - GET  /healthz -> includes account health snapshot
+//! - /ui panel + /api/usage/* stats
 
 use crate::ads::AdRefresher;
 use crate::config::Config;
@@ -28,13 +28,13 @@ use axum::{Json, Router};
 use futures::StreamExt;
 use std::sync::Arc;
 
-/// 统一 AppState（必须 Send+Sync+Clone 才能被 axum State 提取器使用）
+/// Unified AppState (must be Send+Sync+Clone to be usable with axum's State extractor)
 #[derive(Clone)]
 pub struct AppState {
     pub cfg: Arc<Config>,
     pub client: Arc<UpstreamClient>,
     pub pool: Arc<Pool>,
-    /// web Cookie 凭证池（v0.9 §1.1）：多账号健康评分/熔断/冷却/轮询
+    /// web Cookie credential pool (v0.9 §1.1): multi-account health scoring / circuit breaking / cooldown / round-robin
     pub web_pool: Arc<crate::web_pool::WebCookiePool>,
     pub registry: Arc<ModelRegistry>,
     pub router: Arc<ModelRouter>,
@@ -45,32 +45,32 @@ pub struct AppState {
     pub skills: Arc<SkillsManager>,
     pub ads: Arc<AdRefresher>,
     pub prompts: Arc<crate::prompts::PromptManager>,
-    /// 凭证账号信息缓存 + 使用记录
+    /// Credential account info cache + usage records
     pub meta: Arc<crate::account_meta::AccountMetaStore>,
-    /// 当前生效的下游 API Key（支持运行时热更新，见 `POST /api/config/api-key`）
+    /// Currently active downstream API key (supports runtime hot updates, see `POST /api/config/api-key`)
     pub api_keys: Arc<std::sync::RwLock<Vec<String>>>,
-    /// web 协议桥接：客户端会话 → 上游 thread 绑定（复用会话省每日额度）
+    /// web protocol bridge: client session -> upstream thread binding (reusing a session saves daily quota)
     pub web_threads: Arc<crate::web_threads::WebThreadMap>,
-    /// 记忆层运行时开关（面板可热切换；初值来自 config.memory_enabled，默认关）
+    /// Memory layer runtime switch (hot-toggleable from the panel; initial value comes from config.memory_enabled, off by default)
     pub memory_runtime_enabled: Arc<std::sync::atomic::AtomicBool>,
-    /// 双桶并发信号量（v0.8 落地）：免费/订阅两桶，首字节写出前 acquire
+    /// Dual-bucket concurrency semaphore (landed in v0.8): free/subscription buckets, acquired before the first byte is written
     pub semaphore: Arc<crate::semaphore::TieredSemaphore>,
     pub started: std::time::Instant,
 }
 
-/// 读取当前生效的下游 API Key 列表（运行时热更新，不重启即生效）
+/// Read the currently active downstream API key list (hot-updated at runtime, no restart needed)
 fn api_keys_of(st: &AppState) -> Vec<String> {
     st.api_keys.read().map(|k| k.clone()).unwrap_or_default()
 }
 
-/// 写入运行时 API Key 列表（同时持久化到 config.json 由调用方负责）
+/// Write the runtime API key list (persisting to config.json is the caller's responsibility)
 fn set_api_keys(st: &AppState, keys: Vec<String>) {
     if let Ok(mut w) = st.api_keys.write() {
         *w = keys;
     }
 }
 
-/// 记忆层运行时开关（热切换，不重启生效）
+/// Memory layer runtime switch (hot-toggle, takes effect without restart)
 fn memory_enabled_now(st: &AppState) -> bool {
     st.memory_runtime_enabled
         .load(std::sync::atomic::Ordering::Relaxed)
@@ -81,12 +81,14 @@ fn set_memory_runtime_enabled(st: &AppState, enabled: bool) {
         .store(enabled, std::sync::atomic::Ordering::Relaxed);
 }
 
-// axum_core 已对 `S: Clone` 提供 blanket impl FromRef<S> for S，此处无需手动实现。
-// 保留 FromRef 导入供后续扩展（若需要子状态 FromRef 时使用）。
+// axum_core already provides a blanket impl FromRef<S> for S when `S: Clone`, so no manual impl is needed here.
+// Keep the FromRef import for future extension (in case a sub-state FromRef is needed later).
 
-/// 管理端点鉴权：配置了 api_keys 则要求请求头匹配；未配置则仅放行本机直连（无 X-Forwarded-For/X-Real-IP）。
-/// 本地单机软件默认监听 127.0.0.1，行为不变；跨机/代理访问必须显式配置 api_keys。
-/// 额外 CSRF 防护：带 Origin 头（浏览器发起）且非同源本机时拒绝。
+/// Admin endpoint auth: if api_keys is configured, the request header must match; if not configured, only direct
+/// local (loopback) requests are allowed (no X-Forwarded-For/X-Real-IP).
+/// A local single-machine setup listens on 127.0.0.1 by default and this behavior is unchanged; cross-machine/proxied
+/// access must explicitly configure api_keys.
+/// Extra CSRF protection: rejects requests carrying an Origin header (browser-initiated) that isn't same-origin local.
 fn admin_authorized(headers: &HeaderMap, st: &AppState) -> bool {
     if !origin_allowed(headers) {
         return false;
@@ -98,12 +100,15 @@ fn admin_authorized(headers: &HeaderMap, st: &AppState) -> bool {
     authorized(headers, &keys)
 }
 
-/// CSRF 防护：浏览器跨站请求会带 Origin；非同源（非本机面板）一律拒绝。
-/// 非浏览器客户端（curl/SDK/桌面 IPC）不带 Origin，不受影响。
+/// CSRF protection: browser cross-site requests carry an Origin header; anything not same-origin (not the local
+/// panel) is always rejected.
+/// Non-browser clients (curl/SDK/desktop IPC) don't send Origin, so they're unaffected.
 ///
-/// 例外：浏览器扩展（`chrome-extension://` / `moz-extension://`）—— 扩展是"浏览器版一键登录"
-/// 的唯一合法路径（HttpOnly Cookie 只能由扩展读取），其 fetch 会带扩展 Origin。
-/// 配置了 `api_keys` 时扩展仍需携带 Key（面板会把 Key 透传给扩展），安全边界不变。
+/// Exception: browser extensions (`chrome-extension://` / `moz-extension://`) -- the extension is the only
+/// legitimate path for "one-click browser login" (the HttpOnly cookie can only be read by the extension), and its
+/// fetch will carry the extension's Origin.
+/// When `api_keys` is configured, the extension still needs to send the Key (the panel passes the Key through to
+/// the extension), so the security boundary is unchanged.
 fn origin_allowed(headers: &HeaderMap) -> bool {
     match headers.get("origin").and_then(|v| v.to_str().ok()) {
         None => true,
@@ -119,12 +124,15 @@ fn origin_allowed(headers: &HeaderMap) -> bool {
     }
 }
 
-/// 把真实 TCP 对端（axum `ConnectInfo<SocketAddr>` 扩展）写入 `x-fb-peer` 头，供 is_loopback_request 判定。
+/// Writes the real TCP peer (axum's `ConnectInfo<SocketAddr>` extension) into the `x-fb-peer` header, for
+/// is_loopback_request to use.
 ///
-/// - 生产路径：`main` 用 `into_make_service_with_connect_info::<SocketAddr>()` 提供服务，每个请求
-///   都带 ConnectInfo 扩展 → 本中间件**无条件覆盖** `x-fb-peer` 为真实对端 IP，客户端无法伪造。
-/// - 单元测试/oneshot 路径：无 ConnectInfo 扩展 → 移除 `x-fb-peer`（避免客户端残留头干扰判定），
-///   测试可用 `req.extensions_mut().insert(ConnectInfo(peer))` 忠实模拟任意 peer。
+/// - Production path: `main` serves via `into_make_service_with_connect_info::<SocketAddr>()`, so every request
+///   carries the ConnectInfo extension -> this middleware **unconditionally overwrites** `x-fb-peer` with the real
+///   peer IP, so clients can't spoof it.
+/// - Unit test/oneshot path: no ConnectInfo extension -> `x-fb-peer` is removed (to avoid a leftover client header
+///   interfering with the check); tests can faithfully simulate any peer via
+///   `req.extensions_mut().insert(ConnectInfo(peer))`.
 fn inject_peer(mut req: axum::extract::Request) -> axum::extract::Request {
     let peer = req
         .extensions()
@@ -143,10 +151,10 @@ fn inject_peer(mut req: axum::extract::Request) -> axum::extract::Request {
     req
 }
 
-/// 判断请求是否来自本机（v0.9 §1.5 鉴权纵深）：
-/// 1. 出现 X-Forwarded-For / X-Real-IP（经代理或伪造代理头）→ 一律不算本机；
-/// 2. 再看真实 TCP 对端 `x-fb-peer`（由 inject_peer 从 ConnectInfo 写入）：非回环 → 拒绝；
-/// 3. 无 `x-fb-peer`（oneshot 单测未注入）→ 保持默认放行（127.0.0.1 默认行为不变）。
+/// Determines whether a request comes from the local machine (v0.9 §1.5 defense-in-depth auth):
+/// 1. If X-Forwarded-For / X-Real-IP is present (via a proxy or a spoofed proxy header) -> never counts as local;
+/// 2. Otherwise check the real TCP peer `x-fb-peer` (written by inject_peer from ConnectInfo): not loopback -> reject;
+/// 3. No `x-fb-peer` (not injected in a oneshot unit test) -> keep the default allow (127.0.0.1 default behavior unchanged).
 fn is_loopback_request(headers: &HeaderMap) -> bool {
     if headers.get("x-forwarded-for").is_some() || headers.get("x-real-ip").is_some() {
         return false;
@@ -227,8 +235,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/import", post(handle_import))
         .merge(api)
         .with_state(state)
-        // v0.8 安全头：给全部响应加 nosniff / Referrer-Policy / CSP（本地自容面板无外部资源）
-        // v0.9 鉴权纵深：请求进入前注入真实对端（ConnectInfo → x-fb-peer），供管理端点回环判定
+        // v0.8 security headers: add nosniff / Referrer-Policy / CSP to every response (the local self-contained panel has no external resources)
+        // v0.9 defense-in-depth auth: inject the real peer (ConnectInfo -> x-fb-peer) before the request enters, for admin endpoint loopback checks
         .layer(
             tower::ServiceBuilder::new()
                 .map_request(inject_peer)
@@ -236,13 +244,13 @@ pub fn build_router(state: AppState) -> Router {
         )
 }
 
-/// 为每个响应附加安全头（幂等：不覆盖已有值，仅补充缺失的）
+/// Attaches security headers to every response (idempotent: doesn't overwrite existing values, only fills in what's missing)
 ///
-/// - X-Content-Type-Options: nosniff —— 防 MIME 嗅探
-/// - Referrer-Policy: strict-origin-when-cross-origin —— 防完整 URL 泄露到外站
-/// - Content-Security-Policy: default-src 'self' —— 本地面板无外部资源，直接收紧
+/// - X-Content-Type-Options: nosniff -- prevents MIME sniffing
+/// - Referrer-Policy: strict-origin-when-cross-origin -- prevents the full URL from leaking to other sites
+/// - Content-Security-Policy: default-src 'self' -- the local panel has no external resources, so lock it down directly
 ///
-/// 对 SSE 流响应（text/event-stream）同样适用——头部在首次块写出前已确定。
+/// Also applies to SSE streaming responses (text/event-stream) -- headers are finalized before the first chunk is written.
 fn secure_headers(mut resp: axum::response::Response) -> axum::response::Response {
     let hs = resp.headers_mut();
     use axum::http::header;
@@ -255,19 +263,23 @@ fn secure_headers(mut resp: axum::response::Response) -> axum::response::Respons
     }
     insert_if_missing!(header::X_CONTENT_TYPE_OPTIONS, "nosniff");
     insert_if_missing!(header::REFERRER_POLICY, "strict-origin-when-cross-origin");
-    // CSP 仅面板页（HTML/JS）需要；但统一加也不会破坏 JSON/SSE（浏览器仅对 HTML 应用 CSP 的
-    // script/style 限制；API 响应无内联脚本，default-src 'self' 不影响读取）。
-    // 为安全起见，仅当响应 content-type 含 text/html 时加 CSP，避免对 /v1 数据面造成潜在干扰。
+    // CSP is only needed for the panel page (HTML/JS); but adding it uniformly won't break JSON/SSE (browsers only
+    // apply CSP's script/style restrictions to HTML; API responses have no inline scripts, so default-src 'self'
+    // doesn't affect reading them).
+    // To be safe, only add CSP when the response content-type contains text/html, to avoid any potential
+    // interference with the /v1 data plane.
     let ct = hs
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
     if ct.contains("text/html") && !hs.contains_key(header::CONTENT_SECURITY_POLICY) {
-        // 面板是无构建单文件（内联 <script>/<style>/onclick），CSP 必须放行内联脚本与样式，
-        // 否则整个面板瘫痪（内联脚本被 default-src 'self' 阻断——Critic 实测 Edge 报
-        // "Refused to execute inline script"，测试台/设置/关于/日志全部失效）。
-        // 保留其余防护：禁止 object/embed/plugin、限制 base-uri、禁止被 iframe 嵌入、只允许自身与 data: 图片。
+        // The panel is a single unbuilt file (inline <script>/<style>/onclick), so CSP must allow inline scripts
+        // and styles, otherwise the whole panel breaks (inline scripts get blocked by default-src 'self' -- Critic
+        // verified Edge reports "Refused to execute inline script", breaking the test bench/settings/about/logs
+        // entirely).
+        // Keep the rest of the protections: disallow object/embed/plugin, restrict base-uri, disallow being
+        // embedded in an iframe, only allow images from self and data:.
         hs.insert(
             header::CONTENT_SECURITY_POLICY,
             axum::http::HeaderValue::from_static(
@@ -278,10 +290,10 @@ fn secure_headers(mut resp: axum::response::Response) -> axum::response::Respons
     resp
 }
 
-// ---------- 面板 & 健康 ----------
+// ---------- Panel & Health ----------
 
 async fn handle_dashboard() -> impl IntoResponse {
-    // v0.10 §1.5：面板构建失败不 panic（http::Response: Default）
+    // v0.10 §1.5: don't panic if the panel build fails (http::Response: Default)
     Response::builder()
         .header("content-type", "text/html; charset=utf-8")
         .body(Body::from(crate::web::INDEX_HTML))
@@ -290,7 +302,8 @@ async fn handle_dashboard() -> impl IntoResponse {
 
 async fn handle_healthz(State(st): State<AppState>, headers: HeaderMap) -> Response {
     let dur = st.started.elapsed();
-    // 配置了 api_keys 且未通过校验时，只回存活信息——账号名/模型构成不该对未授权方可见
+    // When api_keys is configured and the check fails, only return liveness info -- account names/model composition
+    // shouldn't be visible to unauthorized callers
     let keys = api_keys_of(&st);
     let authorized_ok = if keys.is_empty() {
         is_loopback_request(&headers)
@@ -302,6 +315,7 @@ async fn handle_healthz(State(st): State<AppState>, headers: HeaderMap) -> Respo
             "ok": true,
             "uptime_sec": dur.as_secs(),
             "version": env!("CARGO_PKG_VERSION"),
+            "os": std::env::consts::OS,
         }))
         .into_response();
     }
@@ -309,16 +323,43 @@ async fn handle_healthz(State(st): State<AppState>, headers: HeaderMap) -> Respo
         "ok": true,
         "uptime_sec": dur.as_secs(),
         "version": env!("CARGO_PKG_VERSION"),
-        "accounts": st.pool.snapshot().await.accounts,
+        "os": std::env::consts::OS,
+        "accounts": all_accounts_summary(&st).await,
         "model_count": st.registry.snapshot().await.model_count,
         "ads": st.ads.snapshot().await,
     });
     Json(json).into_response()
 }
 
+/// Bearer pool + web Cookie pool, in the pool's AccountSnapshot shape (the overview table reads this)
+async fn all_accounts_summary(st: &AppState) -> Vec<serde_json::Value> {
+    let mut out: Vec<serde_json::Value> = st
+        .pool
+        .snapshot()
+        .await
+        .accounts
+        .iter()
+        .filter_map(|a| serde_json::to_value(a).ok())
+        .collect();
+    for w in st.web_pool.snapshot().await {
+        let healthy = w.cooldown_seconds.is_none() && w.circuit_state != "open";
+        out.push(serde_json::json!({
+            "name": format!("cookie {}", w.masked),
+            "healthy": healthy,
+            "score": w.health_score,
+            "cooldown_until": w.cooldown_until,
+            "circuit_state": w.circuit_state,
+            "trips": w.trips,
+            "last_error": w.last_error,
+            "session": { "status": if healthy { "ready" } else { "cooling" } },
+        }));
+    }
+    out
+}
+
 async fn handle_v1_models(State(st): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    // 与数据面同一套防线：配置 api_keys 时必须校验（模型清单不对未授权方公开）；
-    // 未配置时仅本机直连。
+    // Same defense line as the data plane: if api_keys is configured, it must be verified (the model list isn't
+    // exposed to unauthorized callers); if not configured, only direct local access is allowed.
     let keys = api_keys_of(&st);
     let authorized_ok = if keys.is_empty() {
         is_loopback_request(&headers)
@@ -342,18 +383,19 @@ async fn handle_v1_models(State(st): State<AppState>, headers: HeaderMap) -> imp
             })
         })
         .collect();
-    // v0.9 §1.2：模型元数据（availability/efforts/multimodal/fallback）并入响应。
-    // `data` 字段保持完全兼容，`meta` 为新增字段。
+    // v0.9 §1.2: model metadata (availability/efforts/multimodal/fallback) merged into the response.
+    // The `data` field stays fully backward-compatible; `meta` is a new field.
     let meta = models_meta_snapshot(&st).await;
     Json(serde_json::json!({ "object": "list", "data": data, "meta": meta })).into_response()
 }
 
-/// /v1/models 元数据接线点（v0.9 §1.2）。
+/// /v1/models metadata wiring point (v0.9 §1.2).
 ///
-/// 契约：`ModelRegistry::meta_snapshot() -> Vec<ModelMeta>`（字段 id/agent/premium/multimodal/
-/// available/efforts/fallback），由模型元数据 worker 在 `src/models.rs` 落地。
-/// **当前该接口尚未到位**（models.rs 为他人独占文件，本 worker 不越界），按任务约定降级为
-/// `meta: []` —— 响应结构稳定（`meta: [...]` 字段名即前端契约），集成阶段合拢时只需替换本函数体。
+/// Contract: `ModelRegistry::meta_snapshot() -> Vec<ModelMeta>` (fields id/agent/premium/multimodal/
+/// available/efforts/fallback), landed by the model metadata worker in `src/models.rs`.
+/// **This interface isn't in place yet** (models.rs is exclusively owned by another worker, so this worker won't
+/// overstep), so per the task agreement it degrades to `meta: []` -- the response shape is stable (the `meta: [...]`
+/// field name is the frontend contract), and only this function body needs replacing once integration lands.
 async fn models_meta_snapshot(st: &AppState) -> Vec<serde_json::Value> {
     st.registry
         .meta_snapshot()
@@ -362,7 +404,7 @@ async fn models_meta_snapshot(st: &AppState) -> Vec<serde_json::Value> {
         .collect()
 }
 
-// ---------- 用量 API ----------
+// ---------- Usage API ----------
 
 async fn handle_usage_totals(State(st): State<AppState>, headers: HeaderMap) -> Response {
     if !admin_authorized(&headers, &st) {
@@ -394,14 +436,14 @@ async fn handle_usage_requests(State(st): State<AppState>, headers: HeaderMap) -
     }
 }
 
-// ---------- 全配置导出/导入（v0.9 §2.3） ----------
+// ---------- Full config export/import (v0.9 §2.3) ----------
 
-/// POST /api/export — 全配置导出（脱敏 config + 凭证 + 技能启用态 + 记忆开关），换机迁移用
+/// POST /api/export -- full config export (redacted config + credentials + skill enable state + memory switch), for migrating to a new machine
 async fn handle_export(State(st): State<AppState>, headers: HeaderMap) -> Response {
     if !admin_authorized(&headers, &st) {
         return admin_denied();
     }
-    // config 脱敏：只导白名单字段，api_keys / auth_tokens 明文绝不导出；http_proxy 仅保留 host 段
+    // config redaction: only export whitelisted fields; api_keys / auth_tokens are never exported in plaintext; http_proxy keeps only the host segment
     let mut config_masked = serde_json::Map::new();
     for (key, _) in CONFIG_EDITABLE {
         let v = match *key {
@@ -439,12 +481,12 @@ async fn handle_export(State(st): State<AppState>, headers: HeaderMap) -> Respon
         tokens,
         skills,
         memory_enabled: memory_enabled_now(&st),
-        note: "Freebuff2API 全配置导出（v0.9）".to_string(),
+        note: "Freebuff2API full config export (v0.9)".to_string(),
     };
     Json(serde_json::json!({ "ok": true, "data": payload })).into_response()
 }
 
-/// http_proxy 脱敏：`http://user:pass@host:port` → `http://***@host:port`
+/// http_proxy redaction: `http://user:pass@host:port` -> `http://***@host:port`
 fn redact_proxy_userinfo(proxy: &str) -> String {
     if let Some(idx) = proxy.find("://") {
         let rest = &proxy[idx + 3..];
@@ -455,7 +497,7 @@ fn redact_proxy_userinfo(proxy: &str) -> String {
     proxy.to_string()
 }
 
-/// POST /api/import — body `{data: ExportPayload}`：校验 → 自动备份 → 原子写回
+/// POST /api/import -- body `{data: ExportPayload}`: validate -> auto backup -> atomic write-back
 async fn handle_import(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -466,19 +508,19 @@ async fn handle_import(
     }
     if body.len() > crate::export::MAX_IMPORT_BYTES {
         return bad_req(&format!(
-            "导入数据超过上限 {}MB",
+            "Import data exceeds the limit of {}MB",
             crate::export::MAX_IMPORT_BYTES / 1024 / 1024
         ));
     }
     let v: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
-        Err(_) => return bad_req("body 必须是 JSON（{ \"data\": <导出内容> }）"),
+        Err(_) => return bad_req("body must be JSON ({ \"data\": <exported content> })"),
     };
     let payload = match crate::export::validate_import_body(&v) {
         Ok(p) => p,
-        Err(e) => return bad_req(&format!("导入校验失败：{e}")),
+        Err(e) => return bad_req(&format!("Import validation failed: {e}")),
     };
-    // 备份目录 = tokens_path 所在目录（默认 data/），与 import.rs 落盘位置一致
+    // backup dir = the directory containing tokens_path (default data/), consistent with where import.rs writes to disk
     let data_dir = std::path::Path::new(&st.cfg.tokens_path)
         .parent()
         .map(|p| p.to_string_lossy().into_owned())
@@ -498,31 +540,31 @@ async fn handle_import(
                 "warn",
                 "config",
                 None,
-                format!("已导入配置备份（{}）", backup),
+                format!("Config imported, backup created ({})", backup),
             );
-            // v0.9 §1.1：导入可能带新 web Cookie 凭证 → 热刷新池（保留既有健康状态）
+            // v0.9 §1.1: import may include new web Cookie credentials -> hot-reload the pool (preserving existing health state)
             st.web_pool.reload(&st.cfg).await;
             Json(serde_json::json!({ "ok": true, "imported": summary })).into_response()
         }
         Err(e) => internal_err(&anyhow::Error::msg(format!(
-            "导入失败（已备份可回滚）：{e}"
+            "Import failed (backup was created, can roll back): {e}"
         ))),
     }
 }
-// ---------- 账号余额查询（web 版协议） ----------
+// ---------- Account balance lookup (web protocol) ----------
 
-/// GET /api/account/balance — 查询账号积分/每模型限额/套餐（用 web Cookie）
+/// GET /api/account/balance -- query account credits/per-model limits/plan (uses web Cookie)
 async fn handle_account_balance(State(st): State<AppState>, headers: HeaderMap) -> Response {
     if !admin_authorized(&headers, &st) {
         return admin_denied();
     }
-    // v0.9 §1.1：从 WebCookiePool 挑选（健康分/熔断/冷却/轮询）；无 Cookie 保持原报错文案
+    // v0.9 §1.1: pick from WebCookiePool (health score/circuit breaking/cooldown/round-robin); keep the original error message if no Cookie is found
     let (cookie, cid) = match pick_web_cookie(&st).await {
         Some((c, _, id)) => (c, id),
         None => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "ok": false, "message": "未找到 web 版 Cookie 凭证。请在浏览器登录 freebuff.com 后从 DevTools 复制完整 Cookie（含 __Secure-next-auth.session-token=...）并 POST /api/tokens/import 导入" })),
+                Json(serde_json::json!({ "ok": false, "message": "No web Cookie credential found. Please log in to freebuff.com in your browser, copy the full Cookie from DevTools (including __Secure-next-auth.session-token=...), and import it via POST /api/tokens/import" })),
             )
                 .into_response();
         }
@@ -535,7 +577,7 @@ async fn handle_account_balance(State(st): State<AppState>, headers: HeaderMap) 
     match client.freebuff_session().await {
         Ok(sess) => {
             st.web_pool.mark_ok(&cid).await;
-            // 计算每模型剩余可用次数
+            // Compute remaining usable count per model
             let mut model_remaining = serde_json::Map::new();
             if let Some(freebucks) = &sess.freebucks {
                 let remaining = freebucks.daily.as_ref().map(|d| d.remaining).unwrap_or(0.0);
@@ -563,7 +605,7 @@ async fn handle_account_balance(State(st): State<AppState>, headers: HeaderMap) 
                             i64::MAX
                         };
                         let usable = by_credit.min(by_limit);
-                        let usable = if usable == i64::MAX { -1 } else { usable }; // -1 = 该模型不消费积分也不限次数
+                        let usable = if usable == i64::MAX { -1 } else { usable }; // -1 = this model neither consumes credits nor has a usage limit
                         model_remaining.insert(model.clone(), serde_json::json!({
                             "price": price,
                             "by_credit_remaining": if by_credit == i64::MAX { -1 } else { by_credit },
@@ -595,8 +637,8 @@ async fn handle_account_balance(State(st): State<AppState>, headers: HeaderMap) 
     }
 }
 
-/// 统一 500 JSON 错误响应
-/// GET /api/prompts — 列出内置提示词与技能（含启用状态）
+/// Unified 500 JSON error response
+/// GET /api/prompts -- list built-in prompts and skills (with enable state)
 async fn handle_prompts_list(State(st): State<AppState>, headers: HeaderMap) -> Response {
     if !admin_authorized(&headers, &st) {
         return admin_denied();
@@ -610,7 +652,7 @@ async fn handle_prompts_list(State(st): State<AppState>, headers: HeaderMap) -> 
     .into_response()
 }
 
-/// POST /api/prompts/toggle — body: { type: "prompt"|"skill", id, enabled }
+/// POST /api/prompts/toggle -- body: { type: "prompt"|"skill", id, enabled }
 async fn handle_prompts_toggle(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -654,7 +696,7 @@ async fn handle_prompts_toggle(
 }
 
 fn internal_err(e: &anyhow::Error) -> Response {
-    tracing::error!("用量统计查询失败: {e}");
+    tracing::error!("Usage stats query failed: {e}");
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(serde_json::json!({ "error": e.to_string() })),
@@ -662,28 +704,28 @@ fn internal_err(e: &anyhow::Error) -> Response {
         .into_response()
 }
 
-/// 管理端点鉴权失败统一响应
+/// Unified response for admin endpoint auth failure
 fn admin_denied() -> Response {
     (
         StatusCode::UNAUTHORIZED,
-        Json(serde_json::json!({ "ok": false, "message": "unauthorized: 管理端点需要 API key（config.json api_keys），本地未配置时仅本机可访问" })),
+        Json(serde_json::json!({ "ok": false, "message": "unauthorized: admin endpoints require an API key (config.json api_keys); when not configured locally, only local machine access is allowed" })),
     )
         .into_response()
 }
 
-/// 跨站 Origin 拦截响应（CSRF 防线）：403 Forbidden，语义区别于未认证 401
+/// Cross-site Origin blocked response (CSRF defense): 403 Forbidden, semantically distinct from unauthenticated 401
 fn origin_blocked() -> Response {
     (
         StatusCode::FORBIDDEN,
-        Json(serde_json::json!({ "error": { "message": "cross-site request blocked (CSRF): 浏览器跨站请求被拒绝", "type": "forbidden" } })),
+        Json(serde_json::json!({ "error": { "message": "cross-site request blocked (CSRF): browser cross-site request was rejected", "type": "forbidden" } })),
     )
         .into_response()
 }
 
-/// web 版完整对话代理（Cookie 鉴权 chat/stream → 真实增量 SSE 透传 → OpenAI 兼容）
-/// POST /v1/web/chat — body: { model, content, thread_id?, images? }
-/// images 支持两种形态：["storageId1", ...] 或 [{ storageId, mediaType?, name? }, ...]
-/// 鉴权与 /v1/chat/completions 一致：配置 api_keys 时校验；未配置时仅本机可访问。
+/// Full web-version chat proxy (Cookie auth chat/stream -> real incremental SSE passthrough -> OpenAI-compatible)
+/// POST /v1/web/chat -- body: { model, content, thread_id?, images? }
+/// images supports two shapes: ["storageId1", ...] or [{ storageId, mediaType?, name? }, ...]
+/// Auth is consistent with /v1/chat/completions: verified when api_keys is configured; only local access allowed when not configured.
 async fn handle_web_chat(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -703,19 +745,19 @@ async fn handle_web_chat(
     if keys.is_empty() && !is_loopback_request(&headers) {
         return admin_denied();
     }
-    // v0.9 §1.1：从 WebCookiePool 挑选（多账号健康/冷却/轮询）
+    // v0.9 §1.1: pick from WebCookiePool (multi-account health/cooldown/round-robin)
     let (cookie, web_cid) = match pick_web_cookie(&st).await {
         Some((c, _, cid)) => (c, Some(cid)),
         None => (String::new(), None),
     };
     let cookie = if cookie.is_empty() {
-        // v0.10 §1.4：池非空但全部冷却 → 结构化降级；否则保留"未导入"文案
+        // v0.10 §1.4: pool is non-empty but all on cooldown -> structured degradation; otherwise keep the "not imported" message
         if st.web_pool.count().await > 0 {
             return web_pool_exhausted(&st).await;
         }
         return (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": { "message": "未导入 web Cookie 凭证。请 POST /api/tokens/import 粘贴 Cookie", "type": "invalid_request_error" } })),
+            Json(serde_json::json!({ "error": { "message": "No web Cookie credential imported. Please POST /api/tokens/import with the Cookie", "type": "invalid_request_error" } })),
         )
             .into_response();
     } else {
@@ -746,7 +788,7 @@ async fn handle_web_chat(
         .and_then(|t| t.as_str())
         .map(|s| s.to_string());
     let reasoning_effort = parsed.get("reasoning_effort").and_then(|r| r.as_str());
-    // 多模态：解析 images（storageId 字符串数组或对象数组）
+    // Multimodal: parse images (array of storageId strings or array of objects)
     let images: Vec<crate::web_protocol::WebImage> = parsed
         .get("images")
         .and_then(|v| v.as_array())
@@ -793,7 +835,7 @@ async fn handle_web_chat(
     }
 
     let images_count = images.len();
-    // 文档/文件附件（attachments）：storageId 字符串或对象数组
+    // Document/file attachments: storageId string or array of objects
     let attachments: Vec<crate::web_protocol::WebAttachment> = parsed
         .get("attachments")
         .and_then(|v| v.as_array())
@@ -836,7 +878,7 @@ async fn handle_web_chat(
         Ok(c) => c,
         Err(e) => return internal_err(&anyhow::Error::msg(e.to_string())),
     };
-    // 真实增量流：上游 chat/stream SSE 逐事件实时转发为 OpenAI chunk（images 透传多模态）
+    // Real incremental stream: forwards the upstream chat/stream SSE event-by-event in real time as OpenAI chunks (images passed through for multimodal)
     match client
         .chat_stream_raw(
             thread_id.as_deref(),
@@ -848,11 +890,11 @@ async fn handle_web_chat(
         .await
     {
         Ok(body) => {
-            // v0.9：HTTP 层成功即记 ok
+            // v0.9: mark ok as soon as the HTTP layer succeeds
             if let Some(id) = &web_cid {
                 st.web_pool.mark_ok(id).await;
             }
-            // 遥测：旁路扫描流（首字节/字节数/usage）+ 完成后上报（web 协议用 Cookie，标记 web-cookie）
+            // Telemetry: tap the stream on the side (first byte/byte count/usage) + report after completion (web protocol uses Cookie, tagged web-cookie)
             let req_id = uuid::Uuid::new_v4().to_string();
             let (tx, rx) =
                 tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(16);
@@ -879,7 +921,7 @@ async fn handle_web_chat(
                                 tail = tail_keep(&tail, 4000);
                             }
                             if tx.send(Ok(b)).await.is_err() {
-                                break; // 客户端断开
+                                break; // client disconnected
                             }
                         }
                         Err(e) => {
@@ -928,12 +970,12 @@ async fn handle_web_chat(
                     "request",
                     Some(&req_id),
                     format!(
-                        "{model_name} web 流式完成 {bytes}B / {images_count} 图（首字节 {}ms / 总 {:.2}s）",
+                        "{model_name} web stream completed {bytes}B / {images_count} image(s) (first byte {}ms / total {:.2}s)",
                         ttft.unwrap_or(0),
                         total_ms as f64 / 1000.0
                     ),
                 );
-                // 记录上游 threadId（供会话清理，防止长期堆积给上游制造压力/暴露指纹）
+                // Record the upstream threadId (for session cleanup, to prevent long-term buildup from stressing the upstream / exposing a fingerprint)
                 if let Some(tid) = client_track.last_thread_id() {
                     record_thread(&threads_path, &tid);
                 }
@@ -950,7 +992,7 @@ async fn handle_web_chat(
                 .unwrap_or_default()
         }
         Err(e) => {
-            // v0.9：401/403/网络失败 → 池内降分/熔断/冷却，下个请求自动换号
+            // v0.9: 401/403/network failure -> lower the score in the pool / circuit break / cooldown; the next request automatically switches accounts
             if let Some(id) = &web_cid {
                 web_pool_failure(&st, id, &e.to_string()).await;
             }
@@ -966,20 +1008,23 @@ async fn handle_usage_models(State(st): State<AppState>, headers: HeaderMap) -> 
     Json(serde_json::json!(st.registry.models().await)).into_response()
 }
 
-// ---------- Web 协议桥接（OpenAI/Anthropic 客户端 → freebuff.com /api/chat/stream） ----------
+// ---------- Web protocol bridge (OpenAI/Anthropic client -> freebuff.com /api/chat/stream) ----------
 
-/// 桥接决策：复用既有 thread 还是新开一个
+/// Bridge decision: reuse an existing thread or open a new one
 enum BridgeMode {
-    /// 续聊：复用绑定的 thread，只发最后一条用户消息
+    /// Continue: reuse the bound thread, only send the last user message
     Continue { thread_id: String },
-    /// 新会话：发完整上下文（摊平后的 transcript）
+    /// Fresh session: send the full context (flattened transcript)
     Fresh { prompt: String },
 }
 
-/// 按会话绑定决定本轮怎么发。
-/// 启发式：客户端 messages 里出现 assistant 消息 = 多轮对话的后续轮次，且已有绑定 → 复用 thread 只发增量；
-/// 否则新开会话发全文。为什么必须复用：上游每日按**会话准入**计数（rateLimitsByModel.limit，免费 6 次/天），
-/// 每请求都开新 thread 会迅速烧光额度——这是"照指南填 /v1 却很快 429"的直接原因。
+/// Decides how to send this round based on the session binding.
+/// Heuristic: an assistant message appearing in the client's messages = a follow-up turn in a multi-turn
+/// conversation, and there's already a binding -> reuse the thread and only send the increment;
+/// otherwise open a fresh session and send the full text. Why reuse is required: the upstream counts by
+/// **session admission** per day (rateLimitsByModel.limit, 6/day on the free tier), and opening a new thread on
+/// every request quickly burns through the quota -- this is the direct cause of "followed the guide to hit /v1
+/// and got 429 almost immediately".
 fn decide_bridge_mode(
     map: &crate::web_threads::WebThreadMap,
     cred_id: &str,
@@ -1009,8 +1054,8 @@ fn decide_bridge_mode(
     Some((BridgeMode::Fresh { prompt: full.0 }, last_user))
 }
 
-/// OpenAI `/v1/chat/completions` 桥接到 web 协议（账号池为空、仅有 web Cookie 时启用）。
-/// `parsed` 是原始请求体（含 messages/stream），`model` 已过路由解析。
+/// Bridges OpenAI `/v1/chat/completions` to the web protocol (enabled when the account pool is empty and only a web Cookie is available).
+/// `parsed` is the raw request body (with messages/stream), `model` has already gone through route resolution.
 async fn web_bridge_openai(
     st: AppState,
     parsed: serde_json::Value,
@@ -1031,7 +1076,7 @@ async fn web_bridge_openai(
         .cloned()
         .unwrap_or_else(|| serde_json::json!([]));
 
-    // 记忆/技能注入（与桌面协议同管线），再摊平为 web 协议 content
+    // Memory/skill injection (same pipeline as the desktop protocol), then flattened into web protocol content
     let mut effective = messages.clone();
     let mem_query: String = crate::web_threads::flatten_messages(&messages, true)
         .map(|(_, l)| l.chars().take(200).collect())
@@ -1051,16 +1096,17 @@ async fn web_bridge_openai(
         None => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": { "message": "messages 里没有可发送的用户内容", "type": "invalid_request_error" } })),
+                Json(serde_json::json!({ "error": { "message": "no sendable user content found in messages", "type": "invalid_request_error" } })),
             )
                 .into_response();
         }
     };
 
-    // v0.8 双桶并发信号量：桥接路径同样在首字节写出前 acquire（保守：web 凭证默认免费桶，
-    // 若含套餐字段则订阅桶）。guard 由后台转发任务持有到流结束。
+    // v0.8 dual-bucket concurrency semaphore: the bridge path also acquires before the first byte is written out
+    // (conservative: web credentials default to the free bucket, the subscription bucket if a plan field is
+    // present). The guard is held by the background forwarding task until the stream ends.
     let bridge_is_sub = crate::semaphore::is_subscriber_token(&cookie, None);
-    // 测试钩子：FREEBUFF2API_WEB_HOST 可覆盖上游 host（生产保持 WEB_HOST 默认）
+    // Test hook: FREEBUFF2API_WEB_HOST can override the upstream host (production keeps the WEB_HOST default)
     let web_host = std::env::var("FREEBUFF2API_WEB_HOST")
         .unwrap_or_else(|_| crate::web_protocol::WEB_HOST.to_string());
     let client = match crate::web_protocol::WebClient::with_host(cookie, model.clone(), &web_host) {
@@ -1075,12 +1121,12 @@ async fn web_bridge_openai(
                 .record_ex("web-cookie", &model, 0, 0, ms, 429, "", "", &req_id)
                 .ok();
             st.telemetry
-                .event(&req_id, "concurrency_busy", "桥接并发桶已满");
+                .event(&req_id, "concurrency_busy", "bridge concurrency bucket full");
             st.logs.emit(
                 "warn",
                 "request",
                 Some(&req_id),
-                format!("{model} 桥接并发桶已满，返回 429"),
+                format!("{model} bridge concurrency bucket full, returning 429"),
             );
             return (
                 StatusCode::TOO_MANY_REQUESTS,
@@ -1119,14 +1165,14 @@ async fn web_bridge_openai(
         .await;
     let body = match upstream {
         Ok(b) => {
-            // v0.9：HTTP 层成功（200）即记 ok；中途断流由后续重试经冷却/降分兜底
+            // v0.9: mark ok as soon as the HTTP layer succeeds (200); a mid-stream drop is caught later via cooldown/score-lowering on retry
             st.web_pool.mark_ok(&cid).await;
             b
         }
         Err(e) => {
-            // v0.9：401/403/网络失败 → 池内降分/熔断/冷却，下个请求自动换号
+            // v0.9: 401/403/network failure -> lower the score in the pool / circuit break / cooldown; the next request automatically switches accounts
             web_pool_failure(&st, &cid, &e.to_string()).await;
-            // 绑定的 thread 可能已被上游清理 → 清绑定，客户端重试即自动新开会话
+            // The bound thread may have already been cleaned up upstream -> clear the binding, so a client retry automatically opens a fresh session
             if matches!(mode, BridgeMode::Continue { .. }) {
                 let _ = st.web_threads.clear(&cid);
                 st.telemetry.event(&req_id, "thread_reset", &e.to_string());
@@ -1165,13 +1211,13 @@ async fn web_bridge_openai(
             });
             return (
                 StatusCode::BAD_GATEWAY,
-                Json(serde_json::json!({ "error": { "message": format!("上游 web 协议请求失败：{e}"), "type": "server_error" } })),
+                Json(serde_json::json!({ "error": { "message": format!("Upstream web protocol request failed: {e}"), "type": "server_error" } })),
             )
                 .into_response();
         }
     };
 
-    // 旁路扫描：转发字节 + 绑定 threadId + usage 统计（与非桥接路径同一套遥测）
+    // Side-channel scan: forward bytes + bind threadId + usage stats (same telemetry as the non-bridge path)
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(16);
     let telem = st.telemetry.clone();
     let usage_db = st.usage.clone();
@@ -1183,14 +1229,14 @@ async fn web_bridge_openai(
     let model_track = model.clone();
     let requested_track = requested.clone();
     let req_id_track = req_id.clone();
-    // token 估算输入（上游 web 协议 SSE 不携带 usage，只能本地估算——见 estimate_tokens）
+    // Token estimation input (the upstream web protocol SSE doesn't carry usage, so it can only be estimated locally -- see estimate_tokens)
     let est_input_chars: usize = match &mode {
         BridgeMode::Continue { thread_id: _ } => last_user.chars().count(),
         BridgeMode::Fresh { prompt } => prompt.chars().count(),
     };
     let est_input_track = est_input_chars;
     tokio::spawn(async move {
-        let _bridge_guard_keep = bridge_guard; // 桥接流期间持有并发 permit，任务结束 Drop 归还
+        let _bridge_guard_keep = bridge_guard; // holds the concurrency permit for the duration of the bridge stream; returned via Drop when the task ends
         let mut stream_ = body.into_data_stream();
         let mut ttft: Option<u64> = None;
         let mut bytes: u64 = 0;
@@ -1207,7 +1253,7 @@ async fn web_bridge_openai(
                         tail = tail_keep(&tail, 4000);
                     }
                     if tx.send(Ok(b)).await.is_err() {
-                        break; // 客户端断开
+                        break; // client disconnected
                     }
                 }
                 Err(e) => {
@@ -1217,14 +1263,15 @@ async fn web_bridge_openai(
             }
         }
         let total_ms = start.elapsed().as_millis() as u64;
-        // threadId 绑定：供续聊复用（省每日会话额度）；同时进全局清理清单
+        // threadId binding: for reuse on continued chats (saves daily session quota); also added to the global cleanup list
         if let Some(tid) = client_track.last_thread_id() {
             let _ = web_threads.bind(&cid_track, &tid, &bound_track);
             record_thread(&threads_path, &tid);
         }
-        // token 记账：上游 web SSE 不给 usage（done 事件为空），优先解析 usage 字段，
-        // 没有则按内容长度估算（输入=发出内容，输出=转换后 chunk 里的正文），
-        // 保证面板/统计不再永远显示 0——估算值以 `~` 前缀语义记录（见 estimate_tokens 注释）。
+        // Token accounting: the upstream web SSE doesn't provide usage (the done event is empty), so parse the
+        // usage field if present, otherwise estimate from content length (input = content sent, output = body in
+        // the converted chunks), so the panel/stats stop showing 0 forever -- estimated values are recorded with a
+        // `~` prefix (see the estimate_tokens comment).
         let (pt, ct) = match extract_usage(&tail) {
             Some(v) => v,
             None => {
@@ -1232,8 +1279,8 @@ async fn web_bridge_openai(
                 (estimate_tokens(est_input_track), estimate_tokens(out_chars))
             }
         };
-        // 桥接流内嵌错误识别（Critic-J P2-1 闭环）：优先用 StreamEncoder 旁路槽
-        // （能看到上游原始 error envelope），tail 扫描 detect_bridge_error 作兜底。
+        // Detecting inline errors in the bridge stream (Critic-J P2-1 closure): prefer the StreamEncoder side
+        // channel (which can see the raw upstream error envelope), with tail-scan detect_bridge_error as a fallback.
         let bypass_error = client_track.last_upstream_error();
         let bridge_kind = bypass_error
             .as_deref()
@@ -1251,7 +1298,7 @@ async fn web_bridge_openai(
                 status,
                 bridge_kind.unwrap_or(""),
                 bridge_kind
-                    .map(|k| format!("上游桥接流内嵌错误（{k}）：凭证可能失效或额度耗尽"))
+                    .map(|k| format!("Upstream bridge stream inline error ({k}): credential may be invalid or quota exhausted"))
                     .as_deref()
                     .unwrap_or(""),
                 &req_id_track,
@@ -1293,19 +1340,19 @@ async fn web_bridge_openai(
         .unwrap_or_default()
 }
 
-/// 桥接路径完成日志（后台任务收尾时调用，避免闭包捕获整个 AppState）
+/// Bridge path completion log (called at the end of the background task, to avoid the closure capturing the whole AppState)
 fn st_logs_done(telem: &TelemetryWriter, req_id: &str, model: &str, bytes: u64, total_ms: u128) {
     telem.event(
         req_id,
         "done",
-        &format!("web bridge {model}：{bytes}B / {total_ms}ms"),
+        &format!("web bridge {model}: {bytes}B / {total_ms}ms"),
     );
 }
 
-/// 识别桥接 SSE 流中的上游内嵌错误（200 内嵌 error envelope）。
-/// 返回 Some(kind) 表示流里出现了错误（对齐 `errors::classify` 的 kind 命名）。
+/// Detects an upstream inline error in the bridge SSE stream (a 200 with an embedded error envelope).
+/// Returns Some(kind) if an error appeared in the stream (aligned with `errors::classify`'s kind naming).
 fn detect_bridge_error(tail: &str) -> Option<&'static str> {
-    // 快路径：无引号 error 字样直接放行（避免对每行做 JSON 解析）
+    // Fast path: no quoted "error" text, pass through directly (avoid JSON-parsing every line)
     if !tail.contains("\"error\"") {
         return None;
     }
@@ -1332,10 +1379,10 @@ fn detect_bridge_error(tail: &str) -> Option<&'static str> {
     None
 }
 
-/// 桥接响应的 OpenAI→Claude 形状适配（/v1/messages 桥接路径用）。
-/// - 非流式 JSON：直接用现有 `openai_to_claude_response` 转换
-/// - SSE 流：实时把 OpenAI chunk 流转成 Anthropic 事件流（message_start → content_block_delta → message_stop）
-/// - 错误 JSON：转 Claude error 形状
+/// Adapts a bridge response's OpenAI shape to Claude's (used by the /v1/messages bridge path).
+/// - Non-streaming JSON: converted directly with the existing `openai_to_claude_response`
+/// - SSE stream: converts OpenAI chunks into an Anthropic event stream in real time (message_start -> content_block_delta -> message_stop)
+/// - Error JSON: converted into Claude's error shape
 async fn openai_error_to_claude(resp: Response, model: &str) -> Response {
     let (mut parts, body) = resp.into_parts();
     if !model.is_empty() {
@@ -1353,8 +1400,8 @@ async fn openai_error_to_claude(resp: Response, model: &str) -> Response {
         .to_string();
     let status = parts.status;
 
-    // SSE：整条收完再一次性转换（桥接流通常几秒内结束，聚合实现简单且正确；
-    // chunk 级实时转换留作后续优化）
+    // SSE: buffer the whole thing and convert it in one shot (the bridge stream usually finishes within a few
+    // seconds, so aggregating is simple and correct; chunk-level real-time conversion is left as a future optimization)
     if ct.contains("text/event-stream") {
         let bytes = axum::body::to_bytes(body, 8 * 1024 * 1024)
             .await
@@ -1375,10 +1422,10 @@ async fn openai_error_to_claude(resp: Response, model: &str) -> Response {
             .header("content-type", "text/event-stream; charset=utf-8")
             .header("cache-control", "no-cache")
             .body(Body::from(events))
-            .unwrap_or_default(); // model 兜底已从 x-bridge-model 头读取
+            .unwrap_or_default(); // model fallback already read from the x-bridge-model header
     }
 
-    // JSON（成功或错误）
+    // JSON (success or error)
     let bytes = axum::body::to_bytes(body, 8 * 1024 * 1024)
         .await
         .unwrap_or_default();
@@ -1387,7 +1434,7 @@ async fn openai_error_to_claude(resp: Response, model: &str) -> Response {
         Err(_) => {
             return (
                 StatusCode::BAD_GATEWAY,
-                Json(serde_json::json!({ "type": "error", "error": { "type": "api_error", "message": "桥接响应不是合法 JSON" } })),
+                Json(serde_json::json!({ "type": "error", "error": { "type": "api_error", "message": "bridge response is not valid JSON" } })),
             )
                 .into_response();
         }
@@ -1396,7 +1443,7 @@ async fn openai_error_to_claude(resp: Response, model: &str) -> Response {
         let msg = err
             .get("message")
             .and_then(|m| m.as_str())
-            .unwrap_or("上游错误");
+            .unwrap_or("upstream error");
         let code = if status == StatusCode::UNAUTHORIZED {
             "authentication_error"
         } else {
@@ -1416,7 +1463,7 @@ async fn openai_error_to_claude(resp: Response, model: &str) -> Response {
     Json(openai_to_claude_response(&v, &model)).into_response()
 }
 
-/// 从聚合好的 OpenAI SSE 文本抽取（正文, 模型, finish_reason, usage）
+/// Extracts (body text, model, finish_reason, usage) from aggregated OpenAI SSE text
 fn collect_openai_stream(raw: &str) -> (String, String, Option<String>, Option<serde_json::Value>) {
     let mut text = String::new();
     let mut model = String::new();
@@ -1461,7 +1508,7 @@ fn collect_openai_stream(raw: &str) -> (String, String, Option<String>, Option<s
     (text, model, finish, usage)
 }
 
-/// 生成完整的 Anthropic 事件流文本（message_start → content_block_delta×N → message_stop）
+/// Generates the full Anthropic event stream text (message_start -> content_block_delta x N -> message_stop)
 fn claude_stream_events(
     text: &str,
     model: &str,
@@ -1505,12 +1552,12 @@ fn claude_stream_events(
         "content_block_start",
         serde_json::json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "text", "text": "" } }),
     );
-    // 按 512 字节切片推 delta，保持"流式"语义（长回答不至于一次性砸给客户端）
+    // Push deltas in 512-byte slices to preserve "streaming" semantics (so a long answer isn't dumped on the client all at once)
     let bytes = text.as_bytes();
     let mut i = 0usize;
     while i < bytes.len() {
         let mut end = (i + 512).min(bytes.len());
-        // 不切断多字节字符
+        // don't cut a multi-byte character in half
         while end < bytes.len() && (bytes[end] & 0xC0) == 0x80 {
             end += 1;
         }
@@ -1545,8 +1592,8 @@ fn claude_stream_events(
     out
 }
 
-/// 把上游 SSE（OpenAI chunk 文本）聚合为单个非流式 OpenAI 响应。
-/// 拼回 `data: {...}` 行里的 delta，攒成完整 content；失败（上游 JSON 错误）转为 502。
+/// Aggregates the upstream SSE (OpenAI chunk text) into a single non-streaming OpenAI response.
+/// Reassembles deltas from `data: {...}` lines into full content; failure (upstream JSON error) becomes a 502.
 async fn aggregate_bridge_sse(
     mut stream: impl futures::Stream<Item = Result<axum::body::Bytes, std::io::Error>> + Unpin,
     model: &str,
@@ -1559,7 +1606,7 @@ async fn aggregate_bridge_sse(
             Err(e) => {
                 return (
                     StatusCode::BAD_GATEWAY,
-                    Json(serde_json::json!({ "error": { "message": format!("上游流中断：{e}"), "type": "server_error" } })),
+                    Json(serde_json::json!({ "error": { "message": format!("Upstream stream interrupted: {e}"), "type": "server_error" } })),
                 )
                     .into_response();
             }
@@ -1583,7 +1630,7 @@ async fn aggregate_bridge_sse(
             let msg = err
                 .get("message")
                 .and_then(|m| m.as_str())
-                .unwrap_or("上游错误");
+                .unwrap_or("upstream error");
             return (
                 StatusCode::BAD_GATEWAY,
                 Json(serde_json::json!({ "error": { "message": msg, "type": "server_error" } })),
@@ -1611,7 +1658,7 @@ async fn aggregate_bridge_sse(
     if content.is_empty() && finish_reason.is_none() {
         return (
             StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({ "error": { "message": "上游未返回任何内容（凭证可能已失效，请在面板重新登录）", "type": "server_error" } })),
+            Json(serde_json::json!({ "error": { "message": "Upstream returned no content (credential may have expired, please log in again from the panel)", "type": "server_error" } })),
         )
             .into_response();
     }
@@ -1649,7 +1696,7 @@ async fn handle_accounts(State(st): State<AppState>, headers: HeaderMap) -> Resp
     if !admin_authorized(&headers, &st) {
         return admin_denied();
     }
-    // v0.9：Bearer 池快照保持原字段兼容；web Cookie 凭证并入展示（含健康字段，契约见 WebAccountSnapshot）
+    // v0.9: the Bearer pool snapshot keeps its original field compatibility; web Cookie credentials are merged into the display (with health fields, see WebAccountSnapshot for the contract)
     let pool_snap = st.pool.snapshot().await;
     let web_snap = st.web_pool.snapshot().await;
     let mut json = serde_json::to_value(&pool_snap)
@@ -1664,9 +1711,9 @@ async fn handle_accounts(State(st): State<AppState>, headers: HeaderMap) -> Resp
     Json(json).into_response()
 }
 
-/// GET /api/accounts/health — 账号健康看板（Bearer + web Cookie 合并，含历史时间线）。
+/// GET /api/accounts/health -- account health dashboard (Bearer + web Cookie merged, with a history timeline).
 ///
-/// 字段名即前端契约（v0.9 任务 B §4，勿改名）：
+/// Field names are the frontend contract (v0.9 task B §4, do not rename):
 /// `{ok, accounts:[{id, kind:"bearer"|"web-cookie", masked, health_score, circuit_state,
 ///   cooldown_until, trips, last_error, last_ok_at, history:[{ts,type,detail}]}]}`
 async fn handle_accounts_health(State(st): State<AppState>, headers: HeaderMap) -> Response {
@@ -1675,7 +1722,7 @@ async fn handle_accounts_health(State(st): State<AppState>, headers: HeaderMap) 
     }
     let mut accounts: Vec<serde_json::Value> = Vec::new();
 
-    // Bearer：从池内读实时熔断/评分（cooldown 换算 RFC3339 与 web 一致）
+    // Bearer: read live circuit-breaker/score state from the pool (cooldown converted to RFC3339, consistent with web)
     {
         let pool_accounts = st.pool.accounts.lock().await;
         for acc in pool_accounts.iter() {
@@ -1708,7 +1755,7 @@ async fn handle_accounts_health(State(st): State<AppState>, headers: HeaderMap) 
         }
     }
 
-    // web Cookie：直接来自 WebCookiePool.snapshot()
+    // web Cookie: taken directly from WebCookiePool.snapshot()
     for w in st.web_pool.snapshot().await {
         accounts.push(serde_json::json!({
             "id": w.id,
@@ -1726,8 +1773,8 @@ async fn handle_accounts_health(State(st): State<AppState>, headers: HeaderMap) 
     Json(serde_json::json!({ "ok": true, "accounts": accounts })).into_response()
 }
 
-/// 账号历史时间线：读 account_history.jsonl（AccountMetaStore.history，最新在前），
-/// 映射为前端时间线事件 `{ts, type, detail}`（type: "ok" | "error"）。
+/// Account history timeline: reads account_history.jsonl (AccountMetaStore.history, newest first),
+/// mapped into frontend timeline events `{ts, type, detail}` (type: "ok" | "error").
 fn account_history_timeline(st: &AppState, cred_id: &str, limit: usize) -> Vec<serde_json::Value> {
     st.meta
         .history(Some(cred_id), limit)
@@ -1737,25 +1784,25 @@ fn account_history_timeline(st: &AppState, cred_id: &str, limit: usize) -> Vec<s
         .map(|r| {
             let ty = if r.ok { "ok" } else { "error" };
             let detail = if r.ok {
-                let mut parts = vec!["检查通过".to_string()];
+                let mut parts = vec!["check passed".to_string()];
                 if let Some(t) = &r.tier_id {
                     parts.push(format!("tier={t}"));
                 }
                 if let Some(rem) = r.daily_remaining {
-                    parts.push(format!("今日剩余 {rem}"));
+                    parts.push(format!("{rem} remaining today"));
                 }
                 parts.join(" · ")
             } else {
-                "检查失败（凭证不可用或上游拒绝）".to_string()
+                "check failed (credential unavailable or rejected by upstream)".to_string()
             };
             serde_json::json!({ "ts": r.ts, "type": ty, "detail": detail })
         })
         .collect()
 }
 
-// ---------- Token 导入（curl / HAR 自动解析入库） ----------
+// ---------- Token import (auto-parses a curl command or HAR into storage) ----------
 
-/// POST /api/tokens/import — body 传 curl 命令文本或 HAR JSON，自动提取 Bearer token 入库
+/// POST /api/tokens/import -- body is a curl command's text or HAR JSON; automatically extracts and stores the Bearer token
 async fn handle_token_import(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -1769,12 +1816,12 @@ async fn handle_token_import(
         Err(_) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "ok": false, "message": "输入不是合法 UTF-8 文本" })),
+                Json(serde_json::json!({ "ok": false, "message": "input is not valid UTF-8 text" })),
             )
                 .into_response();
         }
     };
-    // 兼容 JSON 包裹：{"cookie": "..."} / {"text": "..."}（面板两种提交方式都支持）
+    // Also accepts a JSON wrapper: {"cookie": "..."} / {"text": "..."} (both panel submission methods are supported)
     let text: std::borrow::Cow<'_, str> = if raw.trim_start().starts_with('{') {
         serde_json::from_str::<serde_json::Value>(raw)
             .ok()
@@ -1802,12 +1849,14 @@ async fn handle_token_import(
     match crate::import::persist_tokens(&tokens_path, &tokens) {
         Ok(added) => {
             if added.is_empty() {
-                return Json(serde_json::json!({ "ok": true, "added": 0, "message": "token 已存在，未重复添加" }))
+                return Json(serde_json::json!({ "ok": true, "added": 0, "message": "token already exists, not added again" }))
                     .into_response();
             }
-            // 热更新到账号池。
-            // 注意：web-cookie（session-token）凭证**不入池**——账号池走的是桌面版 Bearer 协议，
-            // 把 Cookie 塞进去会被当成 Bearer 打上游必失败并熔断；web Cookie 由 web 桥接路径使用。
+            // Hot-update into the account pool.
+            // Note: web-cookie (session-token) credentials **are not added to the pool** -- the account pool uses
+            // the desktop Bearer protocol, and stuffing a Cookie in there would be treated as a Bearer token,
+            // which is guaranteed to fail upstream and trip the circuit breaker; web Cookies are used by the web
+            // bridge path instead.
             let new_accounts: Vec<crate::pool::AccountEntry> = added
                 .iter()
                 .filter(|t| !t.token.contains("session-token"))
@@ -1823,11 +1872,11 @@ async fn handle_token_import(
                     breaker: tokio::sync::RwLock::new(crate::pool::CircuitBreaker::new()),
                 })
                 .collect();
-            // 非 Bearer 凭证（web-cookie）不入 Bearer 池，但仍计入"导入成功"响应
+            // Non-Bearer credentials (web-cookie) don't go into the Bearer pool, but still count toward the "import successful" response
             for acc in new_accounts {
                 st.pool.add_account(acc).await;
             }
-            // v0.9：web Cookie 凭证进入 WebCookiePool（健康/熔断/冷却/轮询）
+            // v0.9: web Cookie credentials go into WebCookiePool (health/circuit-breaking/cooldown/round-robin)
             for t in added.iter().filter(|t| t.token.contains("session-token")) {
                 st.web_pool
                     .add_if_absent(&t.token, &t.source, t.added_at.clone())
@@ -1853,7 +1902,7 @@ async fn handle_token_import(
     }
 }
 
-/// GET /api/tokens — 列出已入库 token（脱敏 + 稳定 id + 账号信息缓存 + 入库时间）
+/// GET /api/tokens -- list stored tokens (redacted + stable id + account info cache + storage timestamp)
 async fn handle_tokens_list(State(st): State<AppState>, headers: HeaderMap) -> Response {
     if !admin_authorized(&headers, &st) {
         return admin_denied();
@@ -1874,7 +1923,7 @@ async fn handle_tokens_list(State(st): State<AppState>, headers: HeaderMap) -> R
                         "method": t.method,
                         "added_at": t.added_at,
                         "kind": crate::import::kind_of(&t.token),
-                        // 最近一次拉取到的账号信息（昵称/邮箱/套餐/今日剩余）；从未拉取过则为 null
+                        // Account info from the most recent fetch (nickname/email/plan/remaining today); null if never fetched
                         "meta": metas.get(&id),
                     })
                 })
@@ -1890,7 +1939,7 @@ async fn handle_tokens_list(State(st): State<AppState>, headers: HeaderMap) -> R
     }
 }
 
-/// POST /api/tokens/check — body `{"id":"<凭证id>"}`：对指定凭证拉取账号全貌并刷新缓存
+/// POST /api/tokens/check -- body `{"id":"<credential id>"}`: fetches the full account picture for the given credential and refreshes the cache
 async fn handle_token_check(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -1904,11 +1953,11 @@ async fn handle_token_check(
         .and_then(|v| v.get("id").and_then(|x| x.as_str()).map(String::from))
     {
         Some(v) if !v.is_empty() => v,
-        _ => return bad_req("缺少 id 参数（凭证列表里的 id 字段）"),
+        _ => return bad_req("missing id parameter (the id field from the credentials list)"),
     };
     let (cookie, tok) = match cookie_by_id(&st, &id) {
         Some(v) => v,
-        None => return bad_req("未找到该凭证（可能已被删除，请刷新列表）"),
+        None => return bad_req("credential not found (it may have been deleted, please refresh the list)"),
     };
     let client = match crate::web_protocol::WebClient::new(cookie, "glm-5.3-flash".into()) {
         Ok(c) => c,
@@ -1934,19 +1983,19 @@ async fn handle_token_check(
                 .err()
                 .map(|e| e.to_string())
                 .or_else(|| quota.as_ref().err().map(|e| e.to_string()))
-                .unwrap_or_else(|| "上游未返回登录账号（凭证已失效或未登录）".into()),
+                .unwrap_or_else(|| "upstream returned no logged-in account (credential expired or not logged in)".into()),
         );
     }
     if let Err(e) = st.meta.upsert(meta.clone()) {
-        tracing::warn!("写入账号信息缓存失败: {e}");
+        tracing::warn!("Failed to write account info cache: {e}");
     }
     record_history(&st, &meta, ok);
-    // v0.9：web Cookie 凭证同步池健康（401/403/不可用 → 熔断冷却，自动换号）
+    // v0.9: sync web Cookie credential health into the pool (401/403/unavailable -> circuit break + cooldown, auto account switch)
     if crate::import::kind_of(&tok.token) == "web-cookie" {
         if ok {
             st.web_pool.mark_ok(&id).await;
         } else {
-            web_pool_failure(&st, &id, meta.error.as_deref().unwrap_or("凭证检查失败")).await;
+            web_pool_failure(&st, &id, meta.error.as_deref().unwrap_or("credential check failed")).await;
         }
     }
     st.logs.emit(
@@ -1954,9 +2003,9 @@ async fn handle_token_check(
         "account",
         None,
         format!(
-            "凭证检查 {}：{}",
+            "Credential check {}: {}",
             mask(&tok.token),
-            if ok { "有效" } else { "可能已失效" }
+            if ok { "valid" } else { "may have expired" }
         ),
     );
     Json(serde_json::json!({
@@ -1964,12 +2013,12 @@ async fn handle_token_check(
         "valid": ok,
         "id": id,
         "meta": meta,
-        "message": if ok { "凭证有效，账号信息已更新".to_string() } else { meta.error.clone().unwrap_or_else(|| "凭证可能已失效".into()) },
+        "message": if ok { "Credential is valid, account info updated".to_string() } else { meta.error.clone().unwrap_or_else(|| "credential may have expired".into()) },
     }))
     .into_response()
 }
 
-/// POST /api/tokens/delete — body `{"id":"<凭证id>"}`：删除凭证（落盘 + 内存账号池 + 缓存）
+/// POST /api/tokens/delete -- body `{"id":"<credential id>"}`: deletes the credential (disk + in-memory account pool + cache)
 async fn handle_token_delete(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -1983,12 +2032,12 @@ async fn handle_token_delete(
         .and_then(|v| v.get("id").and_then(|x| x.as_str()).map(String::from))
     {
         Some(v) if !v.is_empty() => v,
-        _ => return bad_req("缺少 id 参数（凭证列表里的 id 字段）"),
+        _ => return bad_req("missing id parameter (the id field from the credentials list)"),
     };
     match crate::import::delete_token(&st.cfg.tokens_path, &id) {
         Ok(Some(removed)) => {
             let in_pool = st.pool.remove_account(&removed.token).await;
-            // v0.9：web Cookie 凭证同时从 WebCookiePool 移除
+            // v0.9: also remove the web Cookie credential from WebCookiePool
             if crate::import::kind_of(&removed.token) == "web-cookie" {
                 let _ = st.web_pool.remove(&id).await;
             }
@@ -1997,24 +2046,24 @@ async fn handle_token_delete(
                 "warn",
                 "account",
                 None,
-                format!("已删除凭证 {}", mask(&removed.token)),
+                format!("Deleted credential {}", mask(&removed.token)),
             );
             Json(serde_json::json!({
                 "ok": true,
                 "removed": mask(&removed.token),
                 "removed_from_pool": in_pool,
-                "message": if in_pool { "凭证已删除（含运行中的账号池）" } else { "凭证已删除" },
+                "message": if in_pool { "Credential deleted (including from the running account pool)" } else { "Credential deleted" },
             }))
             .into_response()
         }
         Ok(None) => (
             StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "ok": false, "message": "未找到该凭证（可能已被删除）" })),
+            Json(serde_json::json!({ "ok": false, "message": "credential not found (it may already have been deleted)" })),
         )
             .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "ok": false, "message": format!("删除失败：{e}") })),
+            Json(serde_json::json!({ "ok": false, "message": format!("delete failed: {e}") })),
         )
             .into_response(),
     }
@@ -2028,7 +2077,7 @@ struct HistoryQuery {
     limit: Option<usize>,
 }
 
-/// GET /api/account/history — 账号使用记录（按凭证可查；最新在前）
+/// GET /api/account/history -- account usage records (queryable by credential; newest first)
 async fn handle_account_history(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -2053,7 +2102,7 @@ async fn handle_account_history(
     }
 }
 
-/// GET /api/guide — 客户端接入所需的全部信息（地址 / Key 状态 / 模型数），供面板与用户直接复制
+/// GET /api/guide -- all the info needed for client setup (address / key status / model count), for the panel and users to copy directly
 async fn handle_guide(State(st): State<AppState>, headers: HeaderMap) -> Response {
     if !admin_authorized(&headers, &st) {
         return admin_denied();
@@ -2072,8 +2121,8 @@ async fn handle_guide(State(st): State<AppState>, headers: HeaderMap) -> Respons
             "count": keys.len(),
             "masked": masked,
         },
-        // 未配置 key 时给客户端填什么（本机直连场景）
-        "api_key_hint": if keys.is_empty() { "sk-local（未配置 api_keys，任意非空字符串即可）" } else { "上面显示的 Key（面板请求会自动带上）" },
+        // what to fill in for the client when no key is configured (local direct-connect scenario)
+        "api_key_hint": if keys.is_empty() { "sk-local (api_keys not configured, any non-empty string works)" } else { "the key shown above (the panel's requests attach it automatically)" },
         "models_count": models.len(),
         "models_sample": models.iter().take(8).cloned().collect::<Vec<_>>(),
         "credential": web_cookie,
@@ -2088,8 +2137,8 @@ struct KeyQuery {
     key: Option<String>,
 }
 
-/// GET /api/login/result — 读内嵌登录窗口的失败结果文件（面板 openEmbedLogin 轮询用）。
-/// 无文件/已消费即返回 ok:false（面板继续等或引导降级）。
+/// GET /api/login/result -- reads the embedded login window's failure result file (for the panel's openEmbedLogin polling).
+/// No file / already consumed returns ok:false (the panel keeps waiting or falls back).
 async fn handle_login_result(State(st): State<AppState>, headers: HeaderMap) -> Response {
     if !admin_authorized(&headers, &st) {
         return admin_denied();
@@ -2097,23 +2146,23 @@ async fn handle_login_result(State(st): State<AppState>, headers: HeaderMap) -> 
     let path = std::path::Path::new("data/login_window_result.json");
     match std::fs::read_to_string(path) {
         Ok(text) => {
-            // 读取即消费（一次性结果）
+            // read = consume (one-shot result)
             let _ = std::fs::remove_file(path);
             let v: serde_json::Value = serde_json::from_str(&text)
-                .unwrap_or(serde_json::json!({ "ok": false, "message": "结果文件损坏" }));
+                .unwrap_or(serde_json::json!({ "ok": false, "message": "result file is corrupted" }));
             Json(v).into_response()
         }
         Err(_) => Json(serde_json::json!({ "ok": false, "consumed": true })).into_response(),
     }
 }
 
-/// POST /api/login/embed — 派生内嵌 WebView2 登录窗口子进程（非阻塞）。
+/// POST /api/login/embed -- spawns an embedded WebView2 login window child process (non-blocking).
 ///
-/// 浏览器版「一键登录」的首选路径：窗口里完成 GitHub 登录后，
-/// 子进程通过 WebView2 CookieManager 抓取含 HttpOnly 的全部 Cookie 并自动 POST
-/// `/api/tokens/import` 入库，然后窗口自关。面板轮询 `/api/tokens` 感知凭证增加。
+/// The preferred path for browser "one-click login": after completing GitHub login in the window, the
+/// child process grabs the full Cookie set (including HttpOnly) via the WebView2 CookieManager and
+/// automatically POSTs it to `/api/tokens/import` for storage, then the window closes itself. The panel polls `/api/tokens` to detect the new credential.
 ///
-/// 平台支持：Windows（WebView2 Runtime）；不支持时返回 ok:false + 原因，前端降级到扩展/剪贴板/手动。
+/// Platform support: Windows (WebView2 Runtime); when unsupported, returns ok:false + a reason, and the frontend falls back to the extension/clipboard/manual import.
 async fn handle_login_embed(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -2122,7 +2171,7 @@ async fn handle_login_embed(
     if let Some(resp) = write_guard(&headers, &st) {
         return resp;
     }
-    // 解析监听端口（面板与本机网关同端口）
+    // parse the listening port (the panel shares the same port as the local gateway)
     let port = st
         .cfg
         .listen_addr
@@ -2135,31 +2184,31 @@ async fn handle_login_embed(
             "info",
             "login",
             None,
-            "内嵌 WebView2 登录窗口已弹出（等待用户完成 GitHub 登录）",
+            "Embedded WebView2 login window has opened (waiting for the user to complete GitHub login)",
         );
         Json(serde_json::json!({
             "ok": true,
-            "message": "登录窗口已弹出，完成 GitHub 登录后凭证将自动入库",
+            "message": "Login window has opened; the credential will be stored automatically after GitHub login completes",
         }))
         .into_response()
     } else {
-        // 两种失败：① 登录窗口已在运行（防重入拒绝）② 平台不支持 WebView2 / spawn 失败。
-        // 文案不预设原因，引导用户看当前状态并给出替代路径。
+        // Two failure modes: (1) a login window is already running (rejected to prevent re-entry) (2) the platform doesn't support WebView2 / spawn failed.
+        // The message doesn't assume a specific cause; it points the user to check the current state and offers an alternative path.
         (
             StatusCode::CONFLICT,
             Json(serde_json::json!({
                 "ok": false,
-                "message": "登录窗口未能启动——可能已有一个登录窗口在运行（请查看任务栏），或当前平台不支持 WebView2。可改用剪贴板/手动导入。",
+                "message": "Login window failed to start: one may already be running (check the taskbar), or this platform does not support WebView2. Use clipboard/manual import instead.",
             })),
         )
             .into_response()
     }
 }
 
-/// GET /api/extension/bundle — 下载浏览器一键登录扩展（zip）
+/// GET /api/extension/bundle -- download the browser one-click-login extension (zip)
 ///
-/// 扩展文件编译期内嵌，单文件分发（没有源码目录）时同样可用。
-/// 面板用 `window.open` 下载，浏览器不会带 Authorization 头，故同时接受 `?key=`（与日志 SSE 同一策略）。
+/// The extension file is embedded at compile time, so it still works when distributed as a single binary (no source tree present).
+/// The panel downloads it via `window.open`, and the browser won't attach an Authorization header, so this also accepts `?key=` (same strategy as the log SSE endpoint).
 async fn handle_extension_bundle(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -2190,12 +2239,12 @@ async fn handle_extension_bundle(
         .body(Body::from(zip))
     {
         Ok(r) => r,
-        Err(e) => internal_err(&anyhow::Error::msg(format!("构建下载响应失败: {e}"))),
+        Err(e) => internal_err(&anyhow::Error::msg(format!("failed to build download response: {e}"))),
     }
 }
 
 /// POST /api/config/api-key — body `{"action":"generate"|"set"|"clear","key":"..."}`
-/// 一键生成/设置/清除下游 API Key，写回 config.json **并立即热生效**（无需重启）。
+/// One-click generate/set/clear the downstream API key, written back to config.json **and takes effect immediately** (no restart needed).
 async fn handle_config_api_key(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -2206,7 +2255,7 @@ async fn handle_config_api_key(
     }
     let v: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
-        Err(_) => return bad_req("body 必须是 JSON"),
+        Err(_) => return bad_req("body must be JSON"),
     };
     let action = v
         .get("action")
@@ -2216,8 +2265,8 @@ async fn handle_config_api_key(
 
     let new_keys: Vec<String> = match action {
         "generate" => {
-            // 密码学随机（OsRng 32 字节 → 32 字符 base64url 字符集映射，192 位有效熵），
-            // 不可预测/不可枚举；UUIDv4 只有 122 位随机且格式可识别
+            // Cryptographically random (OsRng 32 bytes -> 32-character base64url charset mapping, 192 bits of effective entropy),
+            // unpredictable/unenumerable; UUIDv4 only has 122 random bits and a recognizable format
             use rand::rngs::OsRng;
             use rand::RngCore;
             const B64URL: &[u8; 64] =
@@ -2239,23 +2288,23 @@ async fn handle_config_api_key(
                 .trim()
                 .to_string();
             if k.len() < 8 {
-                return bad_req("Key 太短（至少 8 个字符）");
+                return bad_req("key is too short (at least 8 characters)");
             }
             vec![k]
         }
         "clear" => {
-            // 安全守卫：非本机监听时禁止清空（否则管理端点/凭证对网络裸奔）
+            // Safety guard: clearing is disallowed when not listening on loopback (otherwise admin endpoints/credentials are exposed to the network)
             if !crate::config::is_loopback_listen(&st.cfg.listen_addr) {
                 return bad_req(
-                    "当前监听的是非本机地址，禁止清空 API Key（否则面板与凭证会暴露给网络）",
+                    "currently listening on a non-loopback address; clearing the API key is disallowed (otherwise the panel and credentials would be exposed to the network)",
                 );
             }
             vec![]
         }
-        other => return bad_req(&format!("未知 action: {other}（支持 generate/set/clear）")),
+        other => return bad_req(&format!("unknown action: {other} (supported: generate/set/clear)")),
     };
 
-    // 持久化到 config.json（用 Value 往返合并，避免覆盖用户其他配置）
+    // Persist to config.json (round-trip merge via Value, to avoid overwriting the user's other settings)
     let path = crate::config::resolve_config_path();
     if let Some(p) = path.as_deref() {
         let mut root: serde_json::Value = std::fs::read_to_string(p)
@@ -2269,7 +2318,7 @@ async fn handle_config_api_key(
         let write_res = serde_json::to_string_pretty(&root)
             .map_err(|e| e.to_string())
             .and_then(|s| {
-                // 原子写：临时文件 + rename，防写入中途崩溃损坏 config.json
+                // Atomic write: temp file + rename, to prevent a mid-write crash from corrupting config.json
                 let tmp = format!("{p}.tmp");
                 std::fs::write(&tmp, s.clone()).map_err(|e| e.to_string())?;
                 #[cfg(windows)]
@@ -2279,11 +2328,11 @@ async fn handle_config_api_key(
                 std::fs::rename(&tmp, p).map_err(|e| e.to_string())
             });
         match write_res {
-            Ok(()) => tracing::info!("api_keys 已写回 {p}"),
-            Err(e) => tracing::warn!("api_keys 写回 {p} 失败: {e}（仅内存生效）"),
+            Ok(()) => tracing::info!("api_keys written back to {p}"),
+            Err(e) => tracing::warn!("failed to write api_keys back to {p}: {e} (in-memory only)"),
         }
     } else {
-        tracing::warn!("未找到 config.json，api_keys 仅在本次运行内生效");
+        tracing::warn!("config.json not found, api_keys only takes effect for this run");
     }
 
     set_api_keys(&st, new_keys.clone());
@@ -2291,27 +2340,27 @@ async fn handle_config_api_key(
         "warn",
         "config",
         None,
-        format!("下游 API Key 已更新（{} 个）", new_keys.len()),
+        format!("Downstream API key updated ({} total)", new_keys.len()),
     );
     Json(serde_json::json!({
         "ok": true,
         "action": action,
         "configured": !new_keys.is_empty(),
         "count": new_keys.len(),
-        // 生成/设置时回显明文一次，供用户复制到客户端
+        // echo the plaintext once on generate/set, for the user to copy into the client
         "key": new_keys.first().cloned(),
         "previous_count": current.len(),
         "persisted": path.is_some(),
         "message": match action {
-            "generate" => "已生成新的 API Key 并立即生效（同时写入 config.json）",
-            "set" => "API Key 已更新并立即生效",
-            _ => "API Key 已清除（本机直连模式）",
+            "generate" => "New API key generated and took effect immediately (also written to config.json)",
+            "set" => "API key updated and took effect immediately",
+            _ => "API key cleared (local direct-connect mode)",
         },
     }))
     .into_response()
 }
 
-/// 设置页可编辑的配置项白名单（key → 默认值类型）。仅暴露 UI 能安全修改的字段。
+/// Whitelist of settings-page editable config keys (key -> default value type). Only exposes fields the UI can safely modify.
 const CONFIG_EDITABLE: &[(&str, &str)] = &[
     ("listen_addr", "string"),
     ("memory_enabled", "bool"),
@@ -2328,7 +2377,7 @@ const CONFIG_EDITABLE: &[(&str, &str)] = &[
     ("concurrency_sub_multi", "usize"),
 ];
 
-/// GET /api/config — 返回当前配置中可编辑字段（脱敏，供设置页回显）
+/// GET /api/config -- returns the editable fields of the current config (redacted, for the settings page to echo back)
 async fn handle_config_get(State(st): State<AppState>, headers: HeaderMap) -> Response {
     if !admin_authorized(&headers, &st) {
         return admin_denied();
@@ -2358,13 +2407,13 @@ async fn handle_config_get(State(st): State<AppState>, headers: HeaderMap) -> Re
         "ok": true,
         "memory_runtime_enabled": memory_enabled_now(&st),
         "editable": editable,
-        "note": "listen_addr 修改后需重启生效；其余项热生效或写回后重启",
+        "note": "listen_addr requires a restart to take effect after being changed; other fields either hot-apply or require a restart after being written back",
     }))
     .into_response()
 }
 
-/// POST /api/config/save — body `{"key":"listen_addr","value":"..."}`：白名单校验后原子写回 config.json。
-/// 运行时热生效的项（memory_enabled / token_saver / redact_logs / 信号量容量）同步更新内存态。
+/// POST /api/config/save -- body `{"key":"listen_addr","value":"..."}`: validated against the whitelist, then atomically written back to config.json.
+/// Fields that hot-apply at runtime (memory_enabled / token_saver / redact_logs / semaphore capacity) also update in-memory state.
 async fn handle_config_save(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -2375,7 +2424,7 @@ async fn handle_config_save(
     }
     let v: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
-        Err(_) => return bad_req("body 必须是 JSON"),
+        Err(_) => return bad_req("body must be JSON"),
     };
     let key = v
         .get("key")
@@ -2389,9 +2438,9 @@ async fn handle_config_save(
         .find(|(k, _)| *k == key)
         .map(|(_, t)| *t);
     let Some(kind) = kind else {
-        return bad_req(&format!("不允许修改配置项: {key}（白名单外）"));
+        return bad_req(&format!("not allowed to modify config key: {key} (outside the whitelist)"));
     };
-    // 类型校验 + 合法值检查
+    // Type validation + value validation
     let typed: serde_json::Value = match kind {
         "bool" => serde_json::json!(value.as_bool().unwrap_or(false)),
         "usize" | "u64" => {
@@ -2399,34 +2448,34 @@ async fn handle_config_save(
                 .as_u64()
                 .or_else(|| value.as_str().and_then(|s| s.parse().ok()));
             let Some(n) = n else {
-                return bad_req("该配置项需要整数");
+                return bad_req("this config field requires an integer");
             };
             serde_json::json!(n)
         }
         _ => value.clone(),
     };
-    // 合法值校验
+    // Value validation
     match key.as_str() {
         "listen_addr" => {
             let s = typed.as_str().unwrap_or("").trim().to_string();
             if s.is_empty() {
-                return bad_req("监听地址不能为空");
+                return bad_req("listen address cannot be empty");
             }
-            // 校验 host:port 形态（简单检查冒号）
+            // validate host:port shape (a simple colon check)
             if !s.contains(':') {
-                return bad_req("监听地址格式应为 host:port（如 127.0.0.1:47821）");
+                return bad_req("listen address must be in host:port form (e.g. 127.0.0.1:47821)");
             }
-            // 安全守卫：改为非本机地址时必须已有 api_keys（否则管理端点/凭证对网络裸奔）
+            // Safety guard: switching to a non-loopback address requires api_keys to already be configured (otherwise admin endpoints/credentials are exposed to the network)
             if !crate::config::is_loopback_listen(&s) && api_keys_of(&st).is_empty() {
                 return bad_req(
-                    "安全拒绝：非本机监听地址要求先配置 api_keys（防止面板与凭证暴露给网络）",
+                    "safety refusal: a non-loopback listen address requires api_keys to be configured first (to prevent exposing the panel and credentials to the network)",
                 );
             }
         }
         "skills_inject_mode" => {
             let s = typed.as_str().unwrap_or("").trim();
             if !matches!(s, "roster" | "full") {
-                return bad_req("技能注入模式仅支持 roster 或 full");
+                return bad_req("skills_inject_mode only supports roster or full");
             }
         }
         "http_proxy" => {
@@ -2437,7 +2486,7 @@ async fn handle_config_save(
                 || s.starts_with("socks5://")
                 || s.starts_with("socks5h://"))
             {
-                return bad_req("代理地址需以 http:// / https:// / socks5:// 开头");
+                return bad_req("proxy address must start with http:// / https:// / socks5://");
             }
         }
         "concurrency_free_slots"
@@ -2446,13 +2495,13 @@ async fn handle_config_save(
         | "concurrency_sub_multi" => {
             let n = typed.as_u64().unwrap_or(0);
             if n == 0 {
-                return bad_req("并发容量必须 ≥ 1");
+                return bad_req("concurrency capacity must be >= 1");
             }
         }
         _ => {}
     }
 
-    // 原子写回 config.json（Value 往返合并，不覆盖用户其他配置）
+    // Atomically write back to config.json (round-trip merge via Value, without overwriting the user's other settings)
     let path = crate::config::resolve_config_path();
     let persisted = if let Some(p) = path.as_deref() {
         let mut root: serde_json::Value = std::fs::read_to_string(p)
@@ -2476,20 +2525,20 @@ async fn handle_config_save(
             });
         match write_res {
             Ok(()) => {
-                tracing::info!("配置项 {key} 已写回 {p}");
+                tracing::info!("config key {key} written back to {p}");
                 true
             }
             Err(e) => {
-                tracing::warn!("配置项 {key} 写回失败: {e}（仅本次运行生效）");
+                tracing::warn!("failed to write back config key {key}: {e} (only effective for this run)");
                 false
             }
         }
     } else {
-        tracing::warn!("未找到 config.json，配置项仅在本次运行内生效");
+        tracing::warn!("config.json not found, config key only takes effect for this run");
         false
     };
 
-    // 运行时热生效（不重启即改内存态）
+    // Hot-apply at runtime (changes in-memory state without a restart)
     let mut hot_applied = false;
     if key == "memory_enabled" {
         set_memory_runtime_enabled(&st, typed.as_bool().unwrap_or(false));
@@ -2501,11 +2550,11 @@ async fn handle_config_save(
         "config",
         None,
         format!(
-            "配置项 {key} 已更新（{}）",
+            "Config key {key} updated ({})",
             if persisted {
-                "已写入 config.json"
+                "written to config.json"
             } else {
-                "仅本次运行"
+                "this run only"
             }
         ),
     );
@@ -2516,15 +2565,15 @@ async fn handle_config_save(
         "persisted": persisted,
         "hot_applied": hot_applied,
         "message": match key.as_str() {
-            "listen_addr" => "监听地址已写回，需重启网关生效",
-            _ => if hot_applied { "已保存并立即生效" } else { "已写入 config.json，重启后生效" },
+            "listen_addr" => "listen address written back; restart the gateway to take effect",
+            _ => if hot_applied { "saved and took effect immediately" } else { "written to config.json; takes effect after restart" },
         },
     }))
     .into_response()
 }
 
-/// 账户详情卡片数据（每个账号的余额/套餐/限额）
-/// POST /api/account/detail — body { cookie: "..." } 可选；空则用已导入第一个
+/// Account detail card data (each account's balance/plan/limits)
+/// POST /api/account/detail -- body { cookie: "..." } optional; if empty, uses the first imported one
 async fn handle_account_detail(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -2533,7 +2582,7 @@ async fn handle_account_detail(
     if !admin_authorized(&headers, &st) {
         return admin_denied();
     }
-    // 解析 body（可选 cookie）
+    // parse body (optional cookie)
     let mut cookie: Option<String> = None;
     if !body.is_empty() {
         if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&body) {
@@ -2544,7 +2593,7 @@ async fn handle_account_detail(
             }
         }
     }
-    // body 未指定 cookie 时（v0.9）：从 WebCookiePool 挑选；无 Cookie 保持原报错文案
+    // when body doesn't specify a cookie (v0.9): pick from WebCookiePool; keep the original error message if no Cookie is found
     let cookie = match cookie {
         Some(c) => Some(c),
         None => pick_web_cookie(&st).await.map(|(c, _, _)| c),
@@ -2554,18 +2603,18 @@ async fn handle_account_detail(
         None => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "ok": false, "message": "未找到 web Cookie 凭证" })),
+                Json(serde_json::json!({ "ok": false, "message": "no web Cookie credential found" })),
             )
                 .into_response();
         }
     };
-    // 池健康反馈：freebuff_session 成功 → 记 ok；失败 → 记 failure（401/403 自动冷却）
+    // pool health feedback: freebuff_session success -> mark ok; failure -> mark failure (401/403 auto-cooldown)
     let cid = crate::import::cred_id(&cookie);
     let client = match crate::web_protocol::WebClient::new(cookie.clone(), "glm-5.3-flash".into()) {
         Ok(c) => c,
         Err(e) => return internal_err(&anyhow::Error::msg(e.to_string())),
     };
-    // 并发拉取余额+用量+用户+套餐
+    // concurrently fetch balance + usage + user + subscription plan
     let balance = client.freebuff_session().await;
     let usage = client.usage_summary().await;
     let auth = client.auth_session().await;
@@ -2585,10 +2634,10 @@ async fn handle_account_detail(
     .into_response()
 }
 
-/// 脱敏：长串露 前6 + 后4；短串**必须露得更少**。
+/// Redaction: for long strings, show first 6 + last 4; short strings **must show even less**.
 ///
-/// 教训（参考项目 freellmapi 的 maskKey 修复记录）：对短 key 用"取末尾 4 位"会等于完整回显。
-/// 凭证列表是给人看的，不是给人抄的——短凭证一律只露极少量字符。
+/// Lesson learned (from the reference project freellmapi's maskKey fix history): using "last 4 characters" for a short key ends up echoing it back in full.
+/// The credential list is for humans to look at, not to copy -- a short credential always shows only a minimal number of characters.
 fn mask(token: &str) -> String {
     let chars: Vec<char> = token.chars().collect();
     let n = chars.len();
@@ -2608,22 +2657,22 @@ fn mask(token: &str) -> String {
     format!("{head}...{tail}")
 }
 
-// ---------- OpenAI 兼容 ----------
+// ---------- OpenAI-compatible ----------
 
 async fn handle_chat_completions(
     State(st): State<AppState>,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    // 数据面 CSRF 防线：浏览器跨站请求会带 Origin（text/plain 简单请求可绕过预检，
-    // handler 不看 content-type 照样解析 body——必须拦 Origin）。
-    // SDK/curl 不带 Origin，不受影响。
+    // Data-plane CSRF defense: a browser cross-site request carries an Origin header (a text/plain simple request can bypass preflight,
+    // and the handler parses the body regardless of content-type -- so Origin must be blocked).
+    // SDKs/curl don't send Origin, so they're unaffected.
     if !origin_allowed(&headers) {
         return origin_blocked();
     }
     let start = std::time::Instant::now();
     let req_id = uuid::Uuid::new_v4().to_string();
-    // 解析请求
+    // parse the request
     let parsed: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(_) => {
@@ -2648,7 +2697,7 @@ async fn handle_chat_completions(
             .into_response();
     }
 
-    // API key 校验
+    // API key validation
     let keys = api_keys_of(&st);
     if !keys.is_empty() && !authorized(&headers, &keys) {
         return (
@@ -2658,17 +2707,17 @@ async fn handle_chat_completions(
             .into_response();
     }
 
-    // 模型路由降级
+    // model routing / fallback
     let model = st.router.resolve(&requested).await;
 
-    // ---------- Web-Cookie 桥接（关键链路补全） ----------
-    // 用户只导入了 web Cookie（一键登录路径）而没有 Bearer token 时，账号池是空的，
-    // pick_best 必然失败。此时把请求桥接到 web 协议（/api/chat/stream），
-    // 让「照着接入指南填 /v1」的浏览器用户真正能对话。
-    // 会话复用：续聊轮次只发最后一条用户消息 + 复用同一个上游 thread，
-    // 避免每次请求都新开 thread 烧光每日会话准入（rateLimitsByModel.limit）。
-    // 池里有账号还不够——占位符（如 __TEST_SKIP__）或已失效的 Bearer 会挡住桥接又必然 401。
-    // 池内全是占位符（长度 < 20 或命中已知占位模式）时视为"没有可用账号"，走桥接。
+    // ---------- Web-Cookie bridge (fills in a critical path) ----------
+    // When the user has only imported a web Cookie (one-click login path) and has no Bearer token, the account pool is empty,
+    // pick_best necessarily fails. In that case bridge the request to the web protocol (/api/chat/stream),
+    // so browser users who "just fill in /v1 per the setup guide" can actually chat.
+    // Session reuse: a follow-up turn only sends the last user message + reuses the same upstream thread,
+    // avoiding opening a new thread on every request that would burn through the daily session admission quota (rateLimitsByModel.limit).
+    // Having accounts in the pool isn't enough -- a placeholder (e.g. __TEST_SKIP__) or an already-expired Bearer would block the bridge and necessarily 401.
+    // When the pool is entirely placeholders (length < 20 or matching a known placeholder pattern), treat it as "no usable account" and take the bridge path.
     let pool_tokens: Vec<String> = {
         let accounts = st.pool.accounts.lock().await;
         accounts.iter().map(|a| a.token.clone()).collect()
@@ -2684,7 +2733,7 @@ async fn handle_chat_completions(
         }
     }
 
-    // 用量记录字段（api_key 脱敏；提前计算供重试路径复用）
+    // usage-record fields (api_key redacted; computed up front for reuse by the retry path)
     let api_key = headers
         .get("x-api-key")
         .or_else(|| headers.get("authorization"))
@@ -2703,10 +2752,10 @@ async fn handle_chat_completions(
         .map(|s| s.split(',').next().unwrap_or("").to_string())
         .unwrap_or_default();
 
-    // 配置上行 body：设 model + 思考程度降级/剥离 + 提示词/技能注入（与账号无关，重试时复用）
+    // configure the upstream body: set model + reasoning-effort downgrade/strip + prompt/skill injection (account-independent, reused across retries)
     let mut up_body = parsed.clone();
     up_body["model"] = serde_json::json!(model);
-    // 记忆检索 query：最后一条 user 消息（截断 200 字符）
+    // memory retrieval query: the last user message (truncated to 200 characters)
     let mem_query: String = up_body
         .get("messages")
         .and_then(|m| m.as_array())
@@ -2724,8 +2773,8 @@ async fn handle_chat_completions(
         .chars()
         .take(200)
         .collect();
-    // 内置提示词 + 技能 roster + 记忆注入（system 消息前插）
-    // roster 模式：提示词走 prompts（base+启用项），技能走 skills 模块（只注入名称+描述）
+    // built-in prompts + skills roster + memory injection (prepended as a system message)
+    // roster mode: prompts go through prompts (base + enabled items), skills go through the skills module (only injects name + description)
     let sys_prefix = build_system_prefix(&st, &mem_query).await;
     if !sys_prefix.trim().is_empty() {
         if let Some(messages) = up_body.get_mut("messages").and_then(|m| m.as_array_mut()) {
@@ -2740,13 +2789,13 @@ async fn handle_chat_completions(
         match st.router.clamp_effort(&model, effort) {
             Some(clamped) => {
                 if clamped != effort {
-                    tracing::debug!("模型 {model} effort {effort} 降级为 {clamped}");
+                    tracing::debug!("model {model} effort {effort} downgraded to {clamped}");
                     effort_downgraded = Some(clamped.clone());
                     up_body["reasoning_effort"] = serde_json::json!(clamped);
                 }
             }
             None => {
-                tracing::debug!("模型 {model} 不支持 reasoning_effort，自动剥离");
+                tracing::debug!("model {model} doesn't support reasoning_effort, stripping it automatically");
                 if let Some(obj) = up_body.as_object_mut() {
                     obj.remove("reasoning_effort");
                 }
@@ -2754,7 +2803,7 @@ async fn handle_chat_completions(
         }
     }
     remove_passthrough_fields(&mut up_body);
-    // token_saver（可选）：压缩超长 tool 结果（只处理 tool 角色消息，绝不触碰 system 前缀与历史头部）
+    // token_saver (optional): compress overly long tool results (only touches tool-role messages, never touches the system prefix or earlier history)
     if st.cfg.token_saver {
         if let Some(msgs) = up_body.get_mut("messages").and_then(|m| m.as_array_mut()) {
             for m in msgs.iter_mut() {
@@ -2772,7 +2821,7 @@ async fn handle_chat_completions(
             }
         }
     }
-    // 流式请求：向上游显式申请 usage 帧（真实 token 统计所需；非流式响应本身含 usage）
+    // streaming request: explicitly ask upstream for a usage frame (needed for real token accounting; non-streaming responses already include usage)
     if up_body
         .get("stream")
         .and_then(|v| v.as_bool())
@@ -2781,18 +2830,18 @@ async fn handle_chat_completions(
         up_body["stream_options"] = serde_json::json!({ "include_usage": true });
     }
 
-    // 请求级重试循环：失败换号重试。
-    // 此时尚未向客户端写出任何字节，天然满足 committed 边界（首字节后绝不重试）。
-    // v0.8 双桶并发信号量：在首字节写出前 acquire（免费/订阅各一个桶），
-    // 防止多账号高并发撞上游并发墙被风控。超时 2s → 429 语义（对齐 waiting_room）。
+    // Request-level retry loop: on failure, switch accounts and retry.
+    // No bytes have been written to the client yet at this point, so the "committed" boundary is naturally respected (never retry after the first byte).
+    // v0.8 dual-bucket concurrency semaphore: acquire before the first byte is written out (one bucket each for free/subscription tiers),
+    // to prevent high concurrency across multiple accounts from hitting the upstream concurrency wall and getting rate-limited. A 2s timeout maps to 429 semantics (aligned with waiting_room).
     let tier_is_sub = {
         let accounts = st.pool.accounts.lock().await;
         accounts
             .iter()
             .any(|a| crate::semaphore::is_subscriber_token(&a.token, None))
     };
-    // 持有信号量 guard 到函数返回：RAII 自动归还（Drop），保证并发墙计数覆盖整个请求窗口。
-    // 流式路径在后台上游 stream 消耗期间仍持有（函数返回后经 move 进任务的 guard 继续生效）。
+    // Hold the semaphore guard until the function returns: RAII auto-releases it (Drop), ensuring the concurrency-wall count covers the entire request window.
+    // The streaming path still holds it while the background upstream stream is being consumed (the guard moved into the task keeps working after the function returns).
     let tier_guard = match st.semaphore.acquire(tier_is_sub).await {
         Ok(g) => g,
         Err(_) => {
@@ -2804,15 +2853,15 @@ async fn handle_chat_completions(
                 &req_id,
                 "concurrency_busy",
                 &format!(
-                    "并发桶已满（{} 层）",
-                    if tier_is_sub { "订阅" } else { "免费" }
+                    "concurrency bucket full ({} tier)",
+                    if tier_is_sub { "subscription" } else { "free" }
                 ),
             );
             st.logs.emit(
                 "warn",
                 "request",
                 Some(&req_id),
-                format!("{model} 并发桶已满，返回 429（请稍后重试）"),
+                format!("{model} concurrency bucket full, returning 429 (please retry later)"),
             );
             return (
                 StatusCode::TOO_MANY_REQUESTS,
@@ -2832,7 +2881,7 @@ async fn handle_chat_completions(
 
     for attempt in 0..retry_policy.max_attempts {
         attempt_count = attempt + 1;
-        // 挑 token（每次重试重新选号；熔断 Open 的账号会被跳过）
+        // pick a token (re-selects on every retry; accounts with an Open circuit breaker are skipped)
         let account = match st.pool.pick_best().await {
             Some(a) => a,
             None => {
@@ -2859,17 +2908,17 @@ async fn handle_chat_completions(
             st.telemetry.event(
                 &req_id,
                 "retry",
-                &format!("第 {} 次尝试 via {account_name}", attempt + 1),
+                &format!("attempt {} via {account_name}", attempt + 1),
             );
             st.logs.emit(
                 "warn",
                 "retry",
                 Some(&req_id),
-                format!("换号重试（第 {} 次）→ {account_name}", attempt + 1),
+                format!("switching accounts and retrying (attempt {}) -> {account_name}", attempt + 1),
             );
         }
 
-        // 确保会话
+        // ensure a session
         let instance_id = match account.session.ensure_session(&model).await {
             Ok(id) => Some(id),
             Err(e) => {
@@ -2894,7 +2943,7 @@ async fn handle_chat_completions(
             }
         };
 
-        // run 管理：取根 run（惰性）
+        // run management: get the root run (lazily)
         let rid = match ensure_root_run(&st, &account_name, &token).await {
             Ok(id) => id,
             Err(e) => {
@@ -2906,7 +2955,7 @@ async fn handle_chat_completions(
         };
         run_id = rid;
 
-        // 调上游
+        // call upstream
         match st
             .client
             .chat_completions(&token, up_body.clone(), &run_id, instance_id.as_deref())
@@ -2919,7 +2968,7 @@ async fn handle_chat_completions(
             Ok(r) => {
                 let code = r.status().as_u16();
                 let body_text = r.text().await.unwrap_or_default();
-                // 错误分类：文本规则优先（waiting_room/rate_limit/model_unavailable...），状态码兜底
+                // error classification: text rules take priority (waiting_room/rate_limit/model_unavailable...), status code as fallback
                 let kind = crate::errors::classify(code, &body_text);
                 st.pool
                     .mark_failure(&account_name, &format!("HTTP {code}"))
@@ -2930,7 +2979,7 @@ async fn handle_chat_completions(
                         .mark_cooldown(
                             &account_name,
                             std::time::Duration::from_secs(600),
-                            &format!("上游 {code}，token 疑似失效"),
+                            &format!("upstream {code}, token appears to have expired"),
                         )
                         .await;
                 }
@@ -2940,14 +2989,14 @@ async fn handle_chat_completions(
                     kind.as_str(),
                     crate::errors::error_excerpt(&body_text)
                 );
-                // 换号判定：可重试错误（限流/排队/5xx/网络）+ 凭证失效（401/403 已冷却，换号继续）都换号
+                // account-switch decision: switch accounts on either a retryable error (rate limit/queued/5xx/network) or an expired credential (401/403, already cooled down, keep switching)
                 let should_switch =
                     kind.is_retryable() || matches!(kind, crate::errors::ErrorKind::AuthExpired);
                 if should_switch && attempt + 1 < retry_policy.max_attempts {
                     st.telemetry.event(
                         &req_id,
                         "retry_scheduled",
-                        &format!("HTTP {code}（{}），换号重试", kind.as_str()),
+                        &format!("HTTP {code} ({}), switching accounts and retrying", kind.as_str()),
                     );
                     continue;
                 }
@@ -2963,7 +3012,7 @@ async fn handle_chat_completions(
         }
     }
 
-    // 全部尝试失败：记录并返回汇总错误
+    // all attempts failed: log and return an aggregated error
     let upstream_resp = match upstream_resp {
         Some(r) => r,
         None => {
@@ -3000,7 +3049,7 @@ async fn handle_chat_completions(
                 ),
                 error_excerpt: Some(last_error.chars().take(300).collect()),
                 route_reason: Some(format!(
-                    "{} -> {}（{} 次尝试均失败）",
+                    "{} -> {} ({} attempts all failed)",
                     requested, model, attempt_count
                 )),
                 api_key: Some(api_key.clone()),
@@ -3011,11 +3060,11 @@ async fn handle_chat_completions(
                 "request",
                 Some(&req_id),
                 format!(
-                    "{model} 全部 {attempt_count} 次尝试失败: {}",
+                    "{model} all {attempt_count} attempts failed: {}",
                     last_error.chars().take(120).collect::<String>()
                 ),
             );
-            // 有上游 HTTP 响应（非网络类失败）：透传上游状态码，保持客户端重试/退避语义
+            // has an upstream HTTP response (not a network-class failure): pass through the upstream status code, preserving client retry/backoff semantics
             if (400..600).contains(&last_status) {
                 return (
                     StatusCode::from_u16(last_status).unwrap_or(StatusCode::BAD_GATEWAY),
@@ -3042,8 +3091,8 @@ async fn handle_chat_completions(
 
     let status = upstream_resp.status();
     let latency_ms = start.elapsed().as_millis() as i64;
-    // （api_key / client_ip 已在重试循环前计算）
-    // 观察（零 LLM）：模型使用偏好 / 档位降级 / 用户纠正信号 → 记忆库（运行时开关关闭时不记录）
+    // (api_key / client_ip were already computed before the retry loop)
+    // observation (zero LLM): model usage preference / tier downgrade / user correction signals -> memory store (not recorded when the runtime switch is off)
     if memory_enabled_now(&st) {
         let _ = st
             .memory
@@ -3052,21 +3101,21 @@ async fn handle_chat_completions(
 
     if status.is_success() {
         st.pool.update_score(&account_name, 10.0).await;
-        st.pool.mark_success(&account_name).await; // 熔断器：驱动 HalfOpen → Closed 恢复
+        st.pool.mark_success(&account_name).await; // circuit breaker: drives HalfOpen -> Closed recovery
         st.telemetry.event(
             &req_id,
             "upstream_ok",
-            &format!("HTTP {} 建连 {}ms", status.as_u16(), latency_ms),
+            &format!("HTTP {} connected in {}ms", status.as_u16(), latency_ms),
         );
-        // run 收尾：FINISH 上报（释放上游 run 计数；失败不影响响应）
+        // run wrap-up: report FINISH (releases the upstream run count; failure doesn't affect the response)
         if let Err(e) = st.client.finish_run(&token, &run_id, 1).await {
-            tracing::debug!("finish_run 失败（不影响响应）: {e}");
+            tracing::debug!("finish_run failed (doesn't affect the response): {e}");
         }
         st.logs.emit(
             "info",
             "request",
             Some(&req_id),
-            format!("{model} 上游 200，准备转发（{latency_ms}ms 建连）"),
+            format!("{model} upstream 200, forwarding ({latency_ms}ms to connect)"),
         );
     } else {
         st.usage
@@ -3083,14 +3132,14 @@ async fn handle_chat_completions(
             )
             .ok();
         st.pool.update_score(&account_name, -20.0).await;
-        // 上游 401/403 = token 失效 → 冷却熔断该账号（此前 mark_cooldown 为死代码，此处接线）
+        // upstream 401/403 = token expired -> cooldown/circuit-break this account (mark_cooldown was previously dead code; wired up here)
         let code = status.as_u16();
         if code == 401 || code == 403 {
             st.pool
                 .mark_cooldown(
                     &account_name,
                     std::time::Duration::from_secs(600),
-                    &format!("上游 {code}，token 疑似失效"),
+                    &format!("upstream {code}, token appears to have expired"),
                 )
                 .await;
         }
@@ -3120,9 +3169,9 @@ async fn handle_chat_completions(
             "request",
             Some(&req_id),
             format!(
-                "上游 {code}（{kind}），账号 {account_name} 已扣分{}",
+                "upstream {code} ({kind}), account {account_name} penalized{}",
                 if code == 401 || code == 403 {
-                    "并冷却 10 分钟"
+                    " and cooled down for 10 minutes"
                 } else {
                     ""
                 }
@@ -3130,19 +3179,19 @@ async fn handle_chat_completions(
         );
     }
 
-    // 流式转发上游响应（真实增量透传 + 上游错误原样透传）
+    // stream-forward the upstream response (real incremental passthrough + upstream errors passed through as-is)
     let mut builder = Response::builder().status(status);
     for (k, v) in upstream_resp.headers() {
         if k != "content-length" && k != "transfer-encoding" {
             builder = builder.header(k, v);
         }
     }
-    // 非 2xx：透传上游真实错误体（含 message/type/code）
+    // non-2xx: pass through the actual upstream error body (including message/type/code)
     if !status.is_success() {
         let err_body = upstream_resp.bytes().await.unwrap_or_default();
         let err_text = String::from_utf8_lossy(&err_body).to_string();
         tracing::warn!(
-            "[上游错误] {model} HTTP {status}: {}",
+            "[upstream error] {model} HTTP {status}: {}",
             err_text.chars().take(500).collect::<String>()
         );
         return (
@@ -3160,7 +3209,7 @@ async fn handle_chat_completions(
             .into_response();
     }
 
-    // 2xx：分流（非流式读全量解析 usage；流式 spawn 转发 + 旁路采集）
+    // 2xx: branch (non-streaming reads the full body to parse usage; streaming spawns a forwarding task + side-channel collection)
     let is_stream = parsed
         .get("stream")
         .and_then(|v| v.as_bool())
@@ -3180,7 +3229,8 @@ async fn handle_chat_completions(
     if !is_stream {
         let bytes = upstream_resp.bytes().await.unwrap_or_default();
         let text = String::from_utf8_lossy(&bytes).to_string();
-        // 上游可能在 HTTP 200 的 body 里返回错误码（free_mode_* 系列）——识别并视为上游错误
+        // upstream may return an error code inside an HTTP 200 body (the free_mode_* family) -- detect and
+        // treat as an upstream error
         if let Some(code) = upstream_body_error(&text) {
             let total_ms = start.elapsed().as_millis() as u64;
             usage_db
@@ -3209,7 +3259,7 @@ async fn handle_chat_completions(
                 "warn",
                 "request",
                 Some(&rid),
-                format!("{mdl} 上游 200 但 body 含错误码 {code}"),
+                format!("{mdl} upstream 200 but body contains error code {code}"),
             );
             return (
                 StatusCode::BAD_GATEWAY,
@@ -3263,7 +3313,7 @@ async fn handle_chat_completions(
             "request",
             Some(&rid),
             format!(
-                "{mdl} 完成 {}+{} tok（{:.2}s）",
+                "{mdl} completed {}+{} tok ({:.2}s)",
                 pt,
                 ct,
                 total_ms as f64 / 1000.0
@@ -3275,12 +3325,13 @@ async fn handle_chat_completions(
             .into_response();
     }
 
-    // 流式：spawn 转发任务；旁路扫描 usage、记录首字节与总耗时
-    // 信号量 guard move 进任务：后台上游 stream 消耗期间持续持有（防新增并发叠加），
-    // 任务结束时 Drop 归还（覆盖整个流式窗口）。
+    // streaming: spawn the forwarding task; side-channel scan for usage, record first byte and total time
+    // Move the semaphore guard into the task: kept held while the background upstream stream is consumed
+    // (prevents stacking new concurrency), released via Drop when the task ends (covering the whole
+    // streaming window).
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(16);
     tokio::spawn(async move {
-        let _tier_guard_keep = tier_guard; // 持有到任务结束；Drop 自动归还
+        let _tier_guard_keep = tier_guard; // held until the task ends; Drop releases it automatically
         let t0 = std::time::Instant::now();
         let mut stream = upstream_resp.bytes_stream();
         let mut ttft: Option<u64> = None;
@@ -3300,7 +3351,7 @@ async fn handle_chat_completions(
                         totals = (p, c);
                     }
                     if tx.send(Ok(b)).await.is_err() {
-                        break; // 客户端断开
+                        break; // client disconnected
                     }
                 }
                 Err(e) => {
@@ -3323,7 +3374,7 @@ async fn handle_chat_completions(
                         api_key: Some(key.clone()),
                         client_ip: Some(ip.clone()),
                     });
-                    logs.emit("error", "request", Some(&rid), format!("{mdl} 流中断: {e}"));
+                    logs.emit("error", "request", Some(&rid), format!("{mdl} stream interrupted: {e}"));
                     return;
                 }
             }
@@ -3365,7 +3416,7 @@ async fn handle_chat_completions(
             "request",
             Some(&rid),
             format!(
-                "{mdl} 流式完成 {}+{} tok（首字节 {}ms / 总 {:.2}s）",
+                "{mdl} streaming completed {}+{} tok (first byte {}ms / total {:.2}s)",
                 totals.0,
                 totals.1,
                 ttft.unwrap_or(0),
@@ -3383,8 +3434,8 @@ async fn handle_chat_completions(
 }
 
 async fn ensure_root_run(st: &AppState, account_name: &str, token: &str) -> anyhow::Result<String> {
-    // 简化：每个账号惰性建根 run 并缓存（进程内 Arc<Mutex> 缓存方案由后续打补）
-    // 此处直接新建根 run，避免首次建 run 的复杂度
+    // Simplified: lazily create a root run per account and cache it (an in-process Arc<Mutex> caching scheme is a follow-up patch)
+    // Directly create a new root run here, avoiding the complexity of the first-run creation
     let run_id = st
         .client
         .start_run(token, crate::models::ROOT_AGENT_ID, &[])
@@ -3393,7 +3444,7 @@ async fn ensure_root_run(st: &AppState, account_name: &str, token: &str) -> anyh
     Ok(run_id)
 }
 
-// ---------- Anthropic 兼容 ----------
+// ---------- Anthropic compatibility ----------
 
 async fn handle_claude_messages(
     State(st): State<AppState>,
@@ -3402,7 +3453,7 @@ async fn handle_claude_messages(
 ) -> Response {
     let start = std::time::Instant::now();
     let req_id = uuid::Uuid::new_v4().to_string();
-    // 数据面 CSRF 防线（与 /v1/chat/completions 同理：拦恶意网页 text/plain 简单请求）
+    // Data-plane CSRF defense (same rationale as /v1/chat/completions: blocks malicious web pages' text/plain simple requests)
     if !origin_allowed(&headers) {
         return origin_blocked();
     }
@@ -3440,7 +3491,7 @@ async fn handle_claude_messages(
     }
     let resolved = st.router.resolve(&model).await;
 
-    // ---------- Web-Cookie 桥接（与 /v1/chat/completions 相同策略，含占位符保护） ----------
+    // ---------- Web-Cookie bridging (same strategy as /v1/chat/completions, including placeholder protection) ----------
     let pool_tokens: Vec<String> = {
         let accounts = st.pool.accounts.lock().await;
         accounts.iter().map(|a| a.token.clone()).collect()
@@ -3451,7 +3502,7 @@ async fn handle_claude_messages(
     if !pool_has_usable {
         if let Some((cookie, cred, cid)) = pick_web_cookie(&st).await {
             if cookie.contains("session-token") {
-                // Claude messages → OpenAI messages 复用现有转换（含 system/blocks/tool_use）
+                // Claude messages -> OpenAI messages reuses the existing conversion (including system/blocks/tool_use)
                 let openai_msgs = claude_to_openai_messages(
                     parsed
                         .get("messages")
@@ -3492,14 +3543,14 @@ async fn handle_claude_messages(
                     cid,
                 )
                 .await;
-                // OpenAI 形状的错误体 → Claude 形状
+                // OpenAI-shaped error body -> Claude shape
                 return openai_error_to_claude(resp, &resolved).await;
             }
         }
     }
 
-    // v0.8 双桶并发信号量（Claude 路径与 OpenAI 一致）：首字节写出前 acquire。
-    // 保守判定：账号池任一凭证含订阅特征走订阅桶。
+    // v0.8 dual-bucket concurrency semaphore (Claude path matches OpenAI path): acquire before writing the first byte.
+    // Conservative rule: if any credential in the account pool has subscription characteristics, use the subscription bucket.
     let claude_is_sub = {
         let accounts = st.pool.accounts.lock().await;
         accounts
@@ -3517,15 +3568,15 @@ async fn handle_claude_messages(
                 &req_id,
                 "concurrency_busy",
                 &format!(
-                    "Claude 并发桶已满（{} 层）",
-                    if claude_is_sub { "订阅" } else { "免费" }
+                    "Claude concurrency bucket full ({} tier)",
+                    if claude_is_sub { "subscription" } else { "free" }
                 ),
             );
             st.logs.emit(
                 "warn",
                 "request",
                 Some(&req_id),
-                format!("{resolved} Claude 并发桶已满，返回 429"),
+                format!("{resolved} Claude concurrency bucket full, returning 429"),
             );
             return (
                 StatusCode::TOO_MANY_REQUESTS,
@@ -3535,7 +3586,7 @@ async fn handle_claude_messages(
         }
     };
 
-    // Claude → OpenAI 协议转换：system 提取、messages content blocks 打平、max_tokens 映射
+    // Claude -> OpenAI protocol conversion: extract system, flatten messages content blocks, map max_tokens
     let openai_messages = claude_to_openai_messages(
         parsed
             .get("messages")
@@ -3554,7 +3605,7 @@ async fn handle_claude_messages(
     if let Some(maxt) = parsed.get("max_tokens").and_then(|v| v.as_u64()) {
         up_body["max_tokens"] = serde_json::json!(maxt);
     }
-    // Claude system 字段（string 或 blocks 数组）→ OpenAI system 消息前置
+    // Claude system field (string or blocks array) -> prepend an OpenAI system message
     if let Some(sys) = parsed.get("system") {
         let sys_text = match sys {
             serde_json::Value::String(s) => s.clone(),
@@ -3574,7 +3625,7 @@ async fn handle_claude_messages(
             }
         }
     }
-    // 记忆检索 query（最后一条 user 消息）
+    // Memory retrieval query (the last user message)
     let claude_mem_query: String = parsed
         .get("messages")
         .and_then(|m| m.as_array())
@@ -3592,7 +3643,7 @@ async fn handle_claude_messages(
         .chars()
         .take(200)
         .collect();
-    // 记账/遥测字段（api_key 脱敏；client_ip）
+    // Billing/telemetry fields (api_key masked; client_ip)
     let claude_api_key = headers
         .get("x-api-key")
         .or_else(|| headers.get("authorization"))
@@ -3612,7 +3663,7 @@ async fn handle_claude_messages(
         .unwrap_or_default();
     let start_claude = start;
 
-    // v0.8 重试循环（与 OpenAI 路径同策略）：失败换号重试 + 排队 503 + 5xx 换号。
+    // v0.8 retry loop (same strategy as the OpenAI path): retry with a different account on failure + queued 503 + switch account on 5xx.
     let retry_policy = crate::retry::RetryPolicy::default();
     #[allow(unused_assignments)]
     let mut claude_account_name = String::new();
@@ -3653,17 +3704,17 @@ async fn handle_claude_messages(
             st.telemetry.event(
                 &req_id,
                 "retry",
-                &format!("Claude 第 {} 次尝试 via {}", attempt + 1, account.name),
+                &format!("Claude attempt {} via {}", attempt + 1, account.name),
             );
             st.logs.emit(
                 "warn",
                 "retry",
                 Some(&req_id),
-                format!("Claude 换号重试（第 {} 次）→ {}", attempt + 1, account.name),
+                format!("Claude switching account and retrying (attempt {}) -> {}", attempt + 1, account.name),
             );
         }
 
-        // 确保会话（不再吞错：排队/失败进入换号或 503）
+        // Ensure session (no longer swallow errors: queued/failed goes into account switch or 503)
         let instance_id = match account.session.ensure_session(&resolved).await {
             Ok(id) => Some(id),
             Err(e) => {
@@ -3692,7 +3743,7 @@ async fn handle_claude_messages(
             }
         };
 
-        // run 管理（惰性建根 run）
+        // Run management (lazily create root run)
         let rid = match ensure_root_run(&st, &account.name, &claude_token).await {
             Ok(id) => id,
             Err(e) => {
@@ -3704,7 +3755,7 @@ async fn handle_claude_messages(
         };
         claude_run_id = rid;
 
-        // 调上游
+        // Call upstream
         match st
             .client
             .chat_completions(
@@ -3732,7 +3783,7 @@ async fn handle_claude_messages(
                         .mark_cooldown(
                             &account.name,
                             std::time::Duration::from_secs(600),
-                            &format!("上游 {code}，token 疑似失效"),
+                            &format!("upstream {code}, token appears to be invalid"),
                         )
                         .await;
                 }
@@ -3748,7 +3799,7 @@ async fn handle_claude_messages(
                     st.telemetry.event(
                         &req_id,
                         "retry_scheduled",
-                        &format!("Claude HTTP {code}（{}），换号重试", kind.as_str()),
+                        &format!("Claude HTTP {code} ({}), switching account and retrying", kind.as_str()),
                     );
                     continue;
                 }
@@ -3764,7 +3815,7 @@ async fn handle_claude_messages(
         }
     }
 
-    // 全部尝试失败：Claude 形状错误响应（保留 503/5xx 可读消息）
+    // All attempts failed: Claude-shaped error response (preserve a readable 503/5xx message)
     let upstream_resp = match claude_upstream {
         Some(r) => r,
         None => {
@@ -3801,7 +3852,7 @@ async fn handle_claude_messages(
                 ),
                 error_excerpt: Some(claude_last_error.chars().take(300).collect()),
                 route_reason: Some(format!(
-                    "{} -> {}（{} 次尝试均失败）",
+                    "{} -> {} ({} attempts all failed)",
                     model, resolved, claude_attempts
                 )),
                 api_key: Some(claude_api_key.clone()),
@@ -3812,7 +3863,7 @@ async fn handle_claude_messages(
                 "request",
                 Some(&req_id),
                 format!(
-                    "{resolved} Claude 全部 {claude_attempts} 次尝试失败: {}",
+                    "{resolved} Claude all {claude_attempts} attempts failed: {}",
                     claude_last_error.chars().take(120).collect::<String>()
                 ),
             );
@@ -3842,11 +3893,11 @@ async fn handle_claude_messages(
 
     let status = upstream_resp.status();
     let claude_latency_ms = start_claude.elapsed().as_millis() as i64;
-    // 记忆 observe（Claude 路径补齐）：运行时开关开启时记录偏好/降级/纠正
+    // Memory observe (fills the gap in the Claude path): when the runtime toggle is on, record preferences/downgrades/corrections
     if memory_enabled_now(&st) {
         let _ = st.memory.observe(&resolved, None, &claude_mem_query, None);
     }
-    // 非 2xx：转 Claude 错误格式透传
+    // Non-2xx: pass through as a Claude error format
     if !status.is_success() {
         let err_body = upstream_resp.bytes().await.unwrap_or_default();
         let err_text = String::from_utf8_lossy(&err_body).to_string();
@@ -3870,12 +3921,12 @@ async fn handle_claude_messages(
                 .mark_cooldown(
                     &claude_account_name,
                     std::time::Duration::from_secs(600),
-                    &format!("上游 {status}，token 疑似失效"),
+                    &format!("upstream {status}, token appears to be invalid"),
                 )
                 .await;
         }
         tracing::warn!(
-            "[上游错误/Claude] HTTP {status}: {}",
+            "[upstream error/Claude] HTTP {status}: {}",
             err_text.chars().take(500).collect::<String>()
         );
         return (
@@ -3893,10 +3944,10 @@ async fn handle_claude_messages(
             builder = builder.header(k, v);
         }
     }
-    // 非流式：把 OpenAI 响应转换回 Claude 格式（message + content blocks + stop_reason）
+    // Non-streaming: convert the OpenAI response back to Claude format (message + content blocks + stop_reason)
     if wants_stream {
-        // 流式：OpenAI SSE → canonical event → Anthropic 事件流（不再直接透传）
-        // 复用请求级 req_id（事件链完整关联：usage/telemetry/logs 同一 ID）
+        // Streaming: OpenAI SSE -> canonical event -> Anthropic event stream (no longer passed through directly)
+        // Reuse the request-level req_id (full event-chain correlation: usage/telemetry/logs share the same ID)
         let claude_req_id = req_id.clone();
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(16);
         let model_for_render = resolved.clone();
@@ -3913,7 +3964,7 @@ async fn handle_claude_messages(
         let claude_ip = claude_client_ip.clone();
         let t_start = std::time::Instant::now();
         tokio::spawn(async move {
-            // 信号量 guard move 进任务：流式消耗期间持有并发 permit，任务结束 Drop 归还
+            // Move the semaphore guard into the task: hold the concurrency permit while streaming, returned via Drop when the task ends
             let _claude_tier_keep = claude_tier_guard;
             let mut decoder = crate::protocol::openai_sse::OpenAiSseDecoder::new();
             let mut renderer =
@@ -3945,7 +3996,7 @@ async fn handle_claude_messages(
                         if !out.is_empty()
                             && tx.send(Ok(axum::body::Bytes::from(out))).await.is_err()
                         {
-                            break; // 客户端断开
+                            break; // client disconnected
                         }
                     }
                     Err(e) => {
@@ -3960,7 +4011,7 @@ async fn handle_claude_messages(
                     }
                 }
             }
-            // 收尾：冲刷 decoder 残余 + renderer 兜底 message_stop
+            // Finish up: flush remaining decoder data + renderer's fallback message_stop
             let mut tail = String::new();
             for ev in decoder.finish() {
                 for frame in renderer.render(&ev) {
@@ -3973,7 +4024,7 @@ async fn handle_claude_messages(
             }
             let total_ms = t_start.elapsed().as_millis() as u64;
             let status = if err_text.is_some() { 502u16 } else { 200 };
-            // v0.8 补记账：Claude 流式成功路径 usage 落库（此前只遥测不落库）
+            // v0.8 backfill accounting: persist usage for the Claude streaming success path (previously only telemetry, not persisted)
             usage_db
                 .record_ex(
                     &acc,
@@ -4010,7 +4061,7 @@ async fn handle_claude_messages(
                 "request",
                 Some(&rid),
                 format!(
-                    "{mdl} Claude 流式完成 {}+{} tok（{:.2}s）",
+                    "{mdl} Claude stream completed {}+{} tok ({:.2}s)",
                     totals.0,
                     totals.1,
                     total_ms as f64 / 1000.0
@@ -4031,7 +4082,7 @@ async fn handle_claude_messages(
         let text = String::from_utf8_lossy(&bytes).to_string();
         let openai_resp: serde_json::Value =
             serde_json::from_slice(&bytes).unwrap_or(serde_json::json!({}));
-        // v0.8 补记账：Claude 非流式成功路径 usage/遥测落库（此前直接 Json 返回）
+        // v0.8 backfill accounting: persist usage/telemetry for the Claude non-streaming success path (previously returned Json directly)
         let (pt, ct) = extract_usage(&text).unwrap_or((0, 0));
         let total_ms = start_claude.elapsed().as_millis() as u64;
         st.usage
@@ -4070,7 +4121,7 @@ async fn handle_claude_messages(
             "request",
             Some(&req_id),
             format!(
-                "{resolved} Claude 完成 {}+{} tok（{:.2}s）",
+                "{resolved} Claude completed {}+{} tok ({:.2}s)",
                 pt,
                 ct,
                 total_ms as f64 / 1000.0
@@ -4081,9 +4132,9 @@ async fn handle_claude_messages(
     }
 }
 
-/// Claude messages → OpenAI messages：
-/// - content 为 string：原样
-/// - content 为 blocks 数组：text 块拼接为 string，tool_result 块转 role=tool 消息，tool_use 块转 assistant.tool_calls
+/// Claude messages -> OpenAI messages:
+/// - content is a string: kept as-is
+/// - content is a blocks array: text blocks are concatenated into a string, tool_result blocks become role=tool messages, tool_use blocks become assistant.tool_calls
 fn claude_to_openai_messages(messages: serde_json::Value) -> serde_json::Value {
     let arr = messages.as_array().cloned().unwrap_or_default();
     let mut out: Vec<serde_json::Value> = Vec::with_capacity(arr.len());
@@ -4139,7 +4190,7 @@ fn claude_to_openai_messages(messages: serde_json::Value) -> serde_json::Value {
                         _ => {}
                     }
                 }
-                // assistant 的 tool_use → OpenAI assistant 消息 + tool_calls
+                // assistant's tool_use -> OpenAI assistant message + tool_calls
                 if !tool_calls.is_empty() {
                     let mut msg = serde_json::json!({ "role": "assistant", "content": if text_parts.is_empty() { serde_json::Value::Null } else { serde_json::json!(text_parts.join("\n")) } });
                     msg["tool_calls"] = serde_json::json!(tool_calls);
@@ -4147,7 +4198,7 @@ fn claude_to_openai_messages(messages: serde_json::Value) -> serde_json::Value {
                 } else if !text_parts.is_empty() {
                     out.push(serde_json::json!({ "role": role, "content": text_parts.join("\n") }));
                 }
-                // user 的 tool_result → OpenAI tool 消息
+                // user's tool_result -> OpenAI tool message
                 for tr in tool_results {
                     out.push(tr);
                 }
@@ -4158,7 +4209,7 @@ fn claude_to_openai_messages(messages: serde_json::Value) -> serde_json::Value {
     serde_json::json!(out)
 }
 
-/// OpenAI chat 响应 → Claude messages 响应（非流式）
+/// OpenAI chat response -> Claude messages response (non-streaming)
 fn openai_to_claude_response(openai: &serde_json::Value, model: &str) -> serde_json::Value {
     let choice = openai
         .get("choices")
@@ -4202,7 +4253,7 @@ fn openai_to_claude_response(openai: &serde_json::Value, model: &str) -> serde_j
     for tc in tool_calls_out {
         blocks.push(tc);
     }
-    // stop_reason 映射
+    // stop_reason mapping
     let finish = choice
         .and_then(|c| c.get("finish_reason"))
         .and_then(|f| f.as_str())
@@ -4237,9 +4288,9 @@ fn openai_to_claude_response(openai: &serde_json::Value, model: &str) -> serde_j
     })
 }
 
-// ---------- 技能 API ----------
+// ---------- Skills API ----------
 
-/// GET /api/skills — 技能列表 + roster 注入预览
+/// GET /api/skills - skills list + roster injection preview
 async fn handle_skills_list(State(st): State<AppState>, headers: HeaderMap) -> Response {
     if !admin_authorized(&headers, &st) {
         return admin_denied();
@@ -4257,7 +4308,7 @@ async fn handle_skills_list(State(st): State<AppState>, headers: HeaderMap) -> R
     .into_response()
 }
 
-/// POST /api/skills — 新建/更新技能 body: { id?, name, description, body, triggers? }
+/// POST /api/skills - create/update skill body: { id?, name, description, body, triggers? }
 async fn handle_skills_upsert(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -4298,9 +4349,9 @@ async fn handle_skills_upsert(
             .unwrap_or_default(),
     };
     if input.name.trim().is_empty() || input.description.trim().is_empty() {
-        return bad_req("name 和 description 不能为空");
+        return bad_req("name and description must not be empty");
     }
-    // 质量门：对 name/description/body 统一校验；未通过默认拒绝（force:true 可强制保存）
+    // Quality gate: uniformly validate name/description/body; rejected by default if it fails (force:true forces a save)
     let force = v.get("force").and_then(|x| x.as_bool()).unwrap_or(false);
     let mut issues = st.skills.gate(&input.body);
     issues.extend(st.skills.gate(&input.name));
@@ -4308,7 +4359,7 @@ async fn handle_skills_upsert(
     if !issues.is_empty() && !force {
         return (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "ok": false, "message": "质量门未通过（如确认无误可加 force:true 强制保存）", "issues": issues })),
+            Json(serde_json::json!({ "ok": false, "message": "Quality gate failed (add force:true to force save if you confirm it's fine)", "issues": issues })),
         )
             .into_response();
     }
@@ -4316,7 +4367,7 @@ async fn handle_skills_upsert(
         Ok(s) => {
             let gate = st.skills.gate(&s.body);
             st.logs
-                .emit("info", "skills", None, format!("技能已保存: {}", s.name));
+                .emit("info", "skills", None, format!("Skill saved: {}", s.name));
             Json(serde_json::json!({ "ok": true, "skill": s, "gate": gate })).into_response()
         }
         Err(e) => (
@@ -4378,7 +4429,7 @@ async fn handle_skills_delete(
     }
 }
 
-/// POST /api/skills/gate — body: { body } 返回质量问题列表（空数组=通过）
+/// POST /api/skills/gate - body: { body }, returns a list of quality issues (empty array = passed)
 async fn handle_skills_gate(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -4395,17 +4446,17 @@ async fn handle_skills_gate(
     Json(serde_json::json!({ "ok": true, "issues": st.skills.gate(text) })).into_response()
 }
 
-// ---------- 日志 API ----------
+// ---------- Logs API ----------
 
 #[derive(serde::Deserialize)]
 struct LogsQuery {
     limit: Option<usize>,
     after_id: Option<u64>,
-    /// SSE 场景浏览器无法设置请求头，允许用 query 传 api key（仅 api_keys 非空时校验）
+    /// Browsers can't set request headers for SSE, so allow passing the api key via query (validated only when api_keys is non-empty)
     key: Option<String>,
 }
 
-/// GET /api/logs/recent?limit=200 — 最近日志（首屏加载）
+/// GET /api/logs/recent?limit=200 - recent logs (initial page load)
 async fn handle_logs_recent(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -4418,9 +4469,9 @@ async fn handle_logs_recent(
     Json(serde_json::json!({ "ok": true, "events": events, "count": events.len() })).into_response()
 }
 
-/// GET /api/logs/stream — 实时日志 SSE。
-/// - 支持 `?key=`（浏览器 EventSource 无法带头）
-/// - 支持 `Last-Event-ID` 请求头：断线重连时先补发错过的事件
+/// GET /api/logs/stream - real-time log SSE.
+/// - Supports `?key=` (browser EventSource can't send headers)
+/// - Supports the `Last-Event-ID` request header: on reconnect after disconnect, first resend missed events
 async fn handle_logs_stream(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -4435,7 +4486,7 @@ async fn handle_logs_stream(
     if !admin_authorized(&headers, &st) && !query_key_ok {
         return admin_denied();
     }
-    // 断线补发：浏览器重连会带 Last-Event-ID
+    // Resend on reconnect: the browser reconnect will include Last-Event-ID
     let last_id = headers
         .get("last-event-id")
         .and_then(|v| v.to_str().ok())
@@ -4467,9 +4518,9 @@ async fn handle_logs_stream(
     Sse::new(stream).into_response()
 }
 
-// ---------- 请求详情 ----------
+// ---------- Request detail ----------
 
-/// GET /api/usage/requests/{id} — 单条请求完整信息 + 事件链
+/// GET /api/usage/requests/{id} - full info for a single request + event chain
 async fn handle_usage_request_detail(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -4502,7 +4553,7 @@ async fn handle_usage_request_detail(
     }
 }
 
-/// 读取遥测事件（按 req_id 关联；低频操作，短连接可接受）
+/// Read telemetry events (correlated by req_id; low-frequency operation, a short-lived connection is fine)
 fn read_telemetry_events(db_path: &str, req_id: &str) -> Vec<serde_json::Value> {
     let conn = match rusqlite::Connection::open_with_flags(
         db_path,
@@ -4530,7 +4581,7 @@ fn read_telemetry_events(db_path: &str, req_id: &str) -> Vec<serde_json::Value> 
     }
 }
 
-/// 读取遥测富记录（endpoint/ttft/error_kind 等；详情抽屉优先展示）
+/// Read the rich telemetry record (endpoint/ttft/error_kind etc.; shown first in the detail drawer)
 fn read_telemetry_request(db_path: &str, req_id: &str) -> Option<serde_json::Value> {
     let conn =
         rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
@@ -4561,7 +4612,7 @@ fn read_telemetry_request(db_path: &str, req_id: &str) -> Option<serde_json::Val
     rows.next().and_then(|r| r.ok())
 }
 
-/// GET /api/usage/cost — 速率与错误率（免费层无货币成本；诚实标注 estimated）
+/// GET /api/usage/cost - rate and error rate (free tier has no monetary cost; honestly labeled as estimated)
 async fn handle_usage_cost(State(st): State<AppState>, headers: HeaderMap) -> Response {
     if !admin_authorized(&headers, &st) {
         return admin_denied();
@@ -4599,28 +4650,28 @@ async fn handle_usage_cost(State(st): State<AppState>, headers: HeaderMap) -> Re
         "requests_per_hour": requests_30m * 2,
         "totals": totals,
         "estimated": true,
-        "cost_source": "免费层（无货币成本记录）",
+        "cost_source": "free tier (no monetary cost recorded)",
     }))
     .into_response()
 }
 
-/// GET /api/usage/insights — "三最"聚合（最慢账号/最常用模型/错误率最高时段），本地 SQLite 聚合
+/// GET /api/usage/insights - "top three" aggregation (slowest account/most-used model/highest error-rate window), aggregated locally via SQLite
 async fn handle_usage_insights(State(st): State<AppState>, headers: HeaderMap) -> Response {
     if !admin_authorized(&headers, &st) {
         return admin_denied();
     }
-    // 审计 L1：SQLite 聚合放阻塞池，避免占用 tokio worker；busy_timeout 已在 open_db 设置
+    // Audit L1: run the SQLite aggregation on the blocking pool to avoid occupying a tokio worker; busy_timeout is already set in open_db
     let db = st.cfg.telemetry_path.clone();
     match tokio::task::spawn_blocking(move || crate::telemetry::insights(&db, 24)).await {
         Ok(Ok(v)) => Json(v).into_response(),
         Ok(Err(e)) => internal_err(&e),
-        Err(e) => internal_err(&anyhow::anyhow!("insights 任务失败: {e}")),
+        Err(e) => internal_err(&anyhow::anyhow!("insights task failed: {e}")),
     }
 }
 
-/// 写端点 CSRF 防护：要求 `application/json`。
-/// 跨站表单只能发送 text/plain / urlencoded / multipart（浏览器"简单请求"，无需预检）；
-/// 强制 JSON 会让浏览器先发预检，从而挡住 CSRF 写入。
+/// Write-endpoint CSRF protection: requires `application/json`.
+/// A cross-site form can only send text/plain / urlencoded / multipart (a browser "simple request", no preflight needed);
+/// forcing JSON makes the browser send a preflight first, which blocks CSRF writes.
 fn json_write_ok(headers: &HeaderMap) -> bool {
     headers
         .get("content-type")
@@ -4629,27 +4680,27 @@ fn json_write_ok(headers: &HeaderMap) -> bool {
         .unwrap_or(false)
 }
 
-/// 写端点统一守卫：鉴权 + JSON content-type
+/// Unified write-endpoint guard: auth + JSON content-type
 fn write_guard(headers: &HeaderMap, st: &AppState) -> Option<Response> {
     if !admin_authorized(headers, st) {
         return Some(admin_denied());
     }
     if !json_write_ok(headers) {
         return Some(bad_req(
-            "写操作要求 content-type: application/json（CSRF 防护）",
+            "write operations require content-type: application/json (CSRF protection)",
         ));
     }
     None
 }
 
-// ---------- 上游会话清理 ----------
+// ---------- Upstream session cleanup ----------
 
-/// 记录上游 threadId（json 追加 + 去重；供会话清理，防止反代长期堆积给上游制造压力）
-/// threads.json 串行锁：record_thread / sweep_threads 都是"读-改-写整文件"，
-/// 且 sweep 的删除窗口跨越网络 IO（数十秒），并发会互相覆盖（丢新 thread 记录 → 永不清理）。
+/// Record the upstream threadId (json append + dedupe; used for session cleanup, to prevent the reverse proxy from accumulating load on upstream over time)
+/// threads.json serial lock: both record_thread / sweep_threads are "read-modify-write the whole file",
+/// and sweep's deletion window spans network IO (tens of seconds); concurrent writes would overwrite each other (losing new thread records -> never cleaned up).
 static THREADS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// 原子写（JSON 字符串 → 临时文件 → rename），防截断
+/// Atomic write (JSON string -> temp file -> rename), to prevent truncation
 fn atomic_write_json(path: &str, json: &str) {
     let p = std::path::Path::new(path);
     if let Some(parent) = p.parent() {
@@ -4671,7 +4722,7 @@ fn record_thread(path: &str, thread_id: &str) {
     }
     let _g = match THREADS_LOCK.lock() {
         Ok(g) => g,
-        Err(_) => return, // 锁中毒时放弃记录（不能因记录失败阻塞对话流）
+        Err(_) => return, // give up recording if the lock is poisoned (a failed record must not block the conversation flow)
     };
     let mut list: Vec<serde_json::Value> = std::fs::read_to_string(path)
         .ok()
@@ -4692,26 +4743,26 @@ fn record_thread(path: &str, thread_id: &str) {
     }
 }
 
-/// POST /api/threads/cleanup — 清理上游会话（用户批注需求：防止反代给上游制造压力/被识别）
+/// POST /api/threads/cleanup - clean up upstream sessions (per user's annotated requirement: prevent the reverse proxy from putting load on upstream / being identified)
 /// body: `{ dry_run?: bool = true, max_age_hours?: u64 = 24 }`
-/// 保守设计：dry_run 默认 true；上游删除端点未在抓包中确认（尝试 DELETE /{id} 与 POST /delete），
-/// 删除失败的记录会保留（不丢账）。
-/// 会话清理结果
+/// Conservative design: dry_run defaults to true; the upstream delete endpoint hasn't been confirmed via packet capture (tries DELETE /{id} and POST /delete),
+/// records that fail to delete are kept (no account data is lost).
+/// Session cleanup result
 struct SweepOutcome {
     total: usize,
     expired: usize,
     expired_ids: Vec<String>,
     deleted: usize,
-    /// 删除成功（含上游已不存在）的 id，回写时从 threads.json 移除这些
+    /// ids that were deleted successfully (including those already gone upstream); these are removed from threads.json on write-back
     deleted_ids: Vec<String>,
     failed: Vec<String>,
     remaining: usize,
 }
 
-/// 扫描 threads.json，找出超过保留时长的上游会话；`dry_run=false` 时真实删除并回写文件。
+/// Scan threads.json to find upstream sessions past the retention duration; when `dry_run=false`, actually delete them and write the file back.
 ///
-/// 用户批注（网页对话.txt:605）：反代必须自己清理上游会话，
-/// "以防止我们反代给上游制造压力等等的让上游查出来就完蛋了"。
+/// User annotation (网页对话.txt:605): the reverse proxy must clean up upstream sessions itself,
+/// "to prevent our reverse proxy from putting pressure on upstream, getting caught, and it being game over".
 async fn sweep_threads(
     st: &AppState,
     max_age_hours: u64,
@@ -4740,7 +4791,7 @@ async fn sweep_threads(
                     .num_hours() as u64
                     >= max_age_hours
             }
-            None => true, // 无时间戳视为可清理
+            None => true, // treat missing timestamp as eligible for cleanup
         };
         if is_expired {
             expired_ids.push(id);
@@ -4757,22 +4808,22 @@ async fn sweep_threads(
         failed: Vec::new(),
         remaining: fresh.len(),
     };
-    // 预演或没有过期项 → 不需要凭证、不写文件
+    // Dry run or no expired items -> no credentials needed, no file write
     if dry_run || expired_ids.is_empty() {
         return Ok(outcome);
     }
     let (cookie, _, cid) = match pick_web_cookie(st).await {
         Some(v) => v,
-        None => anyhow::bail!("需要 web Cookie 凭证才能清理上游会话"),
+        None => anyhow::bail!("a web Cookie credential is required to clean up upstream sessions"),
     };
     let client = crate::web_protocol::WebClient::new(cookie, "glm-5.3-flash".into())
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     let mut still = fresh;
     for id in &expired_ids {
         match client.delete_thread(id).await {
-            // 上游已删掉 / 本来就不存在（404）→ 两种情况都不需要再保留本地记录
+            // Already deleted upstream / never existed (404) -> in both cases the local record no longer needs to be kept
             Ok(found) => {
-                // v0.9：删除成功 → 池记 ok
+                // v0.9: deletion succeeded -> record ok in the pool
                 st.web_pool.mark_ok(&cid).await;
                 outcome.deleted += 1;
                 outcome.deleted_ids.push(id.clone());
@@ -4781,17 +4832,17 @@ async fn sweep_threads(
                     "cleanup",
                     None,
                     if found {
-                        format!("已删除上游会话 {id}")
+                        format!("deleted upstream session {id}")
                     } else {
-                        format!("会话 {id} 上游已不存在，移除本地记录")
+                        format!("session {id} no longer exists upstream, removing local record")
                     },
                 );
             }
             Err(e) => {
-                // v0.9：删除失败（401/403/网络）→ 池内降分/熔断/冷却
+                // v0.9: deletion failed (401/403/network) -> lower score / circuit-break / cool down in the pool
                 web_pool_failure(st, &cid, &e.to_string()).await;
                 outcome.failed.push(id.clone());
-                tracing::debug!("删除会话 {id} 失败: {e}");
+                tracing::debug!("failed to delete session {id}: {e}");
                 if let Some(orig) = all
                     .iter()
                     .find(|t| t.get("id").and_then(|x| x.as_str()) == Some(id.as_str()))
@@ -4802,9 +4853,9 @@ async fn sweep_threads(
         }
     }
     outcome.remaining = still.len();
-    // 回写必须在 THREADS_LOCK 内、且**基于当前文件内容合并**：
-    // sweep 的删除窗口跨越网络 IO（数十秒），期间 record_thread 可能追加了新 thread——
-    // 直接回写旧快照会把它们吃掉（该会话永不清理）。锁内重读文件，只移除已成功删除的 id。
+    // The write-back must happen inside THREADS_LOCK, and **merge based on the current file contents**:
+    // sweep's deletion window spans network IO (tens of seconds); during that time record_thread may have appended a new thread --
+    // writing back the old snapshot directly would swallow them (that session would never get cleaned up). Re-read the file inside the lock, and only remove ids that were successfully deleted.
     let _g = match THREADS_LOCK.lock() {
         Ok(g) => g,
         Err(_) => return Ok(outcome),
@@ -4817,7 +4868,7 @@ async fn sweep_threads(
         let id = t.get("id").and_then(|x| x.as_str()).unwrap_or("");
         !outcome.deleted_ids.contains(&id.to_string())
     });
-    // 补回删除失败但快照里没有的（防御性，一般不会发生）
+    // Add back entries that failed to delete but are missing from the snapshot (defensive, normally shouldn't happen)
     for id in &outcome.failed {
         if !final_list
             .iter()
@@ -4838,12 +4889,12 @@ async fn sweep_threads(
     Ok(outcome)
 }
 
-/// 后台自动清理循环：每 `thread_cleanup_interval_sec` 秒清理一次超过 `thread_max_age_hours` 的上游会话。
-/// 间隔为 0 时不启动（由 main 决定）。没有过期会话时完全静默，不刷日志。
+/// Background auto-cleanup loop: every `thread_cleanup_interval_sec` seconds, clean up upstream sessions older than `thread_max_age_hours`.
+/// Does not start when the interval is 0 (decided by main). Completely silent when there are no expired sessions, no log spam.
 pub async fn thread_cleanup_loop(st: AppState) {
     let interval = st.cfg.thread_cleanup_interval_sec.max(60);
     tracing::info!(
-        "上游会话自动清理已启用：每 {interval}s 清理超过 {} 小时的会话",
+        "Upstream session auto-cleanup enabled: every {interval}s, clean up sessions older than {} hours",
         st.cfg.thread_max_age_hours
     );
     loop {
@@ -4855,13 +4906,13 @@ pub async fn thread_cleanup_loop(st: AppState) {
                 "cleanup",
                 None,
                 format!(
-                    "自动清理：删除 {} 个过期会话（{} 个失败），剩余 {}",
+                    "Auto-cleanup: deleted {} expired session(s) ({} failed), {} remaining",
                     o.deleted,
                     o.failed.len(),
                     o.remaining
                 ),
             ),
-            Err(e) => tracing::warn!("自动清理会话未执行: {e}"),
+            Err(e) => tracing::warn!("auto-cleanup did not run: {e}"),
         }
     }
 }
@@ -4894,7 +4945,7 @@ async fn handle_threads_cleanup(
             "total": outcome.total,
             "expired": outcome.expired,
             "thread_ids": outcome.expired_ids,
-            "message": format!("预演：{} 个会话超过 {} 小时可清理（真实删除请传 dry_run:false）", outcome.expired, max_age_hours),
+            "message": format!("Dry run: {} session(s) exceed {} hours and can be cleaned up (pass dry_run:false to actually delete)", outcome.expired, max_age_hours),
         }))
         .into_response();
     }
@@ -4906,16 +4957,16 @@ async fn handle_threads_cleanup(
         "failed_ids": outcome.failed,
         "remaining": outcome.remaining,
         "message": if outcome.failed.is_empty() {
-            format!("已清理 {} 个会话", outcome.deleted)
+            format!("cleaned up {} session(s)", outcome.deleted)
         } else {
-            format!("已清理 {} 个；{} 个删除失败（上游端点待验证，记录已保留）", outcome.deleted, outcome.failed.len())
+            format!("cleaned up {}; {} failed to delete (upstream endpoint unverified, records kept)", outcome.deleted, outcome.failed.len())
         },
     }))
     .into_response()
 }
 
-// ---------- 记忆 API ----------
-/// GET /api/memory — 记忆列表 + 统计 + 运行时开关状态
+// ---------- Memory API ----------
+/// GET /api/memory - memory list + stats + runtime toggle status
 async fn handle_memory_list(State(st): State<AppState>, headers: HeaderMap) -> Response {
     if !admin_authorized(&headers, &st) {
         return admin_denied();
@@ -4931,7 +4982,7 @@ async fn handle_memory_list(State(st): State<AppState>, headers: HeaderMap) -> R
     .into_response()
 }
 
-/// POST /api/memory — 手动新增记忆 body: {kind, title, content, is_static?}
+/// POST /api/memory - manually add a memory body: {kind, title, content, is_static?}
 async fn handle_memory_upsert(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -4968,12 +5019,12 @@ async fn handle_memory_upsert(
         .and_then(|x| x.as_bool())
         .unwrap_or(false);
     if title.is_empty() || content.trim().is_empty() {
-        return bad_req("title 和 content 不能为空");
+        return bad_req("title and content must not be empty");
     }
     match st.memory.upsert(kind, &title, &content, is_static) {
         Ok(m) => {
             st.logs
-                .emit("info", "memory", None, format!("记忆已保存: {}", m.title));
+                .emit("info", "memory", None, format!("Memory saved: {}", m.title));
             Json(serde_json::json!({ "ok": true, "memory": m })).into_response()
         }
         Err(e) => (
@@ -5039,7 +5090,7 @@ async fn handle_memory_static(
 }
 
 /// POST /api/memory/toggle — body: {enabled: bool}
-/// 记忆层总开关（默认关闭）：关闭后既不自动记录也不注入 system；写回 config.json 立即热生效。
+/// Memory layer master toggle (off by default): once off, it neither auto-records nor injects into system; writes back to config.json and takes effect immediately.
 async fn handle_memory_toggle(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -5050,17 +5101,17 @@ async fn handle_memory_toggle(
     }
     let v: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
-        Err(_) => return bad_req("body 必须是 JSON"),
+        Err(_) => return bad_req("body must be JSON"),
     };
     let Some(enabled) = v.get("enabled").and_then(|x| x.as_bool()) else {
-        return bad_req("缺少 enabled（bool）");
+        return bad_req("missing enabled (bool)");
     };
-    // 热生效：Config 在 Arc 后面不可变，用与 api_keys 同款的 RwLock 槽覆盖读取。
-    // 简单做法：直接改 Arc 不可行——这里用 AtomicBool 语义借道 api_keys 模式太重，
-    // 改为运行时写一个覆盖文件不可取——最直接：与 api-key 一致，写回 config.json + 内存标志。
-    // Config 本体不可变，因此把开关状态也镜像进 st（见 memory_runtime_enabled）。
+    // Hot-apply: Config is immutable behind the Arc, so use the same RwLock-slot override read pattern as api_keys.
+    // Simple approach: mutating the Arc directly isn't feasible -- using AtomicBool semantics by borrowing the api_keys pattern here is too heavy,
+    // switching to writing a runtime override file isn't desirable either -- the most direct way: consistent with api-key, write back to config.json + an in-memory flag.
+    // Config itself is immutable, so the toggle state is also mirrored into st (see memory_runtime_enabled).
     set_memory_runtime_enabled(&st, enabled);
-    // 持久化到 config.json（Value 往返合并，避免覆盖用户其他配置）
+    // Persist to config.json (round-trip merge as Value, to avoid overwriting the user's other settings)
     let path = crate::config::resolve_config_path();
     let mut persisted = false;
     if let Some(p) = path.as_deref() {
@@ -5086,9 +5137,9 @@ async fn handle_memory_toggle(
         match write_res {
             Ok(()) => {
                 persisted = true;
-                tracing::info!("memory_enabled={enabled} 已写回 {p}");
+                tracing::info!("memory_enabled={enabled} written back to {p}");
             }
-            Err(e) => tracing::warn!("memory_enabled 写回 {p} 失败: {e}（仅内存生效）"),
+            Err(e) => tracing::warn!("failed to write memory_enabled back to {p}: {e} (in-memory only)"),
         }
     }
     st.logs.emit(
@@ -5096,11 +5147,11 @@ async fn handle_memory_toggle(
         "memory",
         None,
         format!(
-            "记忆层已{}",
+            "Memory layer is now {}",
             if enabled {
-                "开启（自动记录 + 注入）"
+                "on (auto-record + inject)"
             } else {
-                "关闭（不记录不注入）"
+                "off (no recording, no injection)"
             }
         ),
     );
@@ -5108,20 +5159,20 @@ async fn handle_memory_toggle(
         "ok": true,
         "enabled": enabled,
         "persisted": persisted,
-        "message": if enabled { "记忆层已开启：自动记录你的偏好与纠正，并在相关对话时注入" } else { "记忆层已关闭：不再自动记录，也不再注入任何记忆内容" },
+        "message": if enabled { "Memory layer is now on: your preferences and corrections will be auto-recorded and injected into relevant conversations" } else { "Memory layer is now off: no longer auto-recording, and no memory content will be injected" },
     }))
     .into_response()
 }
 
-// ---------- MCP（只读工具） ----------
+// ---------- MCP (read-only tools) ----------
 
-/// POST /mcp — MCP JSON-RPC 2.0 端点（tools/list + tools/call，仅只读 3 工具）
+/// POST /mcp - MCP JSON-RPC 2.0 endpoint (tools/list + tools/call, only 3 read-only tools)
 async fn handle_mcp(
     State(st): State<AppState>,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    // 与 /v1 一致的网关鉴权：配置 api_keys 时校验；未配置时仅本机
+    // Gateway auth consistent with /v1: validated when api_keys is configured; loopback-only when not configured
     if !origin_allowed(&headers) {
         return origin_blocked();
     }
@@ -5145,11 +5196,11 @@ async fn handle_mcp(
             .header("content-type", "application/json")
             .body(Body::from(resp))
             .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
-        None => StatusCode::ACCEPTED.into_response(), // notification：无响应体
+        None => StatusCode::ACCEPTED.into_response(), // notification: no response body
     }
 }
 
-/// 组装 MCP 数据快照（从 AppState 拉取只读数据）
+/// Assemble the MCP data snapshot (pull read-only data from AppState)
 async fn build_mcp_snapshot(st: &AppState) -> crate::mcp::GatewaySnapshot {
     let models = st.registry.models().await;
     let pool_snap = st.pool.snapshot().await;
@@ -5177,115 +5228,119 @@ async fn build_mcp_snapshot(st: &AppState) -> crate::mcp::GatewaySnapshot {
     }
 }
 
-// ---------- 系统体检 ----------
+// ---------- System health check ----------
 
-/// GET /api/doctor — 逐项检查（四态：ok / fault / unknown / fact；"未检查"就是未检查）
+/// GET /api/doctor — item-by-item check (four states: ok / fault / unknown / fact; "not checked" simply means not checked)
 async fn handle_doctor(State(st): State<AppState>, headers: HeaderMap) -> Response {
     if !admin_authorized(&headers, &st) {
         return admin_denied();
     }
     let mut checks: Vec<serde_json::Value> = Vec::new();
 
-    // 1. 配置
+    // 1. Config
     checks.push(serde_json::json!({
-        "id": "config", "label": "配置", "state": "ok",
-        "detail": format!("监听 {}，上游 {}", st.cfg.listen_addr, st.cfg.upstream_base_url),
+        "id": "config", "label": "Config", "state": "ok",
+        "detail": format!("Listening on {}, upstream {}", st.cfg.listen_addr, st.cfg.upstream_base_url),
     }));
-    // 1b. 监听非回环且未配置 api_keys → 警告（v0.9 §1.5 鉴权纵深）
+    // 1b. Listening non-loopback with api_keys not configured -> warning (v0.9 §1.5 auth depth)
     let non_loopback = !st.cfg.listen_addr.starts_with("127.")
         && !st.cfg.listen_addr.starts_with("localhost")
         && !st.cfg.listen_addr.starts_with("[::1]");
     if non_loopback && api_keys_of(&st).is_empty() {
         checks.push(serde_json::json!({
-            "id": "listen_scope", "label": "监听范围", "state": "fault",
-            "detail": format!("监听 {}（非回环）但未配置 api_keys —— 局域网/远端可访问面板与管理接口", st.cfg.listen_addr),
-            "fix": "设置 api_keys（面板「接入指南」一键生成），或将 listen_addr 改回 127.0.0.1",
+            "id": "listen_scope", "label": "Listen scope", "state": "fault",
+            "detail": format!("Listening on {} (non-loopback) but api_keys is not configured -- LAN/remote clients can reach the panel and admin endpoints", st.cfg.listen_addr),
+            "fix": "Set api_keys (one-click generate from the panel's \"Getting Started\" guide), or change listen_addr back to 127.0.0.1",
         }));
     } else {
         checks.push(serde_json::json!({
-            "id": "listen_scope", "label": "监听范围", "state": "ok",
-            "detail": format!("监听 {}", st.cfg.listen_addr),
+            "id": "listen_scope", "label": "Listen scope", "state": "ok",
+            "detail": format!("Listening on {}", st.cfg.listen_addr),
         }));
     }
-    // 2. 账号池
+    // 2. Account pool
+    // Bearer pool + web Cookie pool (cookie accounts serve requests through the bridge)
     let snap = st.pool.snapshot().await;
-    let healthy = snap.accounts.iter().filter(|a| a.healthy).count();
-    let (acct_state, acct_fix) = if snap.total == 0 {
-        ("fault", "去「账号」页导入 Cookie / 一键登录")
+    let web = st.web_pool.snapshot().await;
+    let total = snap.total + web.len();
+    let healthy = snap.accounts.iter().filter(|a| a.healthy).count()
+        + web.iter().filter(|w| w.cooldown_seconds.is_none()).count();
+    let (acct_state, acct_fix) = if total == 0 {
+        ("fault", "Go to the Accounts page to import a Cookie or use one-click login")
     } else if healthy == 0 {
-        ("fault", "所有账号冷却中：等待冷却结束，或重新登录刷新凭证")
+        ("fault", "All accounts are cooling down: wait for cooldown to end, or log in again to refresh credentials")
     } else {
         ("ok", "")
     };
     checks.push(serde_json::json!({
-        "id": "accounts", "label": "账号池", "state": acct_state,
-        "detail": format!("{healthy}/{} 个账号可用", snap.total),
+        "id": "accounts", "label": "Account pool", "state": acct_state,
+        "detail": format!("{healthy}/{total} accounts available"),
         "fix": acct_fix,
     }));
-    // 3. 模型注册表
+    // 3. Model registry
     let models = st.registry.models().await;
     checks.push(serde_json::json!({
-        "id": "models", "label": "模型注册表",
+        "id": "models", "label": "Model registry",
         "state": if models.is_empty() { "fault" } else { "ok" },
-        "detail": format!("{} 个模型可用", models.len()),
-        "fix": if models.is_empty() { "检查上游连通性与代理设置" } else { "" },
+        "detail": format!("{} models available", models.len()),
+        "fix": if models.is_empty() { "Check upstream connectivity and proxy settings" } else { "" },
     }));
-    // 4. 遥测写入
+    // 4. Telemetry writes
     let dropped = st.telemetry.dropped();
     checks.push(serde_json::json!({
-        "id": "telemetry", "label": "遥测写入",
+        "id": "telemetry", "label": "Telemetry writes",
         "state": if dropped > 1000 { "fault" } else { "ok" },
-        "detail": format!("累计丢弃 {} 条（队列满时）", dropped),
+        "detail": format!("{} dropped in total (when the queue is full)", dropped),
     }));
-    // 5. 技能库
+    // 5. Skill library
     let skills = st.skills.list();
     let enabled = skills.iter().filter(|s| s.enabled).count();
     checks.push(serde_json::json!({
-        "id": "skills", "label": "技能库", "state": "ok",
-        "detail": format!("{} 条（启用 {}）", skills.len(), enabled),
+        "id": "skills", "label": "Skill library", "state": "ok",
+        "detail": format!("{} entries (enabled {})", skills.len(), enabled),
     }));
-    // 6. 日志总线
+    // 6. Log bus
     checks.push(serde_json::json!({
-        "id": "logs", "label": "日志总线", "state": "ok",
-        "detail": format!("已记录 {} 条", st.logs.count()),
+        "id": "logs", "label": "Log bus", "state": "ok",
+        "detail": format!("{} entries recorded", st.logs.count()),
     }));
-    // 7. 记忆库
+    // 7. Memory store
     let mem_stats = st.memory.stats().unwrap_or_else(|_| serde_json::json!({}));
     checks.push(serde_json::json!({
-        "id": "memory", "label": "记忆库", "state": "ok",
+        "id": "memory", "label": "Memory store", "state": "ok",
         "detail": format!(
-            "{} 条（稳定事实 {} / 纠正 {}）",
+            "{} entries (static facts {} / corrections {})",
             mem_stats.get("total").and_then(|v| v.as_i64()).unwrap_or(0),
             mem_stats.get("static_count").and_then(|v| v.as_i64()).unwrap_or(0),
             mem_stats.get("corrections").and_then(|v| v.as_i64()).unwrap_or(0)
         ),
     }));
-    // 8. 监听地址 + api_keys（v0.9 §1.5 鉴权纵深警告）
+    // 8. Listen address + api_keys (v0.9 §1.5 auth depth warning)
     if !crate::config::is_loopback_listen(&st.cfg.listen_addr) && api_keys_of(&st).is_empty() {
         checks.push(serde_json::json!({
-            "id": "listen", "label": "监听地址", "state": "warn",
-            "detail": format!("监听非回环 {} 但未配置 api_keys：局域网内其他设备可访问面板/管理端点（已按真实 TCP 对端收窄，仅本机回环放行）", st.cfg.listen_addr),
-            "fix": "在 config.json 配置 api_keys，或把 listen_addr 改回 127.0.0.1",
+            "id": "listen", "label": "Listen address", "state": "warn",
+            "detail": format!("Listening non-loopback on {} but api_keys is not configured: other devices on the LAN can access the panel/admin endpoints (narrowed to the real TCP peer; only local loopback is allowed)", st.cfg.listen_addr),
+            "fix": "Configure api_keys in config.json, or change listen_addr back to 127.0.0.1",
         }));
     } else {
         checks.push(serde_json::json!({
-            "id": "listen", "label": "监听地址", "state": "ok",
-            "detail": format!("监听 {}", st.cfg.listen_addr),
+            "id": "listen", "label": "Listen address", "state": "ok",
+            "detail": format!("Listening on {}", st.cfg.listen_addr),
         }));
     }
-    // 9. 版本
+    // 9. Version
     checks.push(serde_json::json!({
-        "id": "version", "label": "版本", "state": "fact",
-        "detail": format!("v{}（运行 {} 秒）", env!("CARGO_PKG_VERSION"), st.started.elapsed().as_secs()),
+        "id": "version", "label": "Version", "state": "fact",
+        "detail": format!("v{} (running for {} seconds)", env!("CARGO_PKG_VERSION"), st.started.elapsed().as_secs()),
     }));
 
     Json(serde_json::json!({ "ok": true, "checks": checks })).into_response()
 }
 
-/// 组装 system 前缀：
-/// - skills_inject_mode="roster"（默认）：提示词（base+启用项）+ 技能 roster（名称+描述，预算内）
-/// - skills_inject_mode="full"：退回旧行为（prompts.system_prefix 含全量技能）
-/// - 记忆块（低权威，预算 512 token）追加在最后；空则不注入
+/// Assemble the system prefix:
+/// - skills_inject_mode="roster" (default): prompt (base + enabled items) + skill roster (name+description, within budget)
+/// - skills_inject_mode="full": fall back to the old behavior (prompts.system_prefix includes all skills)
+/// - Memory block (low authority, 512-token budget) appended last; not injected when empty
 async fn build_system_prefix(st: &AppState, query: &str) -> String {
     let mut s = if st.cfg.skills_inject_mode == "full" {
         st.prompts.system_prefix().await
@@ -5294,14 +5349,14 @@ async fn build_system_prefix(st: &AppState, query: &str) -> String {
         let roster = st.skills.system_prefix(st.cfg.max_roster_tokens);
         if !roster.trim().is_empty() {
             base.push_str(
-                "\n\n[freebuff-skills]\n以下技能可用（低权威参考；相关时按其指引行事）：\n",
+                "\n\n[freebuff-skills]\nThe following skills are available (low-authority reference; follow their guidance when relevant):\n",
             );
             base.push_str(&roster);
             base.push_str("\n[/freebuff-skills]");
         }
         base
     };
-    // 记忆注入（用户偏好/纠正；空结果不注入，保持请求字节稳定；运行时开关关闭时整体跳过）
+    // Memory injection (user preferences/corrections; an empty result is not injected, to keep the request byte-stable; skipped entirely when the runtime toggle is off)
     if memory_enabled_now(st) {
         let mem = st.memory.brief(query, 512);
         if !mem.is_empty() {
@@ -5311,7 +5366,7 @@ async fn build_system_prefix(st: &AppState, query: &str) -> String {
     s
 }
 
-/// 上游 200 响应体内嵌错误码检测（已知 free_mode_* 系列；正常响应不受影响）
+/// Detect embedded error codes in an upstream 200 response body (known free_mode_* family; normal responses are unaffected)
 fn upstream_body_error(text: &str) -> Option<&'static str> {
     const CODES: &[&str] = &[
         "free_mode_invalid_agent_model",
@@ -5321,8 +5376,8 @@ fn upstream_body_error(text: &str) -> Option<&'static str> {
     CODES.iter().find(|c| text.contains(**c)).copied()
 }
 
-/// 安全保留字符串尾部约 `keep_bytes` 字节，且起点落在字符边界上。
-/// 注意：不可直接用 `split_off(len - n)`——多字节字符（中文/emoji）会被切成非法边界而 panic。
+/// Safely keep roughly the last `keep_bytes` bytes of a string, with the start aligned to a char boundary.
+/// Note: don't use `split_off(len - n)` directly -- multi-byte characters (CJK/emoji) can be cut at an illegal boundary and panic.
 fn tail_keep(s: &str, keep_bytes: usize) -> String {
     if s.len() <= keep_bytes {
         return s.to_string();
@@ -5334,7 +5389,7 @@ fn tail_keep(s: &str, keep_bytes: usize) -> String {
     s[start..].to_string()
 }
 
-/// 从 SSE/JSON 文本尾部提取 usage（容错：找不到返回 None）
+/// Extract usage from the tail of SSE/JSON text (fault-tolerant: returns None if not found)
 fn extract_usage(text: &str) -> Option<(u64, u64)> {
     let idx = text.rfind("\"usage\"")?;
     let tail = &text[idx..];
@@ -5346,7 +5401,7 @@ fn extract_usage(text: &str) -> Option<(u64, u64)> {
     }
 }
 
-/// 在字符串里找 `"key": 123` 的数字（简易解析，够用且无依赖）
+/// Find the number in a `"key": 123` pattern within a string (simple parsing, good enough and dependency-free)
 fn find_json_number(s: &str, key: &str) -> Option<u64> {
     let i = s.find(key)?;
     let rest = &s[i + key.len()..];
@@ -5355,15 +5410,15 @@ fn find_json_number(s: &str, key: &str) -> Option<u64> {
     digits.parse().ok()
 }
 
-/// 按字符数估算 token 数（上游 web 协议 SSE 不携带 usage 时的记账兜底）。
-/// 中文约 1 字 ≈ 1~1.6 token、英文约 4 字符 ≈ 1 token，取折中：每 2 字符 1 token。
-/// 估算值偏保守（不虚报），面板侧仍以「估算」语义呈现，不冒充上游精确值。
+/// Estimate token count from character count (accounting fallback for when the upstream web protocol's SSE carries no usage).
+/// Chinese is roughly 1 char ~= 1-1.6 tokens, English roughly 4 chars ~= 1 token; split the difference: 1 token per 2 characters.
+/// The estimate is conservative (never overstated); the panel still presents it with "estimate" semantics, not as an exact upstream value.
 fn estimate_tokens(chars: usize) -> u64 {
     chars.div_ceil(2) as u64
 }
 
-/// 统计桥接转换后 OpenAI chunk 流里的正文与推理内容总字符数（tail 采样用）。
-/// 只数 delta.content / delta.reasoning_content 的字符串值，忽略 JSON 结构开销。
+/// Count the total characters of body and reasoning content in the bridged OpenAI chunk stream (used for tail sampling).
+/// Only counts the string values of delta.content / delta.reasoning_content, ignoring JSON structural overhead.
 fn count_bridge_content_chars(sse_tail: &str) -> usize {
     let mut total = 0usize;
     for line in sse_tail.lines() {
@@ -5390,23 +5445,23 @@ fn count_bridge_content_chars(sse_tail: &str) -> usize {
     total
 }
 
-// ---------- 多模态上传 ----------
+// ---------- Multimodal upload ----------
 
-/// POST /v1/uploads — 上传文件到上游换取 storageId（多模态链路第一步）
+/// POST /v1/uploads — upload a file to the upstream in exchange for a storageId (first step of the multimodal pipeline)
 ///
-/// 用法（裸文件体；无需 multipart，保持零新依赖）：
+/// Usage (raw file body; no multipart needed, keeps zero new dependencies):
 /// ```bash
 /// curl -X POST http://127.0.0.1:47821/v1/uploads \
 ///   -H "content-type: image/png" -H "x-file-name: a.png" \
 ///   --data-binary @a.png
 /// ```
-/// 返回 `{ id, storageId, mediaType, name }`，把 storageId 放进 /v1/web/chat 的 images 数组即可。
+/// Returns `{ id, storageId, mediaType, name }`; put storageId into the images array of /v1/web/chat.
 async fn handle_upload(
     State(st): State<AppState>,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    // 数据面 CSRF 防线（multipart 上传同样会被 text/plain 简单请求盲打）
+    // Data-plane CSRF defense (multipart uploads can equally be blind-hit by simple text/plain requests)
     if !origin_allowed(&headers) {
         return origin_blocked();
     }
@@ -5418,37 +5473,37 @@ async fn handle_upload(
         )
             .into_response();
     }
-    // v0.9 §1.1：从 WebCookiePool 挑选（多账号健康/冷却/轮询）
+    // v0.9 §1.1: pick from WebCookiePool (multi-account health/cooldown/round-robin)
     let (cookie, web_cid) = match pick_web_cookie(&st).await {
         Some((c, _, cid)) => (c, Some(cid)),
         None => (String::new(), None),
     };
     let cookie = if cookie.is_empty() {
-        // v0.10 §1.4：池非空但全部冷却 → 结构化降级；否则保留"未导入"文案
+        // v0.10 §1.4: pool non-empty but all cooling down -> structured degradation; otherwise keep the "not imported" message
         if st.web_pool.count().await > 0 {
             return web_pool_exhausted(&st).await;
         }
         return (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": { "message": "多模态上传需要 web Cookie 凭证（先 POST /api/tokens/import 导入）", "type": "invalid_request_error", "code": "multimodal_requires_web_cookie" } })),
+            Json(serde_json::json!({ "error": { "message": "Multimodal upload requires a web Cookie credential (POST /api/tokens/import first to import one)", "type": "invalid_request_error", "code": "multimodal_requires_web_cookie" } })),
         )
             .into_response();
     } else {
         cookie
     };
     if body.is_empty() {
-        return bad_req("empty body（请用 --data-binary 发送文件内容）");
+        return bad_req("empty body (use --data-binary to send the file content)");
     }
     if body.len() > 20 * 1024 * 1024 {
-        return bad_req("文件过大（上限 20MB）");
+        return bad_req("file too large (limit 20MB)");
     }
     let filename = headers
         .get("x-file-name")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("upload.png")
         .to_string();
-    // 透传客户端 Content-Type（支持图片/文档/任意文件；缺省按扩展名推断）
-    // 注意：此前白名单只放行 image/* 与 pdf，导致文档上传被改写成 image/png（拿不到 kind:"document"）
+    // Pass through the client's Content-Type (supports images/documents/any file; falls back to extension-based inference when absent)
+    // Note: the previous whitelist only allowed image/* and pdf, which caused document uploads to be rewritten as image/png (losing kind:"document")
     let mime = headers
         .get("content-type")
         .and_then(|v| v.to_str().ok())
@@ -5497,7 +5552,7 @@ async fn handle_upload(
                 "upload",
                 None,
                 format!(
-                    "上传 {}（{:.1}KB, {}）→ storageId {}",
+                    "Uploaded {} ({:.1}KB, {}) -> storageId {}",
                     filename.replace(['\r', '\n'], ""),
                     body.len() as f64 / 1024.0,
                     up.kind,
@@ -5512,13 +5567,13 @@ async fn handle_upload(
                 "mediaType": up.media_type,
                 "name": up.name,
                 "bytes": body.len(),
-                "url": up.url,                 // 仅图片有
+                "url": up.url,                 // images only
                 "descriptionStorageId": up.description_storage_id,
-                "chars": up.chars,             // 仅文档有（提取字符数）
-                "truncated": up.truncated,     // 仅文档有（是否截断）
+                "chars": up.chars,             // documents only (extracted character count)
+                "truncated": up.truncated,     // documents only (whether it was truncated)
                 "usage": {
-                    "image": "把 storageId 放进 /v1/web/chat 的 images 数组",
-                    "document": "把 storageId 放进 /v1/web/chat 的 attachments 数组"
+                    "image": "Put storageId into the images array of /v1/web/chat",
+                    "document": "Put storageId into the attachments array of /v1/web/chat"
                 }
             }))
             .into_response()
@@ -5527,7 +5582,7 @@ async fn handle_upload(
             if let Some(id) = &web_cid {
                 web_pool_failure(&st, id, &e.to_string()).await;
             }
-            // 截断上游错误体（防泄露账号/内部细节）
+            // Truncate the upstream error body (avoid leaking account/internal details)
             let msg: String = e.to_string().chars().take(300).collect();
             (
                 StatusCode::BAD_GATEWAY,
@@ -5538,7 +5593,7 @@ async fn handle_upload(
     }
 }
 
-/// 统一 400 JSON 响应
+/// Unified 400 JSON response
 fn bad_req(msg: &str) -> Response {
     (
         StatusCode::BAD_REQUEST,
@@ -5547,9 +5602,9 @@ fn bad_req(msg: &str) -> Response {
         .into_response()
 }
 
-/// 选取 web Cookie 凭证（v0.9 §1.1：从 WebCookiePool 按健康分/熔断/冷却挑选；
-/// config 与导入库凭证已在池构建时并入）。返回 cookie + 展示信息 + 稳定 id。
-/// v0.10 §1.4：web Cookie 池"全冷却/空池"的结构化降级错误（含最短恢复秒）
+/// Pick a web Cookie credential (v0.9 §1.1: chosen from WebCookiePool by health score/circuit-breaker/cooldown;
+/// config and imported-library credentials are already merged in when the pool is built). Returns cookie + display info + stable id.
+/// v0.10 §1.4: structured degradation error for a web Cookie pool that is "all cooling / empty" (includes the minimum recovery seconds)
 async fn web_pool_exhausted(st: &AppState) -> Response {
     let snap = st.web_pool.snapshot().await;
     let cooling: Vec<u64> = snap.iter().filter_map(|s| s.cooldown_seconds).collect();
@@ -5559,9 +5614,9 @@ async fn web_pool_exhausted(st: &AppState) -> Response {
         Json(serde_json::json!({
             "error": {
                 "message": format!(
-                    "{}{}。请到面板「账号」页检查或重新登录。",
-                    format!("所有 web Cookie 账号均不可用（池内 {} 个，冷却中 {} 个）", snap.len(), cooling.len()),
-                    if min_sec > 0 { format!("；最短约 {min_sec} 秒后恢复") } else { String::from("；冷却已到期") }
+                    "{}{}. Check on the panel's Accounts page or log in again.",
+                    format!("All web Cookie accounts are unavailable (pool has {} total, {} cooling down)", snap.len(), cooling.len()),
+                    if min_sec > 0 { format!("; recovers in about {min_sec} seconds at the earliest") } else { String::from("; cooldown has already expired") }
                 ),
                 "type": "pool_exhausted",
                 "code": "web_pool_exhausted",
@@ -5577,8 +5632,8 @@ async fn pick_web_cookie(st: &AppState) -> Option<(String, serde_json::Value, St
     Some((p.cookie, p.cred, p.id))
 }
 
-/// v0.9：web 池失败回写——401/403 确定性失效立即冷却（10 分钟，与 Bearer 池语义对齐），
-/// 其余（网络/5xx）走连续失败累计 → 达阈值熔断。
+/// v0.9: web pool failure write-back -- 401/403 deterministic invalidation cools down immediately (10 minutes, aligned with Bearer pool semantics),
+/// others (network/5xx) accumulate consecutive failures -> trips the breaker once the threshold is reached.
 async fn web_pool_failure(st: &AppState, id: &str, err: &str) {
     if err.contains("401") || err.contains("403") {
         st.web_pool
@@ -5589,7 +5644,7 @@ async fn web_pool_failure(st: &AppState, id: &str, err: &str) {
     }
 }
 
-/// 按稳定 id 取出一条 web Cookie 凭证（用于"对指定凭证做检查/详情"）
+/// Fetch one web Cookie credential by its stable id (used for "check/detail on a specific credential")
 fn cookie_by_id(st: &AppState, id: &str) -> Option<(String, crate::import::ExtractedAuth)> {
     crate::import::load_tokens_healed(&st.cfg.tokens_path)
         .ok()?
@@ -5598,14 +5653,14 @@ fn cookie_by_id(st: &AppState, id: &str) -> Option<(String, crate::import::Extra
         .map(|t| (t.token.clone(), t))
 }
 
-/// 上游调用结果 → `Option<serde_json::Value>`（`None` 表示该端点失败，快照对应字段留空）
+/// Upstream call result -> `Option<serde_json::Value>` (`None` means that endpoint failed; the corresponding snapshot field is left empty)
 fn value_of<T: serde::Serialize>(r: &Result<T, anyhow::Error>) -> Option<serde_json::Value> {
     r.as_ref().ok().and_then(|v| serde_json::to_value(v).ok())
 }
 
-/// `/api/auth/session` 对**未登录/无效凭证**返回的是 `HTTP 200 + {}`，不是 401。
-/// 只判断"请求成功"会把无效凭证误判为有效（实测：伪造 Cookie → `{}` 200）。
-/// 因此必须检查响应里真的有 user 主体。
+/// `/api/auth/session` returns `HTTP 200 + {}` for **unauthenticated/invalid credentials**, not 401.
+/// Checking only "did the request succeed" would misjudge an invalid credential as valid (observed: a forged Cookie -> `{}` 200).
+/// So we must check that the response actually contains a user body.
 fn session_is_authenticated(v: &serde_json::Value) -> bool {
     match v.get("user").filter(|u| u.is_object()) {
         Some(u) => ["id", "email", "name"]
@@ -5615,12 +5670,12 @@ fn session_is_authenticated(v: &serde_json::Value) -> bool {
     }
 }
 
-/// `/api/web/freebuff-session` 对无效凭证返回 401；有效时才有 accessTier/freebucks。
+/// `/api/web/freebuff-session` returns 401 for invalid credentials; accessTier/freebucks are only present when valid.
 fn quota_is_authenticated(v: &serde_json::Value) -> bool {
     v.get("accessTier").map(|x| !x.is_null()).unwrap_or(false) || v.get("freebucks").is_some()
 }
 
-/// 凭证是否可用：身份端点或额度端点任一确认已登录
+/// Whether the credential is usable: either the identity endpoint or the quota endpoint confirms logged-in
 fn credential_usable(
     identity: Option<&serde_json::Value>,
     quota: Option<&serde_json::Value>,
@@ -5629,7 +5684,7 @@ fn credential_usable(
         || quota.map(quota_is_authenticated).unwrap_or(false)
 }
 
-/// 把上游 4 个端点的响应聚合成一条面板可读的账号快照
+/// Aggregate the responses of the 4 upstream endpoints into one panel-readable account snapshot
 fn build_cred_meta(
     cred_id: &str,
     identity: Option<&serde_json::Value>,
@@ -5657,7 +5712,7 @@ fn build_cred_meta(
         m.all_time_active_days = v.get("allTimeActiveDays").and_then(|x| x.as_i64());
         m.tokens_7d = v.pointer("/recent/totalTokens").and_then(|x| x.as_i64());
     }
-    // 套餐档位：优先 freebuff-session.subscription，其次 /api/web/subscriptions.subscription
+    // Plan tier: prefer freebuff-session.subscription, then fall back to /api/web/subscriptions.subscription
     m.tier_id = quota
         .and_then(|v| v.pointer("/subscription/tierId"))
         .and_then(|x| x.as_str())
@@ -5717,7 +5772,7 @@ fn build_cred_meta(
     m
 }
 
-/// 写入一条使用记录（用户批注：每个账号都要有记录可查）。失败只记日志，不影响请求。
+/// Write one usage record (user note: every account should have a checkable record). Failure is only logged, doesn't affect the request.
 fn record_history(st: &AppState, m: &crate::account_meta::CredMeta, ok: bool) {
     let rec = crate::account_meta::HistoryRecord {
         ts: m.checked_at.clone(),
@@ -5733,12 +5788,12 @@ fn record_history(st: &AppState, m: &crate::account_meta::CredMeta, ok: bool) {
         ok,
     };
     if let Err(e) = st.meta.append_history(&rec) {
-        tracing::warn!("写入使用记录失败: {e}");
+        tracing::warn!("Failed to write usage record: {e}");
     }
 }
 
-/// GET /api/account/overview — 账号全貌（身份 / 用量统计 / 套餐 / 额度积分 / 本地凭证）
-/// 聚合上游 4 个端点，任一失败降级为 null（不整体失败）；前端负责中文呈现。
+/// GET /api/account/overview — full account picture (identity / usage stats / plan / quota points / local credential)
+/// Aggregates 4 upstream endpoints; any single failure degrades to null (doesn't fail overall); the frontend handles the display.
 async fn handle_account_overview(State(st): State<AppState>, headers: HeaderMap) -> Response {
     if !admin_authorized(&headers, &st) {
         return admin_denied();
@@ -5751,7 +5806,7 @@ async fn handle_account_overview(State(st): State<AppState>, headers: HeaderMap)
                 Json(serde_json::json!({
                     "ok": false,
                     "code": "need_cookie",
-                    "message": "还没有 web Cookie 凭证。点「一键登录」按向导操作，或粘贴 Cookie 导入。"
+                    "message": "No web Cookie credential yet. Click \"One-Click Login\" and follow the wizard, or paste a Cookie to import."
                 })),
             )
                 .into_response();
@@ -5761,15 +5816,15 @@ async fn handle_account_overview(State(st): State<AppState>, headers: HeaderMap)
         Ok(c) => c,
         Err(e) => return internal_err(&anyhow::Error::msg(e.to_string())),
     };
-    // 并发拉取（任一失败不影响其他）
+    // Fetch concurrently (any single failure doesn't affect the others)
     let (identity, usage, subs, quota) = tokio::join!(
         client.auth_session(),
         client.usage_summary(),
         client.subscriptions(),
         client.freebuff_session(),
     );
-    // 身份/额度端点任一确认已登录才算凭证可用。
-    // 注意：上游对未登录请求返回 200 + {}（不是 401），只判断"请求是否成功"会误判为有效。
+    // The credential is only usable if either the identity or the quota endpoint confirms logged-in.
+    // Note: the upstream returns 200 + {} for unauthenticated requests (not 401); checking only "did the request succeed" would misjudge it as valid.
     let iv = value_of(&identity);
     let qv = value_of(&quota);
     if !credential_usable(iv.as_ref(), qv.as_ref()) {
@@ -5778,10 +5833,10 @@ async fn handle_account_overview(State(st): State<AppState>, headers: HeaderMap)
             .err()
             .map(|e| e.to_string())
             .or_else(|| quota.as_ref().err().map(|e| e.to_string()))
-            .unwrap_or_else(|| "上游未返回登录账号（凭证已失效或未登录）".into());
-        // v0.9：凭证不可用 → 池内降分/熔断/冷却（401/403 自动熔断，其它累计）
+            .unwrap_or_else(|| "Upstream did not return a logged-in account (credential expired or not logged in)".into());
+        // v0.9: credential unusable -> lower score/circuit-break/cooldown in the pool (401/403 auto-trips the breaker, others accumulate)
         web_pool_failure(&st, &cid, &hint).await;
-        // 失败也记一条，便于排查"这个账号什么时候开始不可用"
+        // Also record a failure entry, to help trace "when did this account become unavailable"
         let mut failed = crate::account_meta::CredMeta {
             cred_id: cid,
             valid: false,
@@ -5799,11 +5854,11 @@ async fn handle_account_overview(State(st): State<AppState>, headers: HeaderMap)
             "ok": false,
             "code": "credential_invalid",
             "credential": cred,
-            "message": format!("凭证无法访问上游（可能已失效或被风控）：{hint}。请重新登录后导入新凭证。"),
+            "message": format!("Credential cannot access upstream (it may be expired or risk-controlled): {hint}. Please log in again and import a new credential."),
         }))
         .into_response();
     }
-    // 成功 → 落盘账号快照 + 追加使用记录（供凭证列表与历史查询）
+    // Success -> persist the account snapshot + append a usage record (for the credential list and history queries)
     let meta = build_cred_meta(
         &cid,
         iv.as_ref(),
@@ -5816,12 +5871,12 @@ async fn handle_account_overview(State(st): State<AppState>, headers: HeaderMap)
         ..meta
     };
     if let Err(e) = st.meta.upsert(meta.clone()) {
-        tracing::warn!("写入账号信息缓存失败: {e}");
+        tracing::warn!("Failed to write account info cache: {e}");
     }
     record_history(&st, &meta, true);
-    // v0.9：拉取成功 → 记 ok（HalfOpen 探测连续成功可恢复 Closed）
+    // v0.9: fetch succeeded -> record ok (HalfOpen probe: consecutive successes can recover to Closed)
     st.web_pool.mark_ok(&cid).await;
-    st.logs.emit("info", "account", None, "账号全貌已刷新");
+    st.logs.emit("info", "account", None, "Account overview refreshed");
     Json(serde_json::json!({
         "ok": true,
         "identity": identity.ok(),
@@ -5835,7 +5890,7 @@ async fn handle_account_overview(State(st): State<AppState>, headers: HeaderMap)
     .into_response()
 }
 
-/// POST /api/account/refresh — 凭证保活/健康检查：调 convex-token 验证 Cookie 是否仍有效
+/// POST /api/account/refresh — credential keepalive/health check: call convex-token to verify whether the Cookie is still valid
 async fn handle_account_refresh(State(st): State<AppState>, headers: HeaderMap) -> Response {
     if let Some(resp) = write_guard(&headers, &st) {
         return resp;
@@ -5845,7 +5900,7 @@ async fn handle_account_refresh(State(st): State<AppState>, headers: HeaderMap) 
         None => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "ok": false, "code": "need_cookie", "message": "未找到 web Cookie 凭证" })),
+                Json(serde_json::json!({ "ok": false, "code": "need_cookie", "message": "No web Cookie credential found" })),
             )
                 .into_response();
         }
@@ -5861,33 +5916,33 @@ async fn handle_account_refresh(State(st): State<AppState>, headers: HeaderMap) 
                 .and_then(|t| t.as_str())
                 .map(|s| !s.is_empty())
                 .unwrap_or(false);
-            // v0.9：保活成功且拿到短期 token → 记 ok；可达但无 token → 记 failure（可能过期）
+            // v0.9: keepalive succeeded and got a short-lived token -> record ok; reachable but no token -> record failure (may have expired)
             if has_token {
                 st.web_pool.mark_ok(&cid).await;
             } else {
-                web_pool_failure(&st, &cid, "端点可达但未返回短期 token").await;
+                web_pool_failure(&st, &cid, "endpoint reachable but did not return a short-lived token").await;
             }
             st.logs.emit(
                 "info",
                 "account",
                 None,
-                "凭证保活检查通过（已刷新短期 token）",
+                "Credential keepalive check passed (short-lived token refreshed)",
             );
             Json(serde_json::json!({
                 "ok": true,
                 "valid": has_token,
                 "credential": cred,
                 "meta": st.meta.get(&cid),
-                "message": if has_token { "凭证有效，已刷新短期 token（约 5 分钟有效，网关自动复用）" } else { "端点可达但未返回 token" },
+                "message": if has_token { "Credential is valid; short-lived token refreshed (valid ~5 minutes, gateway reuses it automatically)" } else { "Endpoint reachable but did not return a token" },
             }))
             .into_response()
         }
         Err(e) => {
-            // v0.9：保活失败（401/403/网络）→ 池内降分/熔断/冷却
+            // v0.9: keepalive failed (401/403/network) -> lower score/circuit-break/cooldown in the pool
             web_pool_failure(&st, &cid, &e.to_string()).await;
             st.logs
-                .emit("warn", "account", None, format!("凭证保活检查失败: {e}"));
-            // 失效也要落一条，凭证列表能直接看到"这条已失效"
+                .emit("warn", "account", None, format!("Credential keepalive check failed: {e}"));
+            // Also persist an entry on failure, so the credential list can directly show "this one is invalid"
             let mut failed = crate::account_meta::CredMeta {
                 cred_id: cid.clone(),
                 valid: false,
@@ -5909,14 +5964,14 @@ async fn handle_account_refresh(State(st): State<AppState>, headers: HeaderMap) 
                 "valid": false,
                 "credential": cred,
                 "meta": failed,
-                "message": format!("凭证可能已失效（请重新登录导入）：{e}"),
+                "message": format!("Credential may be invalid (please log in again to import a new one): {e}"),
             }))
             .into_response()
         }
     }
 }
 
-// ---------- 工具 ----------
+// ---------- Utilities ----------
 
 fn authorized(headers: &HeaderMap, keys: &[String]) -> bool {
     let extract = |name: &str| {
@@ -5942,7 +5997,7 @@ fn authorized(headers: &HeaderMap, keys: &[String]) -> bool {
     false
 }
 
-/// 上游不强需的字段预处理（去掉 stream 外的自定义字段避免污染）
+/// Preprocess fields the upstream doesn't strictly need (strip custom fields other than stream to avoid pollution)
 fn remove_passthrough_fields(body: &mut serde_json::Value) {
     if let Some(obj) = body.as_object_mut() {
         obj.remove("stream_options");
@@ -5954,7 +6009,7 @@ mod tests {
 
     #[test]
     fn claude_messages_text_blocks_flattened() {
-        // Claude content blocks 数组 → OpenAI content 字符串
+        // Claude content blocks array -> OpenAI content string
         let msgs = serde_json::json!([
             { "role": "user", "content": [
                 { "type": "text", "text": "hello" },
@@ -5970,7 +6025,7 @@ mod tests {
 
     #[test]
     fn claude_tool_use_to_tool_calls() {
-        // assistant 的 tool_use 块 → OpenAI assistant.tool_calls
+        // assistant's tool_use block -> OpenAI assistant.tool_calls
         let msgs = serde_json::json!([
             { "role": "assistant", "content": [
                 { "type": "text", "text": "let me check" },
@@ -5989,7 +6044,7 @@ mod tests {
 
     #[test]
     fn claude_tool_result_to_tool_role() {
-        // user 的 tool_result 块 → OpenAI role=tool 消息
+        // user's tool_result block -> OpenAI role=tool message
         let msgs = serde_json::json!([
             { "role": "user", "content": [
                 { "type": "tool_result", "tool_use_id": "toolu_1", "content": "18C sunny" }
@@ -6041,27 +6096,27 @@ mod tests {
         assert!(m.starts_with("sk-abc"));
         assert!(m.ends_with("1234"));
         assert!(m.contains("..."));
-        // 短 token 不 panic
+        // short token doesn't panic
         assert!(mask("abc").ends_with("***"));
     }
 
     #[test]
     fn mask_does_not_leak_short_secrets() {
-        // 短凭证必须几乎不可读：旧实现会把 "sk-local" 回显成 "sk-lo***"（泄漏 5/8 字符）
+        // short credentials must be almost unreadable: the old implementation echoed "sk-local" as "sk-lo***" (leaking 5/8 characters)
         let short = mask("sk-local");
-        assert!(!short.contains("local"), "短凭证泄漏了原文: {short}");
-        assert!(short.len() <= 6, "短凭证脱敏后过长: {short}");
-        // 4 字符及以下完全遮蔽
+        assert!(!short.contains("local"), "short credential leaked the original text: {short}");
+        assert!(short.len() <= 6, "masked short credential is too long: {short}");
+        // 4 characters or fewer are fully masked
         assert_eq!(mask("abcd"), "***");
         assert_eq!(mask(""), "***");
-        // 边界：12 字符走"首2+尾2"分支，仍不吐中间
+        // boundary: 12 characters takes the "first 2 + last 2" branch, still doesn't leak the middle
         let m12 = mask("abcdefghijkl");
         assert_eq!(m12, "ab***kl");
     }
 
     #[test]
     fn mask_is_multibyte_safe() {
-        // 多字节字符不得触发 char boundary panic
+        // multi-byte characters must not trigger a char boundary panic
         let m = mask("中文凭证测试内容中文凭证测试内容");
         assert!(m.contains("..."));
         assert!(!mask("中文").is_empty());
@@ -6076,16 +6131,16 @@ mod tests {
         let mut h2 = HeaderMap::new();
         h2.insert("x-real-ip", "1.2.3.4".parse().unwrap());
         assert!(!is_loopback_request(&h2));
-        // v0.9 鉴权纵深：真实对端（x-fb-peer，由 inject_peer 从 ConnectInfo 写入）
+        // v0.9 auth depth: real peer (x-fb-peer, written by inject_peer from ConnectInfo)
         let mut h3 = HeaderMap::new();
         h3.insert("x-fb-peer", "192.168.1.5".parse().unwrap());
-        assert!(!is_loopback_request(&h3), "非回环 peer 不得视为本机");
+        assert!(!is_loopback_request(&h3), "a non-loopback peer must not be treated as local");
         let mut h4 = HeaderMap::new();
         h4.insert("x-fb-peer", "127.0.0.1".parse().unwrap());
-        assert!(is_loopback_request(&h4), "回环 peer 应放行");
+        assert!(is_loopback_request(&h4), "a loopback peer should be allowed");
         let mut h5 = HeaderMap::new();
         h5.insert("x-fb-peer", "not-an-ip".parse().unwrap());
-        assert!(!is_loopback_request(&h5), "无法解析的 peer 一律拒绝");
+        assert!(!is_loopback_request(&h5), "an unparseable peer must always be rejected");
     }
 
     #[test]
@@ -6105,15 +6160,15 @@ mod tests {
 
     #[test]
     fn anonymous_session_is_not_authenticated() {
-        // 上游对无效凭证返回 200 + {}（实测），必须判为未登录，否则假凭证会被当成"有效"
+        // upstream returns 200 + {} for invalid credentials (observed); must be judged as not logged in, otherwise a fake credential would be treated as "valid"
         let anon = serde_json::json!({});
         assert!(!session_is_authenticated(&anon));
-        // user 为 null / 空对象同样不算登录
+        // user being null / an empty object likewise doesn't count as logged in
         assert!(!session_is_authenticated(
             &serde_json::json!({"user": null})
         ));
         assert!(!session_is_authenticated(&serde_json::json!({"user": {}})));
-        // 真实会话必须被识别
+        // a real session must be recognized
         let real = serde_json::json!({"user": {"id": "88d1", "email": "a@b.c"}, "expires": "2026-10-09T13:27:07.358Z"});
         assert!(session_is_authenticated(&real));
     }
@@ -6136,7 +6191,7 @@ mod tests {
         let anon = serde_json::json!({});
         assert!(
             !credential_usable(Some(&anon), None),
-            "空 session 不得判为可用"
+            "an empty session must not be judged usable"
         );
         assert!(!credential_usable(None, None));
         let real = serde_json::json!({"user": {"email": "a@b.c"}});
@@ -6147,71 +6202,71 @@ mod tests {
 
     #[test]
     fn bridge_error_detection() {
-        // 正常流：无 error 字样 → None
+        // normal stream: no "error" text -> None
         assert_eq!(
             detect_bridge_error(
                 "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n"
             ),
             None
         );
-        // 上游 200 内嵌 error envelope → 分类为 auth 类（对齐 errors::classify）
+        // upstream 200 with an embedded error envelope -> classified as auth type (aligned with errors::classify)
         let sse = "data: {\"error\":{\"message\":\"Unauthorized\",\"type\":\"auth\"}}\n\n";
         assert_eq!(detect_bridge_error(sse), Some("auth_expired"));
-        // error 是字符串形式同样识别
+        // error as a string form is recognized too
         let sse2 = "data: {\"error\":\"Unauthorized\"}\n\n";
         assert!(
             detect_bridge_error(sse2).is_some(),
-            "字符串 error 也必须识别"
+            "a string-form error must be recognized too"
         );
-        // error 字样出现在正文里（非 envelope）→ 不误报
+        // "error" text appears in the body (not an envelope) -> must not false-positive
         let false_pos = "data: {\"choices\":[{\"delta\":{\"content\":\"他说 error 这个词\"}}]}\n\n";
         assert_eq!(detect_bridge_error(false_pos), None);
-        // 空流
+        // empty stream
         assert_eq!(detect_bridge_error(""), None);
     }
 
     #[test]
     fn placeholder_tokens_do_not_block_bridge() {
-        // 用户 config 里常见占位符（__TEST_SKIP__ 等）会让账号池"看似非空"，
-        // 既阻断 web 桥接又在桌面协议上必然 401（Cherry Studio 场景实测复现）。
-        // 判定规则：token 长度 >= 20 且不以 __TEST_SKIP__ 开头才算"可用 Bearer"。
+        // A common placeholder in user config (__TEST_SKIP__ etc) makes the account pool "look non-empty",
+        // which blocks the web bridge and also inevitably 401s on the desktop protocol (reproduced in the Cherry Studio scenario).
+        // Rule: a token only counts as a "usable Bearer" if its length >= 20 and it doesn't start with __TEST_SKIP__.
         let usable = |tok: &str| tok.len() >= 20 && !tok.starts_with("__TEST_SKIP__");
-        assert!(!usable("__TEST_SKIP__"), "占位符不得视为可用");
-        assert!(!usable("short"), "超短 token 不得视为可用");
+        assert!(!usable("__TEST_SKIP__"), "a placeholder must not be considered usable");
+        assert!(!usable("short"), "an overly short token must not be considered usable");
         assert!(
             usable("__Secure-next-auth.session-token=abc123; x=1"),
-            "真实长 token 可用"
+            "a real long token is usable"
         );
-        // 注意：web-cookie 凭证根本不该进池（v0.5.0 修复），这里只兜底占位符场景
+        // Note: web-cookie credentials should never enter this pool at all (fixed in v0.5.0); this only guards the placeholder scenario
     }
 
     #[test]
     fn cookie_detection_requires_known_markers() {
-        // v0.8 回归：Cookie 判定收窄——URL 编码串（%3A）不得再被误判为 Cookie
+        // v0.8 regression: Cookie detection narrowed -- a URL-encoded string (%3A) must no longer be misjudged as a Cookie
         let looks_like_cookie = |t: &str| {
             t.contains("session-token") || t.contains(".next-auth") || t.contains("callback-url")
         };
-        // 真实 next-auth Cookie 命中（session-token / .next-auth / callback-url 特征）
+        // a real next-auth Cookie hits (session-token / .next-auth / callback-url signatures)
         assert!(looks_like_cookie("__Secure-next-auth.session-token=abc"));
         assert!(looks_like_cookie(
             "__Host-next-auth.callback-url=https://..."
         ));
         assert!(
             looks_like_cookie("session-token=xyz"),
-            "session-token 特征命中"
+            "session-token signature hit"
         );
-        // 非 Cookie 串不命中：URL 编码串、Bearer 令牌、普通文本
-        assert!(!looks_like_cookie("foo%3Abar"), "%3A 不得误判为 Cookie");
+        // non-Cookie strings don't match: URL-encoded strings, Bearer tokens, plain text
+        assert!(!looks_like_cookie("foo%3Abar"), "%3A must not be misjudged as a Cookie");
         assert!(
             !looks_like_cookie("sk-proj-abc%3Adef%3Aghi"),
-            "Bearer 令牌含 %3A 也不得误判"
+            "a Bearer token containing %3A must not be misjudged either"
         );
         assert!(!looks_like_cookie("plain text without markers"));
     }
 
     #[test]
     fn claude_tool_roundtrip_preserves_order_and_semantics() {
-        // v0.8（5.2B）：string / content-blocks / tool_use+tool_result 组合转换前后语义
+        // v0.8 (5.2B): semantics before/after conversion for string / content-blocks / tool_use+tool_result combinations
         let msgs = serde_json::json!([
             { "role": "user", "content": "查一下上海天气" },
             { "role": "assistant", "content": [
@@ -6225,20 +6280,20 @@ mod tests {
         ]);
         let out = claude_to_openai_messages(msgs);
         let arr = out.as_array().unwrap();
-        // 4 条输入 → 4 条输出（顺序保持）
-        assert_eq!(arr.len(), 4, "组合转换应保持消息数量");
+        // 4 inputs -> 4 outputs (order preserved)
+        assert_eq!(arr.len(), 4, "combined conversion should preserve the message count");
         assert_eq!(arr[0]["role"], "user");
         assert_eq!(arr[0]["content"], "查一下上海天气");
-        // assistant：text + tool_calls
+        // assistant: text + tool_calls
         assert_eq!(arr[1]["role"], "assistant");
         assert_eq!(arr[1]["content"], "好的");
         assert_eq!(arr[1]["tool_calls"][0]["id"], "toolu_a");
         assert_eq!(arr[1]["tool_calls"][0]["function"]["name"], "get_weather");
-        // tool_result → role=tool
+        // tool_result -> role=tool
         assert_eq!(arr[2]["role"], "tool");
         assert_eq!(arr[2]["tool_call_id"], "toolu_a");
         assert_eq!(arr[2]["content"], "多云 22C");
-        // 最后一条 user 消息保留
+        // last user message is preserved
         assert_eq!(arr[3]["role"], "user");
         assert_eq!(arr[3]["content"], "谢谢");
     }

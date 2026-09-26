@@ -1,8 +1,8 @@
-//! 广告换 token 保活：请求广告 → 确认展示（first_party）→ 换取免费额度
+//! Ad-for-token keepalive: request an ad -> confirm impression (first_party) -> redeem free quota
 //!
-//! 逆向自 Freebuff-0.0.98 ads.ts：
-//! - POST /api/v1/ads  （placementIds=[Desktop-Below-Chat], messages, sessionId, device, userAgent）
-//! - POST /api/v1/ads/impression （impUrl, mode=desktop, userAgent, os）first_party 确认
+//! Reverse-engineered from Freebuff-0.0.98's ads.ts:
+//! - POST /api/v1/ads  (placementIds=[Desktop-Below-Chat], messages, sessionId, device, userAgent)
+//! - POST /api/v1/ads/impression (impUrl, mode=desktop, userAgent, os) first_party confirmation
 
 use crate::config::Config;
 use crate::upstream::{AdDevice, AdMessage, AdRequest, UpstreamClient};
@@ -35,7 +35,7 @@ impl AdRefresher {
         }
     }
 
-    /// 为一个 token 触发一次广告刷新（换取免费额度延长会话）
+    /// Triggers one ad refresh for a token (redeems free quota to extend the session)
     pub async fn refresh(&self, token: &str) -> Result<bool> {
         let ad_session = AdRequest {
             messages: vec![
@@ -85,7 +85,7 @@ impl AdRefresher {
 
         let ad = resp.ads.into_iter().next();
         if let Some(ad) = ad {
-            // first_party 确认展示
+            // first_party impression confirmation
             if let Some(imp) = ad.impression_url() {
                 if self.client.confirm_impression(token, imp).await.is_ok() {
                     stats.impressions_confirmed += 1;

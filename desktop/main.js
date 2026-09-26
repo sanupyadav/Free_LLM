@@ -1,8 +1,9 @@
-// Freebuff2API 桌面启动器（Electron 壳）
-// - 拉起网关二进制（resources/freebuff2api.exe 或 target/release/freebuff2api.exe）
-// - 等待 HTTP 就绪后加载本地控制面板
-// - 系统托盘 + 失败弹窗 + 日志落盘 + 打开配置/数据/日志目录
-// - OAuth 一键登录：内置 BrowserWindow 打开 freebuff.com 登录页，登录成功后自动抓 Cookie 并 POST 到网关 /api/tokens/import
+// Freebuff2API desktop launcher (Electron shell)
+// - Spawns the gateway binary (resources/freebuff2api.exe or target/release/freebuff2api.exe)
+// - Waits for HTTP readiness, then loads the local control panel
+// - System tray + failure dialog + log persistence + open config/data/log directories
+// - One-click OAuth login: opens the freebuff.com login page in a built-in BrowserWindow, then
+//   automatically captures the cookie on success and POSTs it to the gateway's /api/tokens/import
 
 const { app, BrowserWindow, Tray, Menu, nativeImage, ipcMain, session, dialog, shell } = require('electron');
 const { spawn, execFile } = require('node:child_process');
@@ -14,19 +15,20 @@ const fs = require('node:fs');
 const GATEWAY_PORT = 47821;
 const GATEWAY_URL = `http://127.0.0.1:${GATEWAY_PORT}`;
 
-// 多开保护（v0.8）：二次启动不重复拉起网关，激活已有窗口并聚焦
+// Single-instance guard (v0.8): a second launch doesn't relaunch the gateway,
+// it just activates and focuses the existing window
 const gotTheLock = app.requestSingleInstanceLock();
 if (!gotTheLock) {
   app.quit();
 } else {
   app.on('second-instance', () => {
-    // 已有实例收到二次启动信号 → 显示主窗口并带到前台
+    // Existing instance received a second-launch signal -> show and foreground the main window
     if (mainWindow) {
       if (mainWindow.isMinimized()) mainWindow.restore();
       mainWindow.show();
       mainWindow.focus();
-      // 若网关尚未就绪，托盘/窗口已可打开控制台
-      writeLog('[app] 收到二次启动信号，激活已有窗口');
+      // Even if the gateway isn't ready yet, the tray/window can still open the console
+      writeLog('[app] Received second-launch signal, activating existing window');
     }
   });
 }
@@ -38,7 +40,7 @@ let ready = false;
 let logStream = null;
 let lastStartupError = null;
 
-// ---------- 日志落盘 ----------
+// ---------- Log persistence ----------
 function logDir() {
   const dir = path.join(app.getPath('userData'), 'logs');
   fs.mkdirSync(dir, { recursive: true });
@@ -54,16 +56,16 @@ function writeLog(line) {
     }
     logStream.write(`[${new Date().toISOString()}] ${line}\n`);
   } catch (e) {
-    console.error('[log] 写入失败', e.message);
+    console.error('[log] write failed', e.message);
   }
 }
 
-// 定位网关二进制（安装目录或开发目录）
+// Locate the gateway binary (install dir or dev dir)
 function findGateway() {
   const candidates = [
-    path.join(process.resourcesPath || '', 'freebuff2api.exe'), // 打包: resources/freebuff2api.exe
+    path.join(process.resourcesPath || '', 'freebuff2api.exe'), // packaged: resources/freebuff2api.exe
     path.join(path.dirname(process.execPath), '..', 'resources', 'freebuff2api.exe'),
-    path.join(app.getAppPath(), '..', 'target', 'release', 'freebuff2api.exe'), // 开发
+    path.join(app.getAppPath(), '..', 'target', 'release', 'freebuff2api.exe'), // dev
     path.join(__dirname, '..', 'target', 'release', 'freebuff2api.exe'),
     path.join(__dirname, '..', '..', 'target', 'release', 'freebuff2api.exe'),
   ];
@@ -73,7 +75,8 @@ function findGateway() {
   return null;
 }
 
-// 迁移：早期版本 userData 目录名为 freebuff2api-desktop，首次启动时把配置/数据搬过来
+// Migration: earlier versions used freebuff2api-desktop as the userData dir name;
+// move config/data over on first launch
 function migrateLegacyData() {
   try {
     const oldDir = path.join(app.getPath('appData'), 'freebuff2api-desktop');
@@ -84,7 +87,7 @@ function migrateLegacyData() {
       const dst = path.join(newDir, f);
       if (fs.existsSync(src) && !fs.existsSync(dst)) {
         fs.copyFileSync(src, dst);
-        writeLog(`[migrate] ${f} 已从旧目录迁移`);
+        writeLog(`[migrate] ${f} migrated from old directory`);
       }
     }
     fs.mkdirSync(path.join(newDir, 'data'), { recursive: true });
@@ -95,12 +98,12 @@ function migrateLegacyData() {
         const dst = path.join(newDir, 'data', f);
         if (fs.statSync(src).isFile() && !fs.existsSync(dst)) {
           fs.copyFileSync(src, dst);
-          writeLog(`[migrate] data/${f} 已迁移`);
+          writeLog(`[migrate] data/${f} migrated`);
         }
       }
     }
   } catch (e) {
-    writeLog(`[migrate] 迁移失败（忽略）: ${e.message}`);
+    writeLog(`[migrate] migration failed (ignored): ${e.message}`);
   }
 }
 
@@ -124,7 +127,7 @@ async function waitForGateway(timeoutMs = 15000) {
   return false;
 }
 
-// 读取用户配置的监听端口（可能与默认不同）
+// Read the user-configured listen port (may differ from the default)
 function configuredPort() {
   try {
     const cfgPath = path.join(app.getPath('userData'), 'config.json');
@@ -134,19 +137,19 @@ function configuredPort() {
       const m = addr.match(/:(\d+)$/);
       if (m) return parseInt(m[1], 10);
     }
-  } catch (_) { /* 忽略：配置损坏时回退默认端口 */ }
+  } catch (_) { /* ignored: fall back to the default port if config is corrupt */ }
   return GATEWAY_PORT;
 }
 
 function startGateway() {
   const exe = findGateway();
   if (!exe) {
-    lastStartupError = '找不到网关二进制 freebuff2api.exe（安装包不完整？请重新下载安装）';
+    lastStartupError = 'Gateway binary freebuff2api.exe not found (incomplete install? please re-download and reinstall)';
     writeLog(`[ERROR] ${lastStartupError}`);
     return;
   }
   const configPath = path.join(app.getPath('userData'), 'config.json');
-  // 若用户未配置 config.json，则用默认（带空 token 也能启动）
+  // If the user hasn't configured config.json, use defaults (starts fine with an empty token too)
   if (!fs.existsSync(configPath)) {
     fs.writeFileSync(configPath, JSON.stringify({
       listen_addr: '127.0.0.1:47821',
@@ -157,26 +160,26 @@ function startGateway() {
       skip_upstream_check: true,
     }, null, 2));
   }
-  writeLog(`[start] 拉起网关: ${exe} --config ${configPath}`);
+  writeLog(`[start] Launching gateway: ${exe} --config ${configPath}`);
   gateway = spawn(exe, ['--config', configPath], {
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true,
-    cwd: app.getPath('userData'), // 相对路径（data/tokens.json 等）落在用户数据目录
+    cwd: app.getPath('userData'), // relative paths (data/tokens.json etc.) land in the userData dir
   });
   gateway.stdout.on('data', d => { const s = String(d).trim(); console.log('[gateway]', s); writeLog(`[out] ${s}`); });
   gateway.stderr.on('data', d => { const s = String(d).trim(); console.error('[gateway-err]', s); writeLog(`[err] ${s}`); });
   gateway.on('exit', (code) => {
-    console.log(`[gateway] 退出 code=${code}`);
+    console.log(`[gateway] exited code=${code}`);
     writeLog(`[exit] code=${code}`);
     if (ready && !app.isQuitting) {
-      // 网关崩溃自动重启（失败 3 次后提示）
+      // Auto-restart the gateway on crash (warn after 3 failures)
       setTimeout(() => {
         startGateway();
         setTimeout(async () => {
           if (!(await checkHealth())) {
             dialog.showErrorBox(
-              'Freebuff2API 网关异常',
-              `网关进程反复退出（最近 code=${code}）。\n\n常见原因：\n1. 端口 ${configuredPort()} 被其他程序占用\n2. 配置文件损坏（%APPDATA%\\freebuff2api\\config.json）\n3. 杀毒软件拦截\n\n详细日志：${logPath()}`
+              'Freebuff2API gateway error',
+              `The gateway process keeps exiting (last code=${code}).\n\nCommon causes:\n1. Port ${configuredPort()} is in use by another program\n2. The config file is corrupt (%APPDATA%\\freebuff2api\\config.json)\n3. Antivirus software is blocking it\n\nDetailed log: ${logPath()}`
             );
           }
         }, 4000);
@@ -189,7 +192,7 @@ function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1280,
     height: 820,
-    title: 'Freebuff2API 控制台',
+    title: 'Freebuff2API Console',
     icon: path.join(__dirname, 'icons', 'icon.png'),
     autoHideMenuBar: true,
     webPreferences: {
@@ -207,13 +210,14 @@ function openConsole() {
   else mainWindow.show();
 }
 
-// 打开控制台并跳转到指定 tab（hash 路由，避免全页 loadURL 导致的刷新/丢失会话）
+// Open the console and jump to a given tab (hash routing, to avoid a full-page
+// loadURL causing a refresh / lost session)
 function openConsoleAt(hashTab) {
   openConsole();
   if (mainWindow) {
-    const apply = () => { try { mainWindow.webContents.executeJavaScript(`location.hash='#${hashTab}'`); } catch (_) { /* 忽略 */ } };
+    const apply = () => { try { mainWindow.webContents.executeJavaScript(`location.hash='#${hashTab}'`); } catch (_) { /* ignored */ } };
     const wc = mainWindow.webContents;
-    // 页面尚未加载完时挂 did-finish-load，否则立即设置
+    // Hook did-finish-load if the page hasn't finished loading yet, otherwise apply immediately
     if (wc && wc.isLoading()) wc.once('did-finish-load', apply);
     else apply();
   }
@@ -226,25 +230,25 @@ function createTray() {
     trayIcon = nativeImage.createEmpty();
   }
   tray = new Tray(trayIcon.resize({ width: 16, height: 16 }));
-  tray.setToolTip('Freebuff2API 网关');
+  tray.setToolTip('Freebuff2API Gateway');
   tray.setContextMenu(Menu.buildFromTemplate([
-    { label: '打开控制台', click: openConsole },
-    { label: '➕ 一键登录新账号', click: openLoginWindow },
+    { label: 'Open Console', click: openConsole },
+    { label: '➕ One-click login for new account', click: openLoginWindow },
     { type: 'separator' },
-    { label: '🩺 系统体检', click: () => { openConsoleAt('doctor'); } },
-    { label: '📄 打开日志', click: () => { shell.openPath(logPath()); } },
-    { label: '⚙️ 打开配置', click: () => { shell.showItemInFolder(path.join(app.getPath('userData'), 'config.json')); } },
-    { label: '📁 打开数据目录', click: () => { shell.openPath(app.getPath('userData')); } },
+    { label: '🩺 System check', click: () => { openConsoleAt('doctor'); } },
+    { label: '📄 Open logs', click: () => { shell.openPath(logPath()); } },
+    { label: '⚙️ Open config', click: () => { shell.showItemInFolder(path.join(app.getPath('userData'), 'config.json')); } },
+    { label: '📁 Open data directory', click: () => { shell.openPath(app.getPath('userData')); } },
     { type: 'separator' },
-    { label: '🔄 检查更新', click: () => { checkForUpdates(); } },
-    { label: '健康检查', click: async () => { const ok = await checkHealth(); tray.displayBalloon({ title: 'Freebuff2API', content: ok ? '网关运行正常 ✅' : '网关未响应 ❌（点「🩺 系统体检」查看）' }); } },
+    { label: '🔄 Check for updates', click: () => { checkForUpdates(); } },
+    { label: 'Health check', click: async () => { const ok = await checkHealth(); tray.displayBalloon({ title: 'Freebuff2API', content: ok ? 'Gateway is running normally ✅' : 'Gateway is not responding ❌ (click "🩺 System check" for details)' }); } },
     { type: 'separator' },
-    { label: '退出', click: () => { app.isQuitting = true; if (gateway) gateway.kill(); app.quit(); } },
+    { label: 'Quit', click: () => { app.isQuitting = true; if (gateway) gateway.kill(); app.quit(); } },
   ]));
   tray.on('click', openConsole);
 }
 
-// ---------- OAuth 一键登录 ----------
+// ---------- OAuth one-click login ----------
 let loginWindow = null;
 
 function buildCookieHeader(cookies) {
@@ -271,7 +275,7 @@ function importCookiesToGateway(cookieStr) {
   });
 }
 
-// 抓取 freebuff.com 会话 Cookie（含 next-auth 三件套）
+// Capture the freebuff.com session cookie (including the next-auth triplet)
 async function captureCookies() {
   const ses = session.fromPartition('persist:freebuff-login');
   const cookies = await ses.cookies.get({ url: 'https://freebuff.com' });
@@ -280,7 +284,7 @@ async function captureCookies() {
     const result = await importCookiesToGateway(cookieStr);
     return { cookieStr, result };
   }
-  return { cookieStr: '', result: { ok: false, body: '未检测到登录会话' } };
+  return { cookieStr: '', result: { ok: false, body: 'No login session detected' } };
 }
 
 function openLoginWindow() {
@@ -288,29 +292,30 @@ function openLoginWindow() {
   const ses = session.fromPartition('persist:freebuff-login');
   loginWindow = new BrowserWindow({
     width: 1000, height: 720,
-    title: 'Freebuff 登录',
+    title: 'Freebuff Login',
     webPreferences: { nodeIntegration: false, contextIsolation: true, session: ses, partition: 'persist:freebuff-login' },
   });
-  // 监听导航完成：当进入 /chat、/account 或 /web（登录成功标志）时抓 Cookie
+  // Listen for navigation completion: capture the cookie on entering /chat, /account
+  // or /web (the login-success signal)
   loginWindow.webContents.on('did-navigate', async (e, url) => {
     if (/freebuff\.com\/(chat|account|web)/.test(url)) {
-      // 稍等 cookie 落盘
+      // Wait briefly for the cookie to be persisted
       setTimeout(async () => {
         const { result } = await captureCookies();
         if (result.ok) {
-          writeLog(`[login] Cookie 入库成功`);
+          writeLog(`[login] Cookie stored successfully`);
           if (loginWindow) {
-            loginWindow.webContents.executeJavaScript(`alert('✅ 登录成功，Cookie 已自动入库！\\n请在网关面板刷新查看账号')`);
+            loginWindow.webContents.executeJavaScript(`alert('✅ Login successful, cookie stored automatically!\\nRefresh the gateway panel to see the account')`);
           }
           setTimeout(() => { if (loginWindow) { loginWindow.close(); loginWindow = null; } }, 1500);
         } else {
-          // 失败时明确提示，不再静默
+          // Show a clear message on failure instead of failing silently
           dialog.showMessageBox(loginWindow || mainWindow || undefined, {
             type: 'warning',
-            title: '未检测到登录会话',
-            message: '页面已打开，但还没抓到登录 Cookie。',
-            detail: '请确认已在打开的窗口中完成 freebuff.com 登录（登录后会跳到 /chat 页面）。\n\n完成登录后无需其他操作，网关会自动抓取。',
-            buttons: ['继续等待', '关闭窗口'],
+            title: 'No login session detected',
+            message: 'The page is open, but no login cookie has been captured yet.',
+            detail: 'Please make sure you\'ve completed freebuff.com login in the open window\n(it redirects to /chat after login).\n\nNo further action is needed after login, the gateway will capture it automatically.',
+            buttons: ['Keep waiting', 'Close window'],
           }).then(({ response }) => {
             if (response === 1 && loginWindow) { loginWindow.close(); loginWindow = null; }
           });
@@ -323,74 +328,74 @@ function openLoginWindow() {
 }
 
 app.on('ready', async () => {
-  writeLog('[app] 启动');
+  writeLog('[app] starting');
   migrateLegacyData();
   startGateway();
   const ok = await waitForGateway();
   if (!ok) {
     ready = false;
     const port = configuredPort();
-    writeLog(`[ERROR] 网关未就绪（端口 ${port}）`);
+    writeLog(`[ERROR] Gateway not ready (port ${port})`);
     dialog.showErrorBox(
-      'Freebuff2API 启动失败',
-      `网关在 15 秒内没有响应（期望地址 http://127.0.0.1:${port}）。\n\n` +
-      `常见原因与处理：\n` +
-      `1. 端口 ${port} 被其他程序占用 → 编辑 %APPDATA%\\freebuff2api\\config.json 改 listen_addr\n` +
-      `2. 首次启动较慢 → 稍等后从托盘「打开控制台」重试\n` +
-      `3. 杀毒/防火墙拦截 → 允许 freebuff2api.exe 通过\n\n` +
-      `日志：${logPath()}`
+      'Freebuff2API failed to start',
+      `The gateway didn't respond within 15 seconds (expected http://127.0.0.1:${port}).\n\n` +
+      `Common causes and fixes:\n` +
+      `1. Port ${port} is in use by another program -> edit %APPDATA%\\freebuff2api\\config.json and change listen_addr\n` +
+      `2. First launch is slow -> wait and retry from the tray "Open Console"\n` +
+      `3. Antivirus/firewall is blocking it -> allow freebuff2api.exe through\n\n` +
+      `Log: ${logPath()}`
     );
   } else {
     ready = true;
-    writeLog('[app] 网关就绪');
+    writeLog('[app] Gateway ready');
   }
   createWindow();
   createTray();
 
-  // 主窗口 IPC：面板点「一键登录」→ 打开登录窗口
+  // Main window IPC: panel click "one-click login" -> open the login window
   ipcMain.handle('open-login', () => openLoginWindow());
   ipcMain.handle('capture-cookie', async () => await captureCookies());
 
-  // 检查更新（electron-updater，仅打包版）
+  // Check for updates (electron-updater, packaged builds only)
   setupUpdater();
 });
 
-// ---------- 自动更新 ----------
+// ---------- Auto-update ----------
 let updater = null;
 function setupUpdater() {
-  if (!app.isPackaged) return; // 开发模式跳过
+  if (!app.isPackaged) return; // skip in dev mode
   try {
     const { autoUpdater } = require('electron-updater');
     updater = autoUpdater;
-    autoUpdater.autoDownload = true;          // 有新版本自动下载
-    autoUpdater.autoInstallOnAppQuit = true;  // 退出时自动安装
+    autoUpdater.autoDownload = true;          // auto-download when a new version is available
+    autoUpdater.autoInstallOnAppQuit = true;  // auto-install on quit
     autoUpdater.setFeedURL({
       provider: 'generic',
       url: 'https://github.com/lza6/Freebuff-2API/releases/latest/download/',
     });
     autoUpdater.on('update-available', () => {
-      tray.setToolTip('Freebuff2API — 有新版本，正在下载…');
-      tray.displayBalloon({ title: 'Freebuff2API 更新可用', content: '正在后台下载，完成后退出会自动安装' });
+      tray.setToolTip('Freebuff2API — new version available, downloading…');
+      tray.displayBalloon({ title: 'Freebuff2API update available', content: 'Downloading in the background; it will auto-install on quit' });
     });
     autoUpdater.on('update-downloaded', () => {
-      tray.setToolTip('Freebuff2API — 更新已就绪，退出后自动安装');
+      tray.setToolTip('Freebuff2API — update ready, will install on quit');
       dialog.showMessageBox({
         type: 'info',
-        title: '更新已下载',
-        message: '新版本已下载完成，退出程序后会自动安装。',
-        buttons: ['立即重启安装', '稍后'],
+        title: 'Update downloaded',
+        message: 'The new version has finished downloading and will auto-install when you quit.',
+        buttons: ['Restart and install now', 'Later'],
       }).then(({ response }) => {
         if (response === 0) { app.isQuitting = true; if (gateway) gateway.kill(); updater.quitAndInstall(); }
       });
     });
     autoUpdater.on('update-not-available', () => {
-      tray.displayBalloon({ title: 'Freebuff2API', content: '当前已是最新版本 ✅' });
+      tray.displayBalloon({ title: 'Freebuff2API', content: 'Already on the latest version ✅' });
     });
     autoUpdater.on('error', (e) => { writeLog(`[updater] ${e.message}`); console.error('[updater]', e.message); });
     autoUpdater.checkForUpdates().catch(() => {});
   } catch (e) {
-    writeLog(`[updater] 初始化失败 ${e.message}`);
-    console.error('[updater] 初始化失败', e.message);
+    writeLog(`[updater] initialization failed ${e.message}`);
+    console.error('[updater] initialization failed', e.message);
   }
 }
 
@@ -398,22 +403,22 @@ function checkForUpdates() {
   if (!updater) { setupUpdater(); }
   if (updater) {
     updater.checkForUpdates().catch((e) => {
-      dialog.showErrorBox('检查更新失败', `无法访问更新源（可能是网络问题）。\n\n${e.message}`);
+      dialog.showErrorBox('Update check failed', `Couldn't reach the update source (possibly a network issue).\n\n${e.message}`);
     });
   } else {
-    dialog.showMessageBox({ type: 'info', title: '检查更新', message: '开发模式下不检查更新。' });
+    dialog.showMessageBox({ type: 'info', title: 'Check for updates', message: 'Updates aren\'t checked in dev mode.' });
   }
 }
 
 app.on('window-all-closed', (e) => {
-  // 托盘常驻：仅隐藏不退出
+  // Stay resident in the tray: hide only, don't quit
   if (process.platform !== 'darwin') {
-    // 保留托盘进程
+    // keep the tray process alive
   }
 });
 
 app.on('before-quit', () => {
   app.isQuitting = true;
   if (gateway) gateway.kill();
-  if (logStream) { try { logStream.end(); } catch (_) { /* 忽略关闭错误 */ } }
+  if (logStream) { try { logStream.end(); } catch (_) { /* ignore close errors */ } }
 });

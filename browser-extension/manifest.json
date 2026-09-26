@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "Freebuff2API 一键登录",
+  "name": "Freebuff2API One-Click Login",
   "version": "1.1.0",
-  "description": "读取 freebuff.com 的登录凭证（含 HttpOnly Cookie）并一键发送到本地 Freebuff2API 网关；面板点「一键登录」全自动，未登录时自动打开登录页等待。",
+  "description": "Reads freebuff.com login credentials (including HttpOnly cookies) and sends them to the local Freebuff2API gateway with one click; clicking \"One-click login\" on the panel is fully automatic, opening the login page and waiting if not logged in.",
   "permissions": ["cookies", "notifications", "storage"],
   "host_permissions": ["https://freebuff.com/*", "https://*.freebuff.com/*", "http://127.0.0.1/*", "http://localhost/*"],
   "background": {
@@ -19,7 +19,7 @@
     "matches": ["http://127.0.0.1/*", "http://localhost/*"]
   },
   "action": {
-    "default_title": "把 Freebuff 登录凭证导入本地网关",
+    "default_title": "Import Freebuff login credentials into the local gateway",
     "default_icon": {
       "128": "icons/icon128.png"
     }

@@ -1,28 +1,29 @@
-# Freebuff2API — Cloudflare Worker（实验性）
+# Freebuff2API — Cloudflare Worker (experimental)
 
-> ⚠️ **当前状态：对线上游不可用，仅供研究参考。**
+> ⚠️ **Current status: not usable against the live upstream, for research reference only.**
 >
-> Codebuff 上游以 `free_mode_cli_required` 拒绝来自 Cloudflare Worker 的请求。这是 **TLS 指纹层（Client Hello / JA3）** 的检测——Worker 的 `fetch` 使用 Cloudflare 自己的 TLS 栈，指纹与官方 CLI（Node.js undici/OpenSSL）不同，**无法通过修改 User-Agent 或任何 HTTP 头绕过**。本地 Go 二进制使用原生 TLS 栈，不在黑名单内，可正常通过。
+> The Codebuff upstream rejects requests from Cloudflare Workers with `free_mode_cli_required`. This is detection at the **TLS fingerprint layer (Client Hello / JA3)** — the Worker's `fetch` uses Cloudflare's own TLS stack, whose fingerprint differs from the official CLI (Node.js undici/OpenSSL), and **this cannot be bypassed by changing the User-Agent or any HTTP header**. The local Go binary uses the native TLS stack, is not on the blocklist, and passes normally.
 >
-> **请使用仓库根目录的本地 Go 服务端**（见 [../README_zh.md](../README_zh.md)）。本目录代码保留了协议翻译与 run/session 管理的实现，供后续研究。
+> **Please use the local Go server in the repo root** (see [../README_zh.md](../README_zh.md)). This directory's code keeps the protocol translation and run/session management implementation for future research.
 
 ---
 
-## 本目录内容
+## Contents of this directory
 
-- `worker.js` — 无状态路由中转版（已移除 D1/KV/DO 依赖）。接收 OpenAI 格式请求，注入 `codebuff_metadata` 后转发到 Codebuff 上游，凭证由调用方在 `Authorization` 头直接携带。
-- `migrations/` — D1 数据库迁移（早期带凭证管理/审计统计的 SaaS 版遗留）。
-- `test-api.js`、`test-upstream.js` — E2E 测试脚本。
+- `worker.js` — stateless routing relay version (D1/KV/DO dependencies removed). Accepts OpenAI-format requests, injects `codebuff_metadata`, and forwards to the Codebuff upstream; credentials are carried directly by the caller in the `Authorization` header.
+- `migrations/` — D1 database migrations (leftover from an earlier SaaS version with credential management/audit stats).
+- `test-api.js`, `test-upstream.js` — E2E test scripts.
 
-## 逆向要点（本实现已覆盖）
+## Reverse-engineering notes (covered by this implementation)
 
-1. **会话创建**：`POST /api/v1/freebuff/session`，带 `{}` 空体 + `x-freebuff-model` 头，返回 `instanceId`。
-2. **Run 层级**：先建根 run（`base2-free`，`ancestorRunIds: []`），子 run 的 `ancestorRunIds` 只能包含根 run id，否则报 `free_mode_invalid_agent_hierarchy`。
-3. **metadata 注入**：聊天载荷必须带 `codebuff_metadata`：`run_id`、`cost_mode: "free"`、`client_id`、`freebuff_instance_id`。
-4. **模型收紧**：实测仅 `google/gemini-2.5-flash-lite` 与 `google/gemini-3.1-flash-lite-preview` 可用，其余模型返回 `free_mode_invalid_agent_model`。
+1. **Session creation**: `POST /api/v1/freebuff/session`, with an empty `{}` body + `x-freebuff-model` header, returns `instanceId`.
+2. **Run hierarchy**: create a root run first (`base2-free`, `ancestorRunIds: []`); a child run's `ancestorRunIds` may only contain the root run id, otherwise it errors with `free_mode_invalid_agent_hierarchy`.
+3. **metadata injection**: the chat payload must carry `codebuff_metadata`: `run_id`, `cost_mode: "free"`, `client_id`, `freebuff_instance_id`.
+4. **Model restrictions**: testing shows only `google/gemini-2.5-flash-lite` and `google/gemini-3.1-flash-lite-preview` work; other models return `free_mode_invalid_agent_model`.
 
 ---
 
-## 许可证
+## License
 
 MIT
+</content>

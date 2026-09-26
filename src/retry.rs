@@ -1,44 +1,44 @@
-//! 失败分类与重试退避策略
+//! Failure classification and retry backoff strategy
 //!
-//! - HTTP 状态码 / reqwest 错误 → [`FailureKind`]
-//! - [`backoff_delay`]：指数退避 `2^attempt * base` 截断到 `max`；
-//!   RateLimit 使用 4 倍基数并叠加 ±20% 抖动；Auth 固定 10s 供刷新/换号
-//! - [`AttemptOutcome`] / [`AttemptFailure`] 标记「已提交」边界：
-//!   已提交（响应已开始下发）后的错误不再换号重试，直接透传
+//! - HTTP status code / reqwest error -> [`FailureKind`]
+//! - [`backoff_delay`]: exponential backoff `2^attempt * base` capped at `max`;
+//!   RateLimit uses a 4x base multiplier plus ±20% jitter; Auth is a fixed 10s for refresh/account switch
+//! - [`AttemptOutcome`] / [`AttemptFailure`] mark the "committed" boundary:
+//!   once committed (the response has started streaming out), errors are passed through as-is instead of retried with a different account
 
 use std::future::Future;
 use std::time::Duration;
 
-/// Auth 失败后的固定等待（供刷新 token 或换号）
+/// Fixed wait after an Auth failure (for refreshing the token or switching accounts)
 pub const AUTH_REFRESH_DELAY_MS: u64 = 10_000;
 
-/// RateLimit 退避基数倍率（限流恢复通常更慢）
+/// RateLimit backoff base multiplier (rate-limit recovery is usually slower)
 const RATE_LIMIT_MULTIPLIER: u64 = 4;
 
-/// 抖动比例（±20%）
+/// Jitter ratio (±20%)
 const JITTER_RATIO: f64 = 0.2;
 
-/// 上游失败分类
+/// Upstream failure classification
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureKind {
-    /// 429 限流
+    /// 429 rate limited
     RateLimit,
-    /// 401 凭证失效（需刷新/换号，不宜原地重试）
+    /// 401 credential expired (needs refresh/account switch, not suitable for an in-place retry)
     Auth,
-    /// 403 无权限（需换号，不宜原地重试）
+    /// 403 no permission (needs an account switch, not suitable for an in-place retry)
     Forbidden,
-    /// 5xx 服务端错误
+    /// 5xx server error
     Server,
-    /// 连接失败/网络不可达
+    /// Connection failed/network unreachable
     Network,
-    /// 请求超时
+    /// Request timed out
     Timeout,
-    /// 其他（协议错误、解析失败等）
+    /// Other (protocol error, parse failure, etc.)
     Other,
 }
 
 impl FailureKind {
-    /// 稳定字符串标识（用于日志与遥测 error_kind）
+    /// Stable string identifier (used for logs and telemetry error_kind)
     pub fn as_str(self) -> &'static str {
         match self {
             FailureKind::RateLimit => "rate_limit",
@@ -58,14 +58,14 @@ impl std::fmt::Display for FailureKind {
     }
 }
 
-/// 重试策略
+/// Retry policy
 #[derive(Debug, Clone)]
 pub struct RetryPolicy {
-    /// 总尝试次数（含首次）
+    /// Total number of attempts (including the first)
     pub max_attempts: usize,
-    /// 退避基数（毫秒）
+    /// Backoff base (milliseconds)
     pub base_delay_ms: u64,
-    /// 单次退避上限（毫秒）
+    /// Cap on a single backoff (milliseconds)
     pub max_delay_ms: u64,
 }
 
@@ -79,7 +79,7 @@ impl Default for RetryPolicy {
     }
 }
 
-/// HTTP 状态码 → 失败分类
+/// HTTP status code -> failure classification
 pub fn classify_status(status: u16) -> FailureKind {
     match status {
         429 => FailureKind::RateLimit,
@@ -90,7 +90,7 @@ pub fn classify_status(status: u16) -> FailureKind {
     }
 }
 
-/// reqwest 传输层错误 → 失败分类
+/// reqwest transport-layer error -> failure classification
 pub fn classify_reqwest_error(e: &reqwest::Error) -> FailureKind {
     if e.is_timeout() {
         FailureKind::Timeout
@@ -101,7 +101,7 @@ pub fn classify_reqwest_error(e: &reqwest::Error) -> FailureKind {
     }
 }
 
-/// 是否适合原地重试（换号由上层决定：Auth/Forbidden 不可原地重试）
+/// Whether this is suitable for an in-place retry (account switching is decided by the caller: Auth/Forbidden cannot be retried in place)
 pub fn is_retryable(kind: FailureKind) -> bool {
     matches!(
         kind,
@@ -109,11 +109,11 @@ pub fn is_retryable(kind: FailureKind) -> bool {
     )
 }
 
-/// 计算第 `attempt` 次失败后的退避时长（attempt 从 0 开始）
+/// Compute the backoff duration after the `attempt`-th failure (attempt starts at 0)
 ///
-/// - 常规：`min(2^attempt * base, max)`
-/// - RateLimit：4 倍基数 + ±20% 抖动，再截断到 `max`
-/// - Auth：固定 [`AUTH_REFRESH_DELAY_MS`]
+/// - Normal: `min(2^attempt * base, max)`
+/// - RateLimit: 4x base + ±20% jitter, then capped at `max`
+/// - Auth: fixed [`AUTH_REFRESH_DELAY_MS`]
 pub fn backoff_delay(policy: &RetryPolicy, attempt: usize, kind: FailureKind) -> Duration {
     if kind == FailureKind::Auth {
         return Duration::from_millis(AUTH_REFRESH_DELAY_MS);
@@ -126,16 +126,16 @@ pub fn backoff_delay(policy: &RetryPolicy, attempt: usize, kind: FailureKind) ->
     Duration::from_millis(ms.min(policy.max_delay_ms))
 }
 
-/// 叠加 ±20% 抖动
+/// Apply ±20% jitter
 fn apply_jitter(ms: u64) -> u64 {
     use rand::Rng;
     let factor = rand::thread_rng().gen_range((1.0 - JITTER_RATIO)..=(1.0 + JITTER_RATIO));
     (ms as f64 * factor).round().max(0.0) as u64
 }
 
-/// 是否继续重试：已提交 / 不可重试 / 次数耗尽 → `None`
+/// Whether to keep retrying: committed / not retryable / attempts exhausted -> `None`
 ///
-/// `attempt` 为当前已完成的尝试序号（从 0 开始）。
+/// `attempt` is the index of the attempt just completed (starting at 0).
 pub fn retry_delay(
     policy: &RetryPolicy,
     attempt: usize,
@@ -151,7 +151,7 @@ pub fn retry_delay(
     Some(backoff_delay(policy, attempt, kind))
 }
 
-/// 一次尝试的结果：`value` + 是否已提交（已向上游/客户端产生不可撤销副作用）
+/// The result of one attempt: `value` + whether it was committed (has produced an irreversible side effect upstream/to the client)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttemptOutcome<T> {
     pub value: T,
@@ -163,12 +163,12 @@ impl<T> AttemptOutcome<T> {
         Self { value, committed }
     }
 
-    /// 已提交（不可重试）
+    /// Committed (not retryable)
     pub fn committed(value: T) -> Self {
         Self::new(value, true)
     }
 
-    /// 未提交（可安全换号重试）
+    /// Not committed (safe to retry with a different account)
     pub fn draft(value: T) -> Self {
         Self::new(value, false)
     }
@@ -177,7 +177,7 @@ impl<T> AttemptOutcome<T> {
         self.committed
     }
 
-    /// 保持 committed 标记映射内部值
+    /// Map the inner value while preserving the committed flag
     pub fn map<U>(self, f: impl FnOnce(T) -> U) -> AttemptOutcome<U> {
         AttemptOutcome {
             value: f(self.value),
@@ -186,7 +186,7 @@ impl<T> AttemptOutcome<T> {
     }
 }
 
-/// 一次失败的尝试：错误本体 + 分类 + 是否已提交
+/// A single failed attempt: the error itself + its classification + whether it was committed
 #[derive(Debug, Clone)]
 pub struct AttemptFailure<E> {
     pub error: E,
@@ -203,21 +203,21 @@ impl<E> AttemptFailure<E> {
         }
     }
 
-    /// 未提交失败（可重试）
+    /// Uncommitted failure (retryable)
     pub fn uncommitted(error: E, kind: FailureKind) -> Self {
         Self::new(error, kind, false)
     }
 
-    /// 已提交失败（直接透传）
+    /// Committed failure (passed through as-is)
     pub fn committed(error: E, kind: FailureKind) -> Self {
         Self::new(error, kind, true)
     }
 }
 
-/// 带退避重试的执行驱动：`attempt_fn` 接收尝试序号（从 0 开始）
+/// Execution driver with backoff retries: `attempt_fn` receives the attempt index (starting at 0)
 ///
-/// 未提交且可重试的失败会按策略退避后重试；已提交/不可重试/次数耗尽
-/// 的错误原样返回。
+/// An uncommitted, retryable failure is retried after a policy-determined backoff; a committed,
+/// non-retryable, or attempts-exhausted error is returned as-is.
 pub async fn run_with_retry<T, E, F, Fut>(policy: &RetryPolicy, mut attempt_fn: F) -> Result<T, E>
 where
     F: FnMut(usize) -> Fut,
@@ -233,7 +233,7 @@ where
                         attempt,
                         kind = failure.kind.as_str(),
                         delay_ms = delay.as_millis() as u64,
-                        "上游失败，退避后重试"
+                        "upstream failure, retrying after backoff"
                     );
                     tokio::time::sleep(delay).await;
                     attempt += 1;
@@ -279,7 +279,7 @@ mod tests {
         let mut prev = Duration::ZERO;
         for attempt in 0..8 {
             let d = backoff_delay(&policy, attempt, FailureKind::Server);
-            assert!(d >= prev, "第 {attempt} 次退避应不小于前一次");
+            assert!(d >= prev, "backoff #{attempt} should not be smaller than the previous one");
             assert!(d <= Duration::from_millis(policy.max_delay_ms));
             prev = d;
         }
@@ -295,7 +295,7 @@ mod tests {
             backoff_delay(&policy, 2, FailureKind::Server),
             Duration::from_millis(2000)
         );
-        // 上限截断
+        // Capped at the max
         assert_eq!(
             backoff_delay(&policy, 20, FailureKind::Server),
             Duration::from_millis(8000)
@@ -305,23 +305,23 @@ mod tests {
     #[test]
     fn rate_limit_backoff_has_jitter_within_bounds_and_caps() {
         let policy = RetryPolicy::default();
-        // attempt=0 → 500 * 4 = 2000ms，抖动区间 [1600, 2400]
+        // attempt=0 -> 500 * 4 = 2000ms, jitter range [1600, 2400]
         for _ in 0..200 {
             let d = backoff_delay(&policy, 0, FailureKind::RateLimit).as_millis() as u64;
-            assert!((1600..=2400).contains(&d), "抖动越界: {d}ms");
+            assert!((1600..=2400).contains(&d), "jitter out of bounds: {d}ms");
         }
-        // 高次数时抖动后仍被 max 截断
+        // At high attempt counts, still capped at max after jitter
         for _ in 0..50 {
             assert_eq!(
                 backoff_delay(&policy, 12, FailureKind::RateLimit),
                 Duration::from_millis(8000)
             );
         }
-        // 抖动确实在变化（非恒定值）
+        // Jitter really does vary (not a constant value)
         let samples: std::collections::HashSet<u128> = (0..50)
             .map(|_| backoff_delay(&policy, 0, FailureKind::RateLimit).as_millis())
             .collect();
-        assert!(samples.len() > 1, "RateLimit 退避应包含随机抖动");
+        assert!(samples.len() > 1, "RateLimit backoff should include random jitter");
     }
 
     #[test]
@@ -338,14 +338,14 @@ mod tests {
     #[test]
     fn retry_delay_stops_when_committed_or_exhausted_or_not_retryable() {
         let policy = RetryPolicy::default();
-        // 未提交且可重试：允许
+        // Uncommitted and retryable: allowed
         assert!(retry_delay(&policy, 0, FailureKind::Server, false).is_some());
-        // 已提交：直接放弃
+        // Committed: give up immediately
         assert!(retry_delay(&policy, 0, FailureKind::Server, true).is_none());
-        // 不可重试
+        // Not retryable
         assert!(retry_delay(&policy, 0, FailureKind::Auth, false).is_none());
         assert!(retry_delay(&policy, 0, FailureKind::Forbidden, false).is_none());
-        // 次数耗尽（max_attempts=3 → attempt 0/1 可重试，attempt 2 不可）
+        // Attempts exhausted (max_attempts=3 -> attempt 0/1 retryable, attempt 2 not)
         assert!(retry_delay(&policy, 1, FailureKind::Network, false).is_some());
         assert!(retry_delay(&policy, 2, FailureKind::Network, false).is_none());
     }
@@ -377,7 +377,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_with_retry_stops_immediately_on_committed_or_exhausted() {
-        // 已提交错误：只尝试一次，错误透传
+        // Committed error: only one attempt, error passed through
         let policy = RetryPolicy {
             max_attempts: 5,
             base_delay_ms: 1,
@@ -399,7 +399,7 @@ mod tests {
         assert_eq!(result.err(), Some("stream broken"));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
-        // 次数耗尽：恰好尝试 max_attempts 次
+        // Attempts exhausted: exactly max_attempts attempts
         let calls2 = Arc::new(AtomicUsize::new(0));
         let c2 = calls2.clone();
         let result2: Result<(), &'static str> = run_with_retry(&policy, move |_| {
@@ -422,13 +422,13 @@ mod tests {
         use tokio::io::AsyncReadExt;
         let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
             Ok(l) => l,
-            Err(_) => return, // 环境不支持本地监听则跳过
+            Err(_) => return, // Skip if the environment doesn't support local listening
         };
         let addr = match listener.local_addr() {
             Ok(a) => a,
             Err(_) => return,
         };
-        // 接受连接但永不响应，制造读取超时
+        // Accept the connection but never respond, to induce a read timeout
         tokio::spawn(async move {
             if let Ok((mut stream, _)) = listener.accept().await {
                 let mut buf = [0u8; 1024];
@@ -444,16 +444,16 @@ mod tests {
             Err(_) => return,
         };
         let err = match client.get(format!("http://{addr}/")).send().await {
-            Ok(_) => return, // 环境异常导致请求成功，跳过
+            Ok(_) => return, // Skip if an environment quirk made the request succeed
             Err(e) => e,
         };
-        assert!(err.is_timeout(), "期望超时错误, 实际: {err}");
+        assert!(err.is_timeout(), "expected a timeout error, got: {err}");
         assert_eq!(classify_reqwest_error(&err), FailureKind::Timeout);
     }
 
     #[tokio::test]
     async fn classify_reqwest_connect_error_as_network() {
-        // 绑定后立刻释放，得到一个几乎必然拒绝连接的本地端口
+        // Bind then release immediately, to get a local port that will almost certainly refuse connections
         let addr = match std::net::TcpListener::bind("127.0.0.1:0") {
             Ok(l) => match l.local_addr() {
                 Ok(a) => a,

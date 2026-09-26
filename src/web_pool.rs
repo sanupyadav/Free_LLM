@@ -1,18 +1,19 @@
-//! web Cookie 凭证池（v0.9）：多 web 账号健康评分 + 轮询 + 熔断/冷却
+//! web Cookie credential pool (v0.9): multi web-account health scoring + rotation + circuit breaking/cooldown
 //!
-//! 背景：Bearer 账号池（`pool.rs`）只覆盖桌面版 Bearer 协议；web Cookie 凭证在
-//! v0.8 及以前只取"第一个有效凭证"（`pick_web_cookie`），无健康分/轮询/冷却，
-//! 一个失效账号会让整个桥接链路 401。
+//! Background: the Bearer account pool (`pool.rs`) only covers the desktop Bearer protocol; before
+//! v0.8, web Cookie credentials just took "the first valid credential" (`pick_web_cookie`), with no
+//! health score/rotation/cooldown, so one dead account would 401 the entire bridging path.
 //!
-//! 本模块把 web Cookie 凭证**池化**：复用 `pool.rs::CircuitBreaker` 语义
-//! （Closed/Open/HalfOpen、连续失败熔断、指数冷却封顶 10 分钟、HalfOpen 探测闸门），
-//! 提供：
-//! - `pick()`：选未熔断 + 冷却期满 + 健康分最高的凭证（多账号轮询）
-//! - `mark_ok()` / `mark_failure()` / `mark_cooldown()`：请求结果回写
-//! - `snapshot()`：面板账号健康展示
+//! This module **pools** web Cookie credentials: reuses `pool.rs::CircuitBreaker` semantics
+//! (Closed/Open/HalfOpen, trip after consecutive failures, exponential cooldown capped at 10 minutes,
+//! HalfOpen probe gate), and provides:
+//! - `pick()`: picks the highest-health, non-tripped, cooldown-elapsed credential (multi-account rotation)
+//! - `mark_ok()` / `mark_failure()` / `mark_cooldown()`: writes back request outcomes
+//! - `snapshot()`: panel account health display
 //!
-//! 网络安全边界：web Cookie 是用户账号的完整会话凭证，仅存本机内存与本地
-//! `tokens.json`，不出网、不写日志明文（快照/面板展示一律脱敏）。
+//! Security boundary: a web Cookie is a user account's full session credential, kept only in local
+//! memory and the local `tokens.json`, never sent out, never logged in plaintext (snapshots/panel
+//! display are always redacted).
 
 use crate::config::Config;
 use crate::import;
@@ -21,7 +22,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
-/// 凭证来源
+/// Credential source
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WebCredSource {
@@ -29,7 +30,7 @@ pub enum WebCredSource {
     Imported,
 }
 
-/// 池内条目（内部可变态）
+/// An entry in the pool (internal mutable state)
 #[derive(Debug)]
 struct WebEntry {
     cookie: String,
@@ -41,37 +42,37 @@ struct WebEntry {
     last_ok_at: Option<Instant>,
 }
 
-/// 挑选结果（调用方只拿 cookie + 展示信息 + 稳定 id，不持有内部态）
+/// Pick result (caller only gets the cookie + display info + stable id, no internal state)
 #[derive(Debug, Clone)]
 pub struct WebPick {
     pub cookie: String,
     pub id: String,
     pub source: &'static str,
     pub added_at: Option<String>,
-    /// 展示信息（source/added_at/token_masked/id），与旧 pick_web_cookie 返回兼容
+    /// Display info (source/added_at/token_masked/id), compatible with the old pick_web_cookie return
     pub cred: serde_json::Value,
 }
 
-/// 健康快照（串行化，供面板）
+/// Health snapshot (serializable, for the panel)
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct WebCookieHealth {
     pub id: String,
     pub kind: &'static str,
     pub source: &'static str,
     pub added_at: Option<String>,
-    /// 脱敏 Cookie（前 6 后 4）
+    /// Redacted cookie (first 6, last 4 chars)
     pub masked: String,
     pub health_score: f64,
     pub circuit_state: String,
     pub cooldown_until: Option<String>,
-    /// v0.10：冷却剩余秒（面板排序/预估恢复用）
+    /// v0.10: cooldown seconds remaining (for panel sorting/estimated recovery)
     pub cooldown_seconds: Option<u64>,
     pub trips: u64,
     pub last_error: Option<String>,
     pub last_ok_at: Option<String>,
 }
 
-/// 与旧 `pick_web_cookie` 一致的 Cookie 判定（只认 next-auth 三件套特征，防 URL 编码串误判）
+/// Cookie detection consistent with the old `pick_web_cookie` (only recognizes the next-auth trio signature, to avoid misjudging URL-encoded strings)
 pub fn looks_like_cookie(t: &str) -> bool {
     t.contains("session-token") || t.contains(".next-auth") || t.contains("callback-url")
 }
@@ -83,7 +84,7 @@ fn mask(cookie: &str) -> String {
     format!("{}...{}", &cookie[..6], &cookie[cookie.len() - 4..])
 }
 
-/// 冷却到期时刻 → ISO8601 UTC（v0.10：面板按时间轴展示；剩余秒单独给 cooldown_seconds）
+/// Cooldown expiry instant -> ISO8601 UTC (v0.10: panel displays on a timeline; remaining seconds given separately via cooldown_seconds)
 fn cooldown_iso(instant: Option<Instant>) -> Option<String> {
     instant.map(|i| {
         let d = i.saturating_duration_since(Instant::now());
@@ -91,7 +92,7 @@ fn cooldown_iso(instant: Option<Instant>) -> Option<String> {
     })
 }
 
-/// 冷却剩余秒
+/// Cooldown seconds remaining
 fn cooldown_secs(instant: Option<Instant>) -> Option<u64> {
     instant.map(|i| i.saturating_duration_since(Instant::now()).as_secs())
 }
@@ -115,7 +116,7 @@ pub struct WebCookiePool {
 }
 
 impl WebCookiePool {
-    /// 构建条目（config 优先，同 cookie 去重）
+    /// Build entries (config takes priority, dedup by same cookie)
     fn build_entries(cfg: &Config) -> Vec<WebEntry> {
         let mut map: HashMap<String, WebEntry> = HashMap::new();
         for t in &cfg.auth_tokens {
@@ -143,14 +144,14 @@ impl WebCookiePool {
         map.into_values().collect()
     }
 
-    /// 从配置 + tokens.json 构建（config 优先，同 cookie 去重）
+    /// Build from config + tokens.json (config takes priority, dedup by same cookie)
     pub fn load(cfg: &Config) -> Self {
         Self {
             inner: RwLock::new(Self::build_entries(cfg)),
         }
     }
 
-    /// 导入/删除凭证后重建池（保留既有健康状态与熔断冷却）
+    /// Rebuild the pool after importing/deleting credentials (preserves existing health state and circuit-breaker cooldowns)
     pub async fn reload(&self, cfg: &Config) {
         let fresh = Self::build_entries(cfg);
         let mut cur = self.inner.write().await;
@@ -167,12 +168,12 @@ impl WebCookiePool {
         *cur = merged;
     }
 
-    /// 别名：与 Config 构建入口一致（`load` 为规范名）
+    /// Alias: consistent with Config's construction entry point (`load` is the canonical name)
     pub fn new(cfg: &Config) -> Self {
         Self::load(cfg)
     }
 
-    /// 热追加（导入新 Cookie 后调用；按 id 去重），返回是否真正新增
+    /// Hot-append (called after importing a new Cookie; dedup by id), returns whether it was actually added
     pub async fn add_if_absent(
         &self,
         cookie: &str,
@@ -193,7 +194,7 @@ impl WebCookiePool {
         true
     }
 
-    /// 热移除（凭证删除后调用），返回是否真的移除了
+    /// Hot-remove (called after credential deletion), returns whether something was actually removed
     pub async fn remove(&self, id: &str) -> bool {
         let mut entries = self.inner.write().await;
         let before = entries.len();
@@ -201,7 +202,7 @@ impl WebCookiePool {
         entries.len() != before
     }
 
-    /// 空池？
+    /// Is the pool empty?
     pub async fn is_empty(&self) -> bool {
         self.inner.read().await.is_empty()
     }
@@ -210,11 +211,11 @@ impl WebCookiePool {
         self.inner.read().await.len()
     }
 
-    /// 挑选健康分最高且熔断允许的凭证；全不可用 → None
+    /// Pick the highest-health credential allowed by the circuit breaker; None if all unavailable
     pub async fn pick(&self) -> Option<WebPick> {
         let mut entries = self.inner.write().await;
         let mut best: Option<usize> = None;
-        // 下标访问（avoid iter_mut + 闭包二次借用冲突；breaker.allow 可变语义不变）
+        // Index-based access (avoid iter_mut + closure double-borrow conflict; breaker.allow's mutable semantics unchanged)
         for i in 0..entries.len() {
             if !entries[i].breaker.allow() {
                 continue;
@@ -245,7 +246,7 @@ impl WebCookiePool {
         })
     }
 
-    /// 业务成功（HalfOpen 探测成功 → 逐步恢复）
+    /// Request succeeded (HalfOpen probe success -> gradual recovery)
     pub async fn mark_ok(&self, id: &str) {
         let mut entries = self.inner.write().await;
         if let Some(e) = entries.iter_mut().find(|e| e.id == id) {
@@ -255,30 +256,30 @@ impl WebCookiePool {
         }
     }
 
-    /// 业务失败（连续失败超阈值才熔断）
+    /// Request failed (only trips the breaker once consecutive failures exceed the threshold)
     pub async fn mark_failure(&self, id: &str, reason: &str) {
         let mut entries = self.inner.write().await;
         if let Some(e) = entries.iter_mut().find(|e| e.id == id) {
             e.breaker.record_failure(reason);
             e.score = (e.score - 2.0).max(-10.0);
-            tracing::warn!("web Cookie 凭证 {} 失败: {reason}", mask(&e.cookie));
+            tracing::warn!("web Cookie credential {} failed: {reason}", mask(&e.cookie));
         }
     }
 
-    /// 确定性失败（401/403 等）→ 立即熔断冷却，不依赖连续失败计数
+    /// Deterministic failure (401/403 etc.) -> trip and cool down immediately, independent of consecutive failure count
     pub async fn mark_cooldown(&self, id: &str, duration: Duration, reason: &str) {
         let mut entries = self.inner.write().await;
         if let Some(e) = entries.iter_mut().find(|e| e.id == id) {
             e.breaker.trip_for(duration, reason);
             e.score = (e.score - 4.0).max(-10.0);
             tracing::warn!(
-                "web Cookie 凭证 {} 冷却 {duration:?}: {reason}",
+                "web Cookie credential {} cooling down {duration:?}: {reason}",
                 mask(&e.cookie)
             );
         }
     }
 
-    /// 健康快照（供 /api/accounts/health 与账号列表）
+    /// Health snapshot (for /api/accounts/health and the account list)
     pub async fn snapshot(&self) -> Vec<WebCookieHealth> {
         let entries = self.inner.read().await;
         entries
@@ -328,7 +329,7 @@ mod tests {
             "no-such-tokens.json",
         );
         let pool = WebCookiePool::load(&c);
-        assert_eq!(pool.count().await, 1, "只有 Cookie 值入池");
+        assert_eq!(pool.count().await, 1, "only cookie values enter the pool");
     }
 
     #[tokio::test]
@@ -342,7 +343,7 @@ mod tests {
         );
         let pool = WebCookiePool::load(&c);
         assert_eq!(pool.count().await, 2);
-        // 直接操作内部计分：bad 低分，good 高分 → pick 应选 good
+        // Directly manipulate internal scoring: bad gets a low score, good a high score -> pick should choose good
         {
             let mut n = pool.inner.write().await;
             for e in n.iter_mut() {
@@ -354,7 +355,7 @@ mod tests {
             }
         }
         let p = pool.pick().await.unwrap();
-        assert!(p.cookie.contains("good-one"), "应选高分凭证");
+        assert!(p.cookie.contains("good-one"), "should pick the high-score credential");
         assert!(p.cred.get("token_masked").is_some());
         assert!(p.cred.get("id").is_some());
     }
@@ -369,9 +370,9 @@ mod tests {
         let p0 = pool.pick().await.unwrap();
         pool.mark_cooldown(&p0.id, Duration::from_secs(3600), "401 expired")
             .await;
-        // 冷却期内：无可用 → None
+        // During cooldown: none available -> None
         assert!(pool.pick().await.is_none());
-        // 快照能反映冷却
+        // Snapshot reflects the cooldown
         let snap = pool.snapshot().await;
         assert_eq!(snap[0].circuit_state, "open");
         assert!(snap[0].cooldown_until.is_some());
@@ -389,15 +390,15 @@ mod tests {
         pool.mark_cooldown(&p0.id, Duration::from_millis(1), "boom")
             .await;
         tokio::time::sleep(Duration::from_millis(5)).await;
-        // 到期后 allow() 进入 HalfOpen 放行一次探测（探测在途期间不再放行，故直接取该次结果）
-        let p1 = pool.pick().await.expect("冷却到期应放行单个探测");
+        // After expiry, allow() enters HalfOpen and lets one probe through (no further probes while one is in flight, so we take this result directly)
+        let p1 = pool.pick().await.expect("cooldown expiry should allow a single probe through");
         pool.mark_ok(&p1.id).await;
         let snap = pool.snapshot().await;
         assert_eq!(
             snap[0].circuit_state, "half_open",
-            "HalfOpen 一次成功待二次确认"
+            "HalfOpen needs a second success to confirm"
         );
-        // 第二次成功 → 恢复 Closed
+        // Second success -> recovers to Closed
         pool.mark_ok(&p1.id).await;
         let snap2 = pool.snapshot().await;
         assert_eq!(snap2[0].circuit_state, "closed");
@@ -412,7 +413,7 @@ mod tests {
         );
         let pool = WebCookiePool::load(&c);
         let p0 = pool.pick().await.unwrap();
-        // 连续 4 次失败 → Closed→Open
+        // 4 consecutive failures -> Closed->Open
         for _ in 0..4 {
             pool.mark_failure(&p0.id, "upstream 5xx").await;
         }
@@ -430,7 +431,7 @@ mod tests {
         let pool = WebCookiePool::load(&c);
         let snap = pool.snapshot().await;
         assert!(snap[0].masked.contains("..."));
-        assert!(!snap[0].masked.contains("0123456789abcdef"), "不得明文");
+        assert!(!snap[0].masked.contains("0123456789abcdef"), "must not be plaintext");
         assert_eq!(snap[0].kind, "web-cookie");
     }
 

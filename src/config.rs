@@ -5,70 +5,70 @@ use std::env;
 use std::str::FromStr;
 use std::time::Duration;
 
-/// 全局配置，JSON 文件 + 环境变量双来源（环境变量优先）
+/// Global config, from JSON file + environment variables (env vars take priority)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    /// 监听地址，默认 127.0.0.1:47821（本地软件默认仅本机）
+    /// Listen address, defaults to 127.0.0.1:47821 (local software defaults to loopback only)
     pub listen_addr: String,
-    /// 上游 API 地址
+    /// Upstream API address
     pub upstream_base_url: String,
-    /// Freebuff 认证 token（多账号轮询）
+    /// Freebuff auth tokens (multi-account rotation)
     pub auth_tokens: Vec<String>,
-    /// 本网关对外鉴权 key（空则不校验）
+    /// This gateway's outward-facing auth key (empty = no auth check)
     pub api_keys: Vec<String>,
-    /// run 轮换间隔
+    /// Run rotation interval
     pub rotation_interval_sec: u64,
-    /// 上游请求超时
+    /// Upstream request timeout
     pub request_timeout_sec: u64,
-    /// HTTP 代理（支持 http/socks5）
+    /// HTTP proxy (supports http/socks5)
     pub http_proxy: String,
-    /// 会话保活间隔（广告刷新 / 心跳）
+    /// Session keepalive interval (ad refresh / heartbeat)
     pub session_keepalive_sec: u64,
-    /// 广告保活 provider（逗号分隔：gravity,zeroclick,carbon）
+    /// Ad keepalive providers (comma-separated: gravity,zeroclick,carbon)
     pub ad_providers: Vec<String>,
-    /// 模型路由降级链配置
+    /// Model routing fallback chain config
     pub fallback_models: Vec<String>,
-    /// 是否启用 token 节省（压缩超长 tool_result）
+    /// Whether to enable token saving (compress oversized tool_result)
     pub token_saver: bool,
-    /// 用量统计 SQLite 路径（空则禁用统计）
+    /// Usage stats SQLite path (empty = disable stats)
     pub sqlite_path: String,
-    /// 导入凭证存储路径（curl/HAR/Cookie 解析后落盘位置）
+    /// Imported credential storage path (where curl/HAR/Cookie parsing writes to disk)
     pub tokens_path: String,
-    /// 遥测 SQLite 路径（请求详情/事件链，独立库避免写锁竞争）
+    /// Telemetry SQLite path (request details/event chains, separate DB to avoid write-lock contention)
     pub telemetry_path: String,
-    /// 记忆库 SQLite 路径（用户偏好/纠正；独立库）
+    /// Memory store SQLite path (user preferences/corrections; separate DB)
     pub memory_path: String,
-    /// 上游会话记录（web 协议 threadId；供自动清理）
+    /// Upstream session records (web protocol threadId; for auto cleanup)
     pub threads_path: String,
-    /// 凭证账号信息缓存（昵称/邮箱/套餐/今日剩余，面板凭证列表用）
+    /// Credential account info cache (nickname/email/plan/today's remaining, used by panel credential list)
     pub cred_meta_path: String,
-    /// 账号使用记录（JSONL，按凭证可查历史）
+    /// Account usage history (JSONL, queryable per credential)
     pub account_history_path: String,
-    /// 上游会话自动清理间隔（秒）；0 = 关闭自动清理
+    /// Upstream session auto-cleanup interval (seconds); 0 = disable auto cleanup
     pub thread_cleanup_interval_sec: u64,
-    /// 上游会话保留时长（小时），超过即清理
+    /// Upstream session retention (hours); cleaned up once exceeded
     pub thread_max_age_hours: u64,
-    /// web 协议桥接的会话绑定（OpenAI/Anthropic 客户端 → 上游 thread 复用）
+    /// Session bindings for web protocol bridging (OpenAI/Anthropic client -> upstream thread reuse)
     pub web_threads_path: String,
-    /// 记忆层开关（false 时既不自动记录也不注入；隐私敏感用户可关）
+    /// Memory layer switch (when false, neither auto-records nor injects; privacy-sensitive users can disable)
     pub memory_enabled: bool,
-    /// 技能目录（技能文件真相源）
+    /// Skills directory (source of truth for skill files)
     pub skills_dir: String,
-    /// 技能注入模式：roster（只注入名称+描述）| full（全量拼接）
+    /// Skill injection mode: roster (inject name+description only) | full (concatenate everything)
     pub skills_inject_mode: String,
-    /// roster 注入的 token 预算上限
+    /// Token budget cap for roster injection
     pub max_roster_tokens: usize,
-    /// 内置面板目录（空则用嵌入资源）
+    /// Built-in panel directory (empty = use embedded resources)
     pub web_dir: String,
-    /// 启动时跳过上游连通性检查
+    /// Skip upstream connectivity check on startup
     pub skip_upstream_check: bool,
-    /// 日志/遥测脱敏（默认开）：写入日志总线与遥测前把 Cookie/Bearer/authorization 值替换为 ***
+    /// Log/telemetry redaction (on by default): replaces Cookie/Bearer/authorization values with *** before writing to the log bus and telemetry
     pub redact_logs: bool,
-    /// 双桶并发信号量：免费层 {付费槽, 普通}
+    /// Dual-bucket concurrency semaphore: free tier {paid slots, regular}
     pub concurrency_free_slots: usize,
     pub concurrency_free_multi: usize,
-    /// 双桶并发信号量：订阅层 {付费槽, 普通}
+    /// Dual-bucket concurrency semaphore: subscription tier {paid slots, regular}
     pub concurrency_sub_slots: usize,
     pub concurrency_sub_multi: usize,
 }
@@ -94,11 +94,11 @@ impl Default for Config {
             threads_path: "data/threads.json".into(),
             cred_meta_path: "data/cred_meta.json".into(),
             account_history_path: "data/account_history.jsonl".into(),
-            // 用户批注（网页对话.txt:605）：反代要自己清理上游会话，别把压力留给上游被查出来
+            // User note (网页对话.txt:605): the reverse proxy must clean up upstream sessions itself, don't leave the load on upstream and get caught
             thread_cleanup_interval_sec: 3600,
             thread_max_age_hours: 24,
             web_threads_path: "data/web_threads.json".into(),
-            // 记忆默认关闭（用户批注 2026-09-11：记忆不是每个人都需要的，要有单独开关且默认关）
+            // Memory disabled by default (user note 2026-09-11: memory isn't for everyone, needs its own toggle and defaults off)
             memory_enabled: false,
             skills_dir: "data/skills".into(),
             skills_inject_mode: "roster".into(),
@@ -115,22 +115,22 @@ impl Default for Config {
 }
 
 impl Config {
-    /// 从默认值 + JSON 文件 + 环境变量合并加载
+    /// Load by merging defaults + JSON file + environment variables
     pub fn load(path: Option<&str>) -> Result<Self> {
         let mut cfg = Self::default();
 
         if let Some(p) = path {
             if std::path::Path::new(p).exists() {
                 let data = std::fs::read_to_string(p)
-                    .map_err(|e| anyhow!("读取配置文件 {p} 失败: {e}"))?;
+                    .map_err(|e| anyhow!("Failed to read config file {p}: {e}"))?;
                 let file_cfg: Config = serde_json::from_str(&data)
-                    .map_err(|e| anyhow!("解析配置文件 {p} 失败: {e}"))?;
+                    .map_err(|e| anyhow!("Failed to parse config file {p}: {e}"))?;
                 cfg = file_cfg;
             } else {
-                return Err(anyhow!("配置文件不存在: {p}"));
+                return Err(anyhow!("Config file does not exist: {p}"));
             }
         }
-        // 自动探测默认 config.json
+        // Auto-detect default config.json
         else if std::path::Path::new("config.json").exists() {
             let data = std::fs::read_to_string("config.json")?;
             cfg = serde_json::from_str(&data)?;
@@ -263,31 +263,31 @@ impl Config {
 
     fn validate(&self) -> Result<()> {
         if self.listen_addr.trim().is_empty() {
-            return Err(anyhow!("LISTEN_ADDR 不能为空"));
+            return Err(anyhow!("LISTEN_ADDR must not be empty"));
         }
-        // 安全守卫：监听非本机地址时必须配置 api_keys（否则管理端点/记忆/凭证对网络裸奔）
+        // Safety guard: api_keys must be configured when listening on a non-local address (otherwise admin endpoints/memory/credentials are exposed to the network unprotected)
         if !is_loopback_listen(&self.listen_addr) && self.api_keys.is_empty() {
             return Err(anyhow!(
-                "安全拒绝：listen_addr={} 不是本机地址，但未配置 api_keys。\
-                 请配置 api_keys（推荐）或改回 127.0.0.1",
+                "Safety refusal: listen_addr={} is not a local address but api_keys is not configured. \
+                 Please configure api_keys (recommended) or switch back to 127.0.0.1",
                 self.listen_addr
             ));
         }
         if self.upstream_base_url.trim().is_empty() {
-            return Err(anyhow!("UPSTREAM_BASE_URL 不能为空"));
+            return Err(anyhow!("UPSTREAM_BASE_URL must not be empty"));
         }
         if self.auth_tokens.is_empty() && !self.skip_upstream_check {
-            return Err(anyhow!("至少需要一个 AUTH_TOKENS"));
+            return Err(anyhow!("At least one AUTH_TOKENS entry is required"));
         }
         let unique: HashSet<&String> = self.auth_tokens.iter().collect();
         if unique.len() != self.auth_tokens.len() {
-            return Err(anyhow!("AUTH_TOKENS 存在重复 token"));
+            return Err(anyhow!("AUTH_TOKENS contains duplicate tokens"));
         }
         Ok(())
     }
 }
 
-/// 判断监听地址是否为本机（host 部分精确匹配，防 `localhost.evil.com` 这类前缀绕过）。
+/// Determine whether the listen address is local (host part matched exactly, to prevent prefix bypass tricks like `localhost.evil.com`).
 pub fn is_loopback_listen(listen_addr: &str) -> bool {
     // host[:port] → host；[::1]:port → ::1
     let host = if let Some(rest) = listen_addr.strip_prefix('[') {
@@ -305,9 +305,9 @@ pub fn is_loopback_listen(listen_addr: &str) -> bool {
             .unwrap_or(false)
 }
 
-/// 解析配置文件路径：`--config x.json` > 第一个位置参数 > 当前目录 config.json > None
+/// Resolve config file path: `--config x.json` > first positional arg > config.json in cwd > None
 ///
-/// 与启动时 `Config::load` 的取舍保持一致，供"运行时写回配置"（如面板一键生成 API Key）复用。
+/// Kept consistent with the choices `Config::load` makes at startup, reused by "runtime config write-back" (e.g. the panel's one-click API Key generation).
 pub fn resolve_config_path() -> Option<String> {
     let args: Vec<String> = std::env::args().collect();
     if let Some(i) = args.iter().position(|a| a == "--config") {
@@ -326,7 +326,7 @@ pub fn resolve_config_path() -> Option<String> {
     None
 }
 
-/// 解析 "6h" / "900s" / "15m" 或纯秒数
+/// Parse "6h" / "900s" / "15m" or a plain number of seconds
 pub fn parse_duration_sec(raw: &str) -> Option<u64> {
     let raw = raw.trim();
     if let Ok(secs) = raw.parse::<u64>() {

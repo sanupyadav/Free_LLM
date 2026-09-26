@@ -1,17 +1,17 @@
 #!/usr/bin/env node
 /**
- * Phase I E2E —— 全功能真实 E2E 矩阵（用 data/tokens.json 里的真实凭证打真实上游）
+ * Phase I E2E -- full-functionality real E2E matrix (hits a real upstream using the real credential in data/tokens.json)
  *
- * 覆盖（用户点名）：
- *   1. token 保活（/api/account/refresh）
- *   2. 模型列表（/v1/models：内容 + 鉴权两态）
- *   3. 工具调用能力（web_search/read_url 经桥接透传）
- *   4. 缓存/多轮上下文（同 thread 多轮 + 跨请求记忆）
- *   5. 长 agent 能力（多工具链 + 长输出）
- *   6. Anthropic 协议（/v1/messages 流式事件流结构）
+ * Coverage (explicitly requested):
+ *   1. token keep-alive (/api/account/refresh)
+ *   2. model list (/v1/models: content + both auth states)
+ *   3. tool-calling capability (web_search/read_url passed through via the bridge)
+ *   4. caching/multi-turn context (multiple turns in one thread + cross-request memory)
+ *   5. long agent capability (multi-tool chains + long output)
+ *   6. Anthropic protocol (/v1/messages streaming event structure)
  *
- * 前置：网关已启动（隔离配置，端口 47861），data/e2e/tokens.json 有真实凭证。
- * 注意：真实消耗上游额度；每项都有明确断言，任何一项失败退出码非 0。
+ * Prerequisite: gateway is running (isolated config, port 47861), data/e2e/tokens.json has a real credential.
+ * Note: this really consumes upstream quota; every item has an explicit assertion, and a non-zero exit code on any failure.
  */
 const http = require('node:http');
 const fs = require('node:fs');
@@ -47,7 +47,7 @@ const json = async (m, p, b, h) => {
   let j = null; try { j = JSON.parse(r.text); } catch (e) {}
   return { ...r, json: j };
 };
-/** 聚合桥接 SSE（OpenAI chunk 流）→ {content, toolCalls, reasoningLen, error} */
+/** Aggregates the bridge's SSE (OpenAI chunk stream) -> {content, toolCalls, reasoningLen, error} */
 function parseBridgeSSE(raw) {
   let content = '', reasoningLen = 0, error = null;
   const toolCalls = [];
@@ -67,53 +67,53 @@ function parseBridgeSSE(raw) {
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 (async () => {
-  console.log(`\n=== Phase I 全功能真实 E2E（http://${HOST}:${PORT}，真实凭证 + 真实上游）===\n`);
+  console.log(`\n=== Phase I full-functionality real E2E (http://${HOST}:${PORT}, real credential + real upstream) ===\n`);
 
-  // ---------- 0. 凭证就绪检查 ----------
+  // ---------- 0. Credential readiness check ----------
   {
     const cred = JSON.parse(fs.readFileSync('data/e2e/tokens.json', 'utf8')).find(t => t.token.includes('session-token'));
-    ok('0.1 真实 web 凭证存在', !!cred, 'data/e2e/tokens.json 无 session-token 凭证');
+    ok('0.1 Real web credential exists', !!cred, 'data/e2e/tokens.json has no session-token credential');
     if (!cred) { console.log(results.join('\n')); process.exit(1); }
   }
 
-  // ---------- 1. token 保活 ----------
+  // ---------- 1. Token keep-alive ----------
   {
     const r = await json('POST', '/api/account/refresh', {});
     const j = r.json || {};
-    ok('1.1 保活检查通过（凭证有效）', r.status === 200 && j.ok === true && j.valid === true, `${r.status} ${r.text.slice(0, 200)}`);
-    ok('1.2 保活刷新了短期 token（上游 convex-token 真实响应）', typeof j.message === 'string' && /token/.test(j.message), j.message);
+    ok('1.1 Keep-alive check passes (credential valid)', r.status === 200 && j.ok === true && j.valid === true, `${r.status} ${r.text.slice(0, 200)}`);
+    ok('1.2 Keep-alive refreshed the short-lived token (real upstream convex-token response)', typeof j.message === 'string' && /token/.test(j.message), j.message);
   }
 
-  // ---------- 2. 模型列表 ----------
+  // ---------- 2. Model list ----------
   {
     const r = await json('GET', '/v1/models');
     const j = r.json || {};
     const ids = (j.data || []).map(m => m.id);
-    ok('2.1 模型列表 200 且非空', r.status === 200 && ids.length > 0, `${r.status} count=${ids.length}`);
-    ok('2.2 模型条目字段完整（id/object/owned_by）', ids.length > 0 && (j.data[0].object === 'model') && !!j.data[0].owned_by);
-    ok('2.3 含点名验证的目标模型', ids.includes(MODEL), ids.slice(0, 5).join(','));
+    ok('2.1 Model list 200 and non-empty', r.status === 200 && ids.length > 0, `${r.status} count=${ids.length}`);
+    ok('2.2 Model entries have complete fields (id/object/owned_by)', ids.length > 0 && (j.data[0].object === 'model') && !!j.data[0].owned_by);
+    ok('2.3 Includes the explicitly-requested target model', ids.includes(MODEL), ids.slice(0, 5).join(','));
     const g = await json('GET', '/api/guide');
-    ok('2.4 /api/guide 的 models_count 与列表一致', ((g.json || {}).models_count || 0) >= ids.length, `guide=${(g.json || {}).models_count} list=${ids.length}`);
+    ok('2.4 /api/guide models_count matches the list', ((g.json || {}).models_count || 0) >= ids.length, `guide=${(g.json || {}).models_count} list=${ids.length}`);
   }
 
-  // ---------- 3. 工具调用能力（web_search） ----------
+  // ---------- 3. Tool-calling capability (web_search) ----------
   {
     const r = await req('POST', '/v1/chat/completions', {
       body: { model: MODEL, stream: true, messages: [{ role: 'user', content: '请用联网搜索工具查一下 freebuff.com 是什么网站，然后用一句话回答。必须真的调用搜索。' }] },
     });
     const sse = parseBridgeSSE(r.text);
-    ok('3.1 工具调用请求 200 且无内嵌错误', r.status === 200 && !sse.error, `${r.status} ${sse.error ? JSON.stringify(sse.error).slice(0, 150) : 'ok'}`);
-    ok('3.2 有工具调用或工具研究正文透传（agent 能力真实触发）', sse.toolCalls.length > 0 || sse.content.length > 20, `toolCalls=${sse.toolCalls.length} contentLen=${sse.content.length}`);
-    ok('3.3 有思考过程（reasoning 透传）', sse.reasoningLen > 0 || sse.content.length > 0, `reasoningChars=${sse.reasoningLen}`);
+    ok('3.1 Tool-call request 200 with no embedded error', r.status === 200 && !sse.error, `${r.status} ${sse.error ? JSON.stringify(sse.error).slice(0, 150) : 'ok'}`);
+    ok('3.2 Has a tool call or tool-researched content passed through (agent capability really triggered)', sse.toolCalls.length > 0 || sse.content.length > 20, `toolCalls=${sse.toolCalls.length} contentLen=${sse.content.length}`);
+    ok('3.3 Has reasoning output (reasoning passed through)', sse.reasoningLen > 0 || sse.content.length > 0, `reasoningChars=${sse.reasoningLen}`);
   }
 
-  // ---------- 4. 缓存/多轮上下文（同 thread 跨请求记忆） ----------
+  // ---------- 4. Caching/multi-turn context (cross-request memory within the same thread) ----------
   {
     const NAME = '测友' + (Date.now() % 10000);
-    // 第 1 轮：告诉它名字
+    // Turn 1: tell it a name
     const r1 = await json('POST', '/v1/chat/completions', { model: MODEL, stream: false, messages: [{ role: 'user', content: `记住：我的代号是「${NAME}」。请只回复：记住了` }] });
-    ok('4.1 第 1 轮 200', r1.status === 200, r1.text.slice(0, 150));
-    // 第 2 轮：问名字（多轮 messages，应复用 thread 只发增量）
+    ok('4.1 Turn 1 200', r1.status === 200, r1.text.slice(0, 150));
+    // Turn 2: ask for the name (multi-turn messages, should reuse the thread and only send the delta)
     const r2 = await json('POST', '/v1/chat/completions', {
       model: MODEL, stream: false,
       messages: [
@@ -123,16 +123,16 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
       ],
     });
     const a2 = ((r2.json || {}).choices || [{}])[0].message?.content || '';
-    ok('4.2 第 2 轮 200 且答出代号（跨请求上下文生效 = thread 复用）', r2.status === 200 && a2.includes(NAME), `answer=${JSON.stringify(a2.slice(0, 60))}`);
-    // 绑定文件确认 thread 复用
+    ok('4.2 Turn 2 200 and answers with the name (cross-request context works = thread reuse)', r2.status === 200 && a2.includes(NAME), `answer=${JSON.stringify(a2.slice(0, 60))}`);
+    // Check the binding file to confirm thread reuse
     fs.mkdirSync('data/e2e', { recursive: true });
     if (!fs.existsSync('data/e2e/web_threads.json')) { fs.writeFileSync('data/e2e/web_threads.json', '{}'); }
     const bind = JSON.parse(fs.readFileSync('data/e2e/web_threads.json', 'utf8'));
     const turns = Math.max(...Object.values(bind).map(v => v.turns), 0);
-    ok('4.3 thread 绑定 turns>0（续聊确实在复用，未重开会话烧额度）', turns > 0, `turns=${turns}`);
+    ok('4.3 Thread binding turns>0 (the conversation really reused the thread instead of burning quota on a new session)', turns > 0, `turns=${turns}`);
   }
 
-  // ---------- 5. 长 agent 能力（长任务 + 长输出） ----------
+  // ---------- 5. Long agent capability (long task + long output) ----------
   {
     const r = await req('POST', '/v1/chat/completions', {
       body: {
@@ -141,12 +141,12 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
       },
     });
     const sse = parseBridgeSSE(r.text);
-    ok('5.1 长 agent 请求 200', r.status === 200, String(r.status));
-    ok('5.2 长输出达标（>400 字，证明多轮工具+生成链路稳定）', sse.content.length > 400, `contentLen=${sse.content.length}`);
-    ok('5.3 输出含分条结构（模型真的在干活，非空转）', /[-•*1-9]/.test(sse.content), sse.content.slice(0, 80));
+    ok('5.1 Long-agent request 200', r.status === 200, String(r.status));
+    ok('5.2 Long output meets the bar (>400 chars, proves the multi-turn tool+generation chain is stable)', sse.content.length > 400, `contentLen=${sse.content.length}`);
+    ok('5.3 Output has a bulleted structure (the model is really doing work, not idling)', /[-•*1-9]/.test(sse.content), sse.content.slice(0, 80));
   }
 
-  // ---------- 6. Anthropic 协议（/v1/messages 流式） ----------
+  // ---------- 6. Anthropic protocol (/v1/messages streaming) ----------
   {
     const r = await req('POST', '/v1/messages', {
       body: { model: MODEL, max_tokens: 200, stream: true, messages: [{ role: 'user', content: '请只回复两个字：就绪' }] },
@@ -155,12 +155,12 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
     const hasStart = evs.includes('message_start');
     const hasDelta = evs.includes('content_block_delta');
     const hasStop = evs.includes('message_stop');
-    ok('6.1 Anthropic 事件流三件套齐全（message_start/delta/stop）', r.status === 200 && hasStart && hasDelta && hasStop, `${r.status} events=${[...new Set(evs)].join(',')}`);
+    ok('6.1 All three Anthropic event-stream stages present (message_start/delta/stop)', r.status === 200 && hasStart && hasDelta && hasStop, `${r.status} events=${[...new Set(evs)].join(',')}`);
     const deltaText = (r.text.match(/"text":"((?:[^"\\]|\\.)*)"/g) || []).join('');
-    ok('6.2 流中有实际内容', deltaText.length > 0, `deltaSample=${deltaText.slice(0, 60)}`);
+    ok('6.2 Stream carries actual content', deltaText.length > 0, `deltaSample=${deltaText.slice(0, 60)}`);
   }
 
   console.log(results.join('\n'));
-  console.log(`\n=== Phase I 结果：${passed} 通过 / ${failed} 失败 ===\n`);
+  console.log(`\n=== Phase I results: ${passed} passed / ${failed} failed ===\n`);
   process.exit(failed > 0 ? 1 : 0);
-})().catch(e => { console.error('Phase I 脚本异常:', e); process.exit(1); });
+})().catch(e => { console.error('Phase I script error:', e); process.exit(1); });

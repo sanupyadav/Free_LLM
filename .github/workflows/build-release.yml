@@ -1,4 +1,4 @@
-# Freebuff2API CI/CD — Windows 桌面安装包构建 + 自动发布 Release
+# Freebuff2API CI/CD - builds the Windows desktop installer + auto-publishes a Release
 name: Build Windows Installer & Release
 
 on:
@@ -21,7 +21,8 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
         with:
-          # 锁定与本地验证一致的版本，避免最新 stable 的 clippy 新 lint 触发 -D warnings
+          # Pinned to the same version used for local verification, to avoid the latest
+          # stable clippy's new lints tripping -D warnings
           toolchain: 1.95.0
           targets: x86_64-pc-windows-msvc
           components: clippy, rustfmt, rust-docs
@@ -37,12 +38,12 @@ jobs:
       - name: Build gateway (release)
         run: cargo build --release
         env:
-          CARGO_HTTP_PROXY: "" # GitHub Actions 直连
+          CARGO_HTTP_PROXY: "" # GitHub Actions connects directly
 
       - name: Run tests + clippy
         shell: bash
         env:
-          CARGO_HTTP_PROXY: ""   # 隔离本机 .cargo/config.toml 代理（已移出 git，双保险）
+          CARGO_HTTP_PROXY: ""   # isolate the local .cargo/config.toml proxy (already removed from git, belt and suspenders)
           HTTP_PROXY: ""
           HTTPS_PROXY: ""
           ALL_PROXY: ""
@@ -182,14 +183,15 @@ jobs:
           mkdir -p data-e2e
           ./target/release/freebuff2api.exe --config config.e2e.json &
           GW_PID=$!
-          # 审计 L6：无论脚本成败都清理网关；健康轮询超时显式失败（不静默白等）
+          # Audit L6: clean up the gateway regardless of script success/failure; an explicit
+          # failure on health-poll timeout instead of silently waiting forever
           trap 'taskkill //F //IM freebuff2api.exe >/dev/null 2>&1 || kill $GW_PID >/dev/null 2>&1 || true' EXIT
           for i in $(seq 1 90); do
             if curl -sf http://127.0.0.1:47980/healthz >/dev/null 2>&1; then break; fi
             if [ "$i" = "90" ]; then echo "::error::gateway failed to start within 90s"; exit 1; fi
             sleep 1
           done
-          # 预置假 web-cookie（仅本地池，触发 health 合并路径；无上游网络调用）
+          # Pre-seed a fake web cookie (local pool only, triggers the health merge path; no upstream network call)
           curl -s -X POST http://127.0.0.1:47980/api/tokens/import -H "content-type: application/json" -d "{\"cookie\":\"__Secure-next-auth.session-token=e2e-fake-abc; __Host-next-auth.csrf-token=e2e\"}" >/dev/null
           node tests/e2e_phase_v0_8.cjs 47980 config.e2e.json
           node tests/e2e_phase_v0_9.cjs 47980 config.e2e.json
@@ -214,12 +216,12 @@ jobs:
           key: ${{ runner.os }}-cov-${{ hashFiles('Cargo.lock') }}
       - name: Install cargo-llvm-cov
         run: cargo install cargo-llvm-cov --locked
-      - name: Coverage gate (>=70% lines, v0.10.3 真门禁)
-        # v0.10.3：本机实测 TOTAL 行覆盖率 72.25%（cargo-llvm-cov 0.9.1 --locked，2026-09-19）。
-        # 本轮新增 22 个 Router 级集成用例（config/skills/memory/tokens/usage/insights/logs/doctor/export/import/prompts/threads/guide/models/web-chat/upload 等本地 handler），
-        # api.rs 覆盖 30.6% -> 45.8%。关键业务模块：errors 97.9 / redact 98.5 / mcp 98.6 / telemetry 94.4 / memory 93.9 / import 92.8 / router 89.0 / web_pool 84.6 / export 84.0 / models 83.2。
-        # 拉低项：main.rs 0（启动路径）、upstream 51.6 / session 65.6 / web_protocol 76.9（网络层）。
-        # 提升路径（backlog）：api.rs 45.8 -> 60（补鉴权/路由错误分支）-> 总体 75% -> 80%。
+      - name: Coverage gate (>=70% lines, v0.10.3 real gate)
+        # v0.10.3: locally measured TOTAL line coverage is 72.25% (cargo-llvm-cov 0.9.1 --locked, 2026-09-19).
+        # This round added 22 Router-level integration cases (config/skills/memory/tokens/usage/insights/logs/doctor/export/import/prompts/threads/guide/models/web-chat/upload etc. local handlers),
+        # taking api.rs coverage from 30.6% -> 45.8%. Key business modules: errors 97.9 / redact 98.5 / mcp 98.6 / telemetry 94.4 / memory 93.9 / import 92.8 / router 89.0 / web_pool 84.6 / export 84.0 / models 83.2.
+        # Dragging it down: main.rs 0 (startup path), upstream 51.6 / session 65.6 / web_protocol 76.9 (network layer).
+        # Improvement path (backlog): api.rs 45.8 -> 60 (add auth/routing error branches) -> overall 75% -> 80%.
         continue-on-error: false
         env:
           CARGO_HTTP_PROXY: ""

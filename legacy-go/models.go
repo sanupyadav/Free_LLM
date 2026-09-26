@@ -20,8 +20,9 @@ const (
 	rootAgentID          = "base2-free"
 )
 
-// hardcodedFallback 为内置模型注册表（上游 free-agents.ts 已改用常量引用，正则无法解析，
-// 以本表为权威底座；远程解析结果仅作增量补充）。子代理必须挂在根 agent 之下。
+// hardcodedFallback is the built-in model registry (the upstream free-agents.ts now uses
+// constant references that the regex can't parse, so this table is the authoritative base;
+// remote-parsed results are only an incremental supplement). Sub-agents must hang off the root agent.
 var hardcodedFallback = map[string][]string{
 	rootAgentID:                {"google/gemini-2.5-flash-lite"},
 	"file-picker":              {"google/gemini-2.5-flash-lite"},
@@ -153,8 +154,9 @@ func (r *ModelRegistry) refresh(ctx context.Context) error {
 		return fmt.Errorf("no free agents found in source")
 	}
 
-	// 以 hardcodedFallback 为底座合并：上游源码改用常量引用（如 FREEBUFF_*_MODEL_ID）
-	// 后正则无法解析，合并保证列表只增不减；远程解析到的条目覆盖/新增。
+	// Merge on top of hardcodedFallback as the base: once the upstream source switched to
+	// constant references (e.g. FREEBUFF_*_MODEL_ID), the regex can no longer parse them, so
+	// merging guarantees the list only grows; remotely-parsed entries override/add to it.
 	merged := make(map[string][]string, len(hardcodedFallback)+len(all))
 	for agentID, models := range hardcodedFallback {
 		merged[agentID] = models

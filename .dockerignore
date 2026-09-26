@@ -6,3 +6,4 @@
 Dockerfile
 .dockerignore
 .gitignore
+!browser-extension/README.md

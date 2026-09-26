@@ -1,7 +1,8 @@
-//! WebCookiePool 集成测试（v0.9 §1.1）：从真实 Config/tokens.json 构建 + 契约字段 + 并发稳定。
+//! WebCookiePool integration tests (v0.9 §1.1): building from a real Config/tokens.json + contract fields + concurrency stability.
 //!
-//! 单元级（挑选/熔断/冷却/恢复/空池 ≥8）在 src/web_pool.rs 内；
-//! 本文件覆盖"从磁盘构建""健康快照契约字段""并发挑选稳定"等跨模块行为。
+//! Unit-level tests (pick / circuit-break / cooldown / recovery / empty pool >= 8) live in src/web_pool.rs;
+//! this file covers cross-module behavior such as "building from disk", "health snapshot contract fields",
+//! and "concurrent pick stability".
 
 use freebuff2api::config::Config;
 use freebuff2api::web_pool::WebCookiePool;
@@ -14,7 +15,7 @@ fn cookie_b() -> String {
     "__Secure-next-auth.session-token=bbbb; __Host-next-auth.csrf-token=zzz".to_string()
 }
 
-/// 组装一个带 tokens_path 的临时 Config（auth_tokens 含一个 Cookie，导入库含一个 web-cookie）
+/// Assembles a temporary Config with a tokens_path (auth_tokens has one Cookie, the import library has one web-cookie)
 fn tmp_cfg(cfg_auth_token: &str, tokens_json: &str) -> (Config, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let tokens_path = dir.path().join("tokens.json");
@@ -31,7 +32,7 @@ fn tmp_cfg(cfg_auth_token: &str, tokens_json: &str) -> (Config, tempfile::TempDi
 
 #[tokio::test]
 async fn builds_from_config_cookie_and_imported_web_cookie() {
-    // config.auth_tokens 里的 Cookie 项 + tokens.json 的 web-cookie 都要入池
+    // Both the Cookie entry in config.auth_tokens and the web-cookie in tokens.json must enter the pool
     let tokens_json = format!(
         r#"[{{"token":"{b}","source":"cookie","host":"freebuff.com","path":"/p","method":"GET","added_at":"2026-09-01T00:00:00Z"}}]"#,
         b = cookie_b()
@@ -39,27 +40,27 @@ async fn builds_from_config_cookie_and_imported_web_cookie() {
     let (cfg, _dir) = tmp_cfg(&cookie_a(), &tokens_json);
     let pool = WebCookiePool::new(&cfg);
     let snap = pool.snapshot().await;
-    assert_eq!(snap.len(), 2, "config 与导入库凭证都应入池");
+    assert_eq!(snap.len(), 2, "credentials from both config and the import library should enter the pool");
     let sources: Vec<&str> = snap.iter().map(|s| s.source).collect();
-    assert!(sources.contains(&"config"), "config 项 source=config");
-    assert!(sources.contains(&"imported"), "导入项 source=imported");
+    assert!(sources.contains(&"config"), "the config entry should have source=config");
+    assert!(sources.contains(&"imported"), "the imported entry should have source=imported");
 }
 
 #[tokio::test]
 async fn ignores_bearer_tokens_in_config_and_import() {
-    // Bearer token（无 session-token）不得进 web Cookie 池
+    // A Bearer token (no session-token) must not enter the web Cookie pool
     let tokens_json = r#"[{"token":"sk-bearer-abc123","source":"curl","host":"h","path":"p","method":"POST","added_at":"2026-09-01T00:00:00Z"}]"#;
     let (cfg, _dir) = tmp_cfg("sk-plain-bearer", tokens_json);
     let pool = WebCookiePool::new(&cfg);
     assert!(
         pool.pick().await.is_none(),
-        "无 web Cookie → pick 应为 None"
+        "no web Cookie -> pick should be None"
     );
 }
 
 #[tokio::test]
 async fn snapshot_contract_fields_for_health_endpoint() {
-    // /api/accounts/health 的 web 侧契约：字段名与类型不可变（前端按此画时间线）
+    // Web-side contract for /api/accounts/health: field names and types are immutable (the frontend draws its timeline from these)
     let (cfg, _dir) = tmp_cfg(&cookie_a(), "[]");
     let pool = WebCookiePool::new(&cfg);
     let id = pool.pick().await.unwrap().id;
@@ -75,15 +76,15 @@ async fn snapshot_contract_fields_for_health_endpoint() {
     assert_eq!(s.id, id);
     assert!(!s.masked.is_empty());
     assert_eq!(s.circuit_state, "open");
-    assert!(s.cooldown_until.is_some(), "熔断后应有 cooldown_until");
+    assert!(s.cooldown_until.is_some(), "cooldown_until should be set after tripping");
     assert_eq!(s.trips, 1);
     assert!(s.last_error.as_deref().is_some());
-    // last_ok_at 初始为 None（从未成功）
+    // last_ok_at starts as None (never succeeded)
     assert!(s.last_ok_at.is_none());
-    // added_at 字段必须存在（契约），config 项可为 null（导入项才有真实入库时间）
+    // The added_at field must exist (contract); config entries may have it as null (only imported entries have a real ingest time)
     assert!(
         serde_json::to_value(s).unwrap().get("added_at").is_some(),
-        "added_at 字段必须存在"
+        "the added_at field must exist"
     );
     let v = serde_json::to_value(s).unwrap();
     for field in [
@@ -99,7 +100,7 @@ async fn snapshot_contract_fields_for_health_endpoint() {
         "last_error",
         "last_ok_at",
     ] {
-        assert!(v.get(field).is_some(), "契约字段 {field} 缺失");
+        assert!(v.get(field).is_some(), "contract field {field} is missing");
     }
 }
 
@@ -113,7 +114,7 @@ async fn concurrent_picks_never_panic_and_respect_cooldown() {
         ),
     );
     let pool = WebCookiePool::new(&cfg);
-    // 坏号 401：立即熔断冷却；并发挑选必须稳定落在好号（无 panic / 无 None）
+    // Bad account gets a 401: trips into cooldown immediately; concurrent picks must reliably land on the good account (no panic / no None)
     let idb = freebuff2api::import::cred_id(&cookie_b());
     pool.mark_cooldown(&idb, Duration::from_secs(600), "web chat HTTP 401")
         .await;
@@ -125,9 +126,9 @@ async fn concurrent_picks_never_panic_and_respect_cooldown() {
     }
     for h in handles {
         let picked = h.await.unwrap();
-        assert!(picked.is_some(), "好号存在时并发 pick 不得返回 None");
+        assert!(picked.is_some(), "concurrent pick must not return None while a good account exists");
         let picked = picked.unwrap();
-        assert_eq!(picked.cookie, cookie_a(), "坏号熔断后并发挑选应全部落好号");
+        assert_eq!(picked.cookie, cookie_a(), "after the bad account trips, concurrent picks should all land on the good account");
     }
 }
 
@@ -139,12 +140,12 @@ async fn mark_ok_sets_last_ok_at() {
     pool.mark_cooldown(&id, Duration::from_millis(1), "boom")
         .await;
     tokio::time::sleep(Duration::from_millis(5)).await;
-    // 冷却到期 → HalfOpen 探测放行 → 连续两次成功恢复 Closed
+    // Cooldown expires -> HalfOpen probe let through -> two consecutive successes restore Closed
     let p1 = pool.pick().await.unwrap();
     pool.mark_ok(&p1.id).await;
     pool.mark_ok(&p1.id).await;
     let snap = pool.snapshot().await;
     let s = snap.iter().find(|x| x.id == id).unwrap();
-    assert!(s.last_ok_at.is_some(), "成功后应记录 last_ok_at");
-    assert_eq!(s.circuit_state, "closed", "连续成功应恢复 Closed");
+    assert!(s.last_ok_at.is_some(), "last_ok_at should be recorded after success");
+    assert_eq!(s.circuit_state, "closed", "consecutive successes should restore Closed");
 }

@@ -1,9 +1,9 @@
-//! Router 级集成测试（v0.8，5.2C）：构建完整 axum Router + Mock 上游，覆盖 8 条主路径。
+//! Router-level integration tests (v0.8, 5.2C): build the full axum Router + a mock upstream, covering 8 main paths.
 //!
-//! 用自建 tokio TCP stub 模拟上游（不加新 dev-dependency），
-//! 覆盖：chat 非流式/流式、messages 非流式、401、跨站 403、healthz、桥接触发、信号量 429。
+//! The upstream is simulated with a hand-rolled tokio TCP stub (no new dev-dependency),
+//! covering: chat non-streaming/streaming, messages non-streaming, 401, cross-site 403, healthz, bridge trigger, semaphore 429.
 //!
-//! 所有测试不写真实令牌、不打真实付费上游（遵守付费 API 红线）。
+//! No test writes real tokens or hits a real paid upstream (paid-API red line).
 
 use axum::body::Body;
 use axum::http::Response;
@@ -30,12 +30,8 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tower::ServiceExt;
 
-/// 极简 Mock 上游：接受请求，按路径分流（session/run 成功、chat 按 mode 定行为）。
-async fn mock_upstream(addr: std::net::SocketAddr, mode: MockMode) {
-    let listener = match TcpListener::bind(addr).await {
-        Ok(l) => l,
-        Err(_) => return, // 端口冲突则跳过（环境不支持本地监听）
-    };
+/// Minimal mock upstream: accepts requests and routes by path (session/run succeed, chat behaves per mode).
+async fn mock_upstream(listener: TcpListener, mode: MockMode) {
     loop {
         let Ok((mut stream, _)) = listener.accept().await else {
             continue;
@@ -52,14 +48,14 @@ async fn mock_upstream(addr: std::net::SocketAddr, mode: MockMode) {
                 })
                 .map(|l| l.split_whitespace().nth(1).unwrap_or("").to_string())
                 .unwrap_or_default();
-            // Freebuff 上游真实协议：
-            // 1) session 端点（POST/GET/DELETE /api/v1/freebuff/session）→ 返回会话状态
-            // 2) agent-runs 端点（POST /api/v1/agent-runs）→ 返回 runId
-            // 3) chat 端点（POST /api/v1/chat/completions）→ 返回 mode 决定的行为
+            // Real Freebuff upstream protocol:
+            // 1) session endpoint (POST/GET/DELETE /api/v1/freebuff/session) → returns session state
+            // 2) agent-runs endpoint (POST /api/v1/agent-runs) → returns runId
+            // 3) chat endpoint (POST /api/v1/chat/completions) → behavior decided by mode
             let (status_line, body) = if path.contains("/freebuff/session") {
                 match mode {
                     MockMode::WaitingRoom => {
-                        // 排队：返回 queued 状态 → ensure_session 抛出 waiting_room_queued
+                        // queued: return queued status → ensure_session raises waiting_room_queued
                         let body = r#"{"status":"queued","position":3,"queueDepth":5,"estimatedWaitMs":3000,"message":"queued"}"#;
                         (
                             "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n".to_string(),
@@ -67,7 +63,7 @@ async fn mock_upstream(addr: std::net::SocketAddr, mode: MockMode) {
                         )
                     }
                     _ => {
-                        // 活跃会话
+                        // active session
                         let body = r#"{"status":"active","instanceId":"inst-test","model":"z-ai/glm-5.3-flash","expiresAt":"2099-12-31T00:00:00Z"}"#;
                         (
                             "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n".to_string(),
@@ -82,10 +78,10 @@ async fn mock_upstream(addr: std::net::SocketAddr, mode: MockMode) {
                     body.to_string(),
                 )
             } else {
-                // chat 端点按 mode
+                // chat endpoint by mode
                 match mode {
                     MockMode::JsonOk => {
-                        let body = r#"{"id":"cmpl-1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"你好，我是 Mock 上游"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#;
+                        let body = r#"{"id":"cmpl-1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"Hello, I am the mock upstream"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#;
                         (
                             "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n".to_string(),
                             body.to_string(),
@@ -123,8 +119,8 @@ async fn mock_upstream(addr: std::net::SocketAddr, mode: MockMode) {
                         )
                     }
                     MockMode::BridgeSse => {
-                        // web 协议桥接：上游 chat/stream 事件流（type: meta/delta/done）
-                        let body = "data: {\"type\":\"meta\",\"threadId\":\"thread-1\",\"title\":\"桥接会话\"}\n\ndata: {\"type\":\"delta\",\"text\":\"桥接回复\"}\n\ndata: {\"type\":\"done\"}\n\n";
+                        // web protocol bridge: upstream chat/stream event stream (type: meta/delta/done)
+                        let body = "data: {\"type\":\"meta\",\"threadId\":\"thread-1\",\"title\":\"bridge session\"}\n\ndata: {\"type\":\"delta\",\"text\":\"bridge reply\"}\n\ndata: {\"type\":\"done\"}\n\n";
                         (
                             "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n".to_string(),
                             body.to_string(),
@@ -152,7 +148,7 @@ enum MockMode {
     BridgeSse,
 }
 
-/// 构建一个最小但完整的 AppState（所有数据面组件临时目录隔离）
+/// Build a minimal but complete AppState (all data-plane components isolated in temp dirs)
 async fn build_state(base_url: String) -> Arc<AppState> {
     let dir = tempfile::tempdir().unwrap();
     let p = |n: &str| dir.path().join(n).to_str().unwrap().to_string();
@@ -207,7 +203,7 @@ async fn build_state(base_url: String) -> Arc<AppState> {
     let memory_runtime_enabled = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let semaphore = Arc::new(TieredSemaphore::default_capacity());
 
-    // 保留 tempdir（写文件类 handler：tokens.json / memory / skills 需要目录存活）
+    // keep the tempdir alive (file-writing handlers: tokens.json / memory / skills need it)
     std::mem::forget(dir);
 
     Arc::new(AppState {
@@ -233,15 +229,16 @@ async fn build_state(base_url: String) -> Arc<AppState> {
     })
 }
 
-/// 启动 Mock 上游并返回 base_url
+/// Start the mock upstream and return its base_url
 async fn start_mock(mode: MockMode) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move { mock_upstream(addr, mode).await });
+    // hand over the bound listener: re-binding in the task raced with the first request (connection refused)
+    tokio::spawn(async move { mock_upstream(listener, mode).await });
     format!("http://{}", addr)
 }
 
-/// 发起请求到 Router，返回 (status, body)
+/// Send a request to the Router, returning (status, body)
 async fn send(
     app: &mut axum::Router,
     method: Method,
@@ -275,14 +272,14 @@ async fn chat_completions_non_stream_returns_200() {
         &mut app,
         Method::POST,
         "/v1/chat/completions",
-        Some(r#"{"model":"z-ai/glm-5.3-flash","messages":[{"role":"user","content":"你好"}]}"#),
+        Some(r#"{"model":"z-ai/glm-5.3-flash","messages":[{"role":"user","content":"Hello"}]}"#),
         None,
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "非流式 chat 应 200，body={body}");
+    assert_eq!(status, StatusCode::OK, "non-streaming chat should be 200, body={body}");
     assert!(
-        body.contains("你好，我是 Mock 上游"),
-        "应透传上游正文: {body}"
+        body.contains("Hello, I am the mock upstream"),
+        "should pass through upstream text: {body}"
     );
 }
 
@@ -298,8 +295,8 @@ async fn chat_completions_stream_returns_sse() {
         Some(r#"{"model":"z-ai/glm-5.3-flash","messages":[{"role":"user","content":"hi"}],"stream":true}"#),
         None,
     ).await;
-    assert_eq!(status, StatusCode::OK, "流式 chat 应 200");
-    assert!(body.contains("data:"), "应返回 SSE 流: {body}");
+    assert_eq!(status, StatusCode::OK, "streaming chat should be 200");
+    assert!(body.contains("data:"), "should return an SSE stream: {body}");
 }
 
 #[tokio::test]
@@ -311,12 +308,12 @@ async fn messages_non_stream_returns_claude_shape() {
         &mut app,
         Method::POST,
         "/v1/messages",
-        Some(r#"{"model":"z-ai/glm-5.3-flash","max_tokens":64,"messages":[{"role":"user","content":"你好"}]}"#),
+        Some(r#"{"model":"z-ai/glm-5.3-flash","max_tokens":64,"messages":[{"role":"user","content":"Hello"}]}"#),
         None,
     ).await;
-    assert_eq!(status, StatusCode::OK, "Claude 非流式应 200，body={body}");
-    assert!(body.contains("type"), "应为 Claude 形状: {body}");
-    assert!(body.contains("content"), "应含 content 块: {body}");
+    assert_eq!(status, StatusCode::OK, "Claude non-streaming should be 200, body={body}");
+    assert!(body.contains("type"), "should be Claude-shaped: {body}");
+    assert!(body.contains("content"), "should contain a content block: {body}");
 }
 
 #[tokio::test]
@@ -335,11 +332,11 @@ async fn messages_waiting_room_returns_503_readable() {
     assert_eq!(
         status,
         StatusCode::SERVICE_UNAVAILABLE,
-        "排队应 503，body={body}"
+        "queued should be 503, body={body}"
     );
     assert!(
         body.contains("waiting_room_queued") || body.to_lowercase().contains("waiting"),
-        "排队消息应可读: {body}"
+        "queued message should be readable: {body}"
     );
 }
 
@@ -347,7 +344,7 @@ async fn messages_waiting_room_returns_503_readable() {
 async fn invalid_api_key_returns_401() {
     let base = start_mock(MockMode::JsonOk).await;
     let state = Arc::unwrap_or_clone(build_state(base).await);
-    // 配置一个 api_key，客户端不传 → 401
+    // configure an api_key, client sends none → 401
     *state.api_keys.write().unwrap() = vec!["sk-correct".into()];
     let mut app = build_router(state);
     let (status, body) = send(
@@ -361,7 +358,7 @@ async fn invalid_api_key_returns_401() {
     assert_eq!(
         status,
         StatusCode::UNAUTHORIZED,
-        "无 Key 应 401，body={body}"
+        "no key should be 401, body={body}"
     );
     let (status2, _) = send(
         &mut app,
@@ -390,7 +387,7 @@ async fn cross_site_origin_blocked_403() {
     assert_eq!(
         status,
         StatusCode::FORBIDDEN,
-        "跨站 Origin 应 403，body={body}"
+        "cross-site Origin should be 403, body={body}"
     );
 }
 
@@ -400,15 +397,15 @@ async fn healthz_returns_ok() {
     let state = build_state(base).await;
     let mut app = build_router(Arc::unwrap_or_clone(state));
     let (status, body) = send(&mut app, Method::GET, "/healthz", None, None).await;
-    assert_eq!(status, StatusCode::OK, "healthz 应 200，body={body}");
-    assert!(body.contains("ok"), "healthz 应含 ok: {body}");
+    assert_eq!(status, StatusCode::OK, "healthz should be 200, body={body}");
+    assert!(body.contains("ok"), "healthz should contain ok: {body}");
 }
 
 #[tokio::test]
 async fn empty_pool_with_web_cookie_triggers_bridge() {
-    // 账号池空（无 auth_tokens）+ 有 web Cookie → 走桥接路径（Mock 上游返回 SSE）
+    // empty account pool (no auth_tokens) + a web Cookie → bridge path (mock upstream returns SSE)
     let base = start_mock(MockMode::BridgeSse).await;
-    // 让桥接 WebClient 指向 Mock 地址（生产默认 freebuff.com）
+    // point the bridge WebClient at the mock address (production default: freebuff.com)
     std::env::set_var("FREEBUFF2API_WEB_HOST", base.clone());
     let dir = tempfile::tempdir().unwrap();
     let p = |n: &str| dir.path().join(n).to_str().unwrap().to_string();
@@ -429,7 +426,7 @@ async fn empty_pool_with_web_cookie_triggers_bridge() {
         skip_upstream_check: true,
         ..Default::default()
     };
-    // 导入库写入一个 web Cookie 凭证（ExtractedAuth 完整字段）
+    // write one web Cookie credential into the import store (full ExtractedAuth fields)
     let cookie = "__Secure-next-auth.session-token=mock-cookie-abc; x=1";
     std::fs::write(&cfg.tokens_path, format!(
         r#"[{{"token":"{cookie}","source":"curl","host":"www.codebuff.com","path":"/api/v1/chat/completions","method":"POST","added_at":"2026-09-15T00:00:00Z"}}]"#
@@ -491,16 +488,16 @@ async fn empty_pool_with_web_cookie_triggers_bridge() {
         &mut app,
         Method::POST,
         "/v1/chat/completions",
-        Some(r#"{"model":"z-ai/glm-5.3-flash","messages":[{"role":"user","content":"桥接测试"}],"stream":true}"#),
+        Some(r#"{"model":"z-ai/glm-5.3-flash","messages":[{"role":"user","content":"bridge test"}],"stream":true}"#),
         None,
     ).await;
-    assert_eq!(status, StatusCode::OK, "桥接路径应 200，body={body}");
-    assert!(body.contains("data:"), "桥接应返回 SSE: {body}");
+    assert_eq!(status, StatusCode::OK, "bridge path should be 200, body={body}");
+    assert!(body.contains("data:"), "bridge should return SSE: {body}");
 }
 
 #[tokio::test]
 async fn upstream_5xx_retries_then_returns_502() {
-    // 上游 chat 持续 5xx：重试循环耗尽后应返回 502 + 可读消息（验证换号重试逻辑）
+    // upstream chat keeps returning 5xx: after the retry loop is exhausted, expect 502 + a readable message (verifies account-switch retry)
     let base = start_mock(MockMode::Server5xx).await;
     let state = build_state(base).await;
     let mut app = build_router(Arc::unwrap_or_clone(state));
@@ -515,14 +512,14 @@ async fn upstream_5xx_retries_then_returns_502() {
     assert_eq!(
         status,
         StatusCode::BAD_GATEWAY,
-        "上游 5xx 应 502，body={body}"
+        "upstream 5xx should be 502, body={body}"
     );
-    assert!(body.contains("attempts"), "应带尝试次数: {body}");
+    assert!(body.contains("attempts"), "should include the attempt count: {body}");
 }
 
 #[tokio::test]
 async fn upstream_401_is_handled_with_auth_expired() {
-    // 上游 chat 返回 401：凭证失效分类，不应裸 200
+    // upstream chat returns 401: classified as invalid credential, must not be a bare 200
     let base = start_mock(MockMode::Unauthorized).await;
     let state = build_state(base).await;
     let mut app = build_router(Arc::unwrap_or_clone(state));
@@ -537,20 +534,20 @@ async fn upstream_401_is_handled_with_auth_expired() {
     assert_eq!(
         status,
         StatusCode::UNAUTHORIZED,
-        "上游 401 应透传 401，body={body}"
+        "upstream 401 should pass through as 401, body={body}"
     );
     assert!(
         body.contains("auth") || body.contains("401") || body.contains("attempts"),
-        "应含错误信息: {body}"
+        "should contain an error message: {body}"
     );
 }
 
 #[tokio::test]
 async fn non_loopback_peer_denied_admin_without_keys() {
-    // v0.9 §1.5 鉴权纵深：即使没有任何代理头，
-    // 真实 TCP 对端非回环（模拟 0.0.0.0 监听 + 局域网直连）+ 未配置 api_keys → 管理端点 401。
-    // 生产路径由 main 用 into_make_service_with_connect_info 注入 ConnectInfo；
-    // 这里用 req.extensions_mut() 忠实注入同一扩展类型。
+    // v0.9 §1.5 defense-in-depth auth: even without any proxy headers,
+    // a non-loopback real TCP peer (simulating 0.0.0.0 listen + direct LAN access) + no api_keys → admin endpoints 401.
+    // In production, main injects ConnectInfo via into_make_service_with_connect_info;
+    // here req.extensions_mut() injects the same extension type faithfully.
     let base = start_mock(MockMode::JsonOk).await;
     let state = build_state(base).await;
     let app = build_router(Arc::unwrap_or_clone(state));
@@ -567,10 +564,10 @@ async fn non_loopback_peer_denied_admin_without_keys() {
     assert_eq!(
         resp.status(),
         StatusCode::UNAUTHORIZED,
-        "非回环 peer + 无 api_keys → 管理端点必须 401"
+        "non-loopback peer + no api_keys → admin endpoints must be 401"
     );
 
-    // 对照：同一端点 + 回环 peer（127.0.0.1）→ 默认行为不变，正常放行
+    // control: same endpoint + loopback peer (127.0.0.1) → default behavior unchanged, allowed
     let mut req2 = Request::builder()
         .method(Method::GET)
         .uri("/healthz")
@@ -580,10 +577,10 @@ async fn non_loopback_peer_denied_admin_without_keys() {
         "127.0.0.1:47821".parse::<std::net::SocketAddr>().unwrap(),
     ));
     let resp2: Response<Body> = app.oneshot(req2).await.unwrap();
-    assert_eq!(resp2.status(), StatusCode::OK, "回环 peer 应保持默认放行");
+    assert_eq!(resp2.status(), StatusCode::OK, "loopback peer should stay allowed by default");
 }
 
-// ---------- v0.10.3：api.rs 覆盖补充（本地 handler，不依赖真实上游） ----------
+// ---------- v0.10.3: extra api.rs coverage (local handlers, no real upstream) ----------
 
 #[tokio::test]
 async fn config_get_returns_editable_fields() {
@@ -592,8 +589,8 @@ async fn config_get_returns_editable_fields() {
     let mut app = build_router(Arc::unwrap_or_clone(state));
     let (s, b) = send(&mut app, Method::GET, "/api/config", None, None).await;
     assert_eq!(s, StatusCode::OK);
-    assert!(b.contains("editable"), "config get 应含 editable: {b}");
-    assert!(b.contains("listen_addr"), "editable 含 listen_addr");
+    assert!(b.contains("editable"), "config get should contain editable: {b}");
+    assert!(b.contains("listen_addr"), "editable contains listen_addr");
 }
 
 #[tokio::test]
@@ -609,7 +606,7 @@ async fn config_save_valid_updates_and_invalid_rejected() {
         None,
     )
     .await;
-    assert_eq!(s1, StatusCode::OK, "合法配置应保存: {b1}");
+    assert_eq!(s1, StatusCode::OK, "valid config should save: {b1}");
     let (s2, b2) = send(
         &mut app,
         Method::POST,
@@ -620,7 +617,7 @@ async fn config_save_valid_updates_and_invalid_rejected() {
     .await;
     assert!(
         s2 == StatusCode::BAD_REQUEST || s2 == StatusCode::OK,
-        "白名单外应拒绝: {b2}"
+        "keys outside the allowlist should be rejected: {b2}"
     );
     let (s3, b3) = send(
         &mut app,
@@ -632,7 +629,7 @@ async fn config_save_valid_updates_and_invalid_rejected() {
     .await;
     assert!(
         s3 == StatusCode::BAD_REQUEST || s3 == StatusCode::OK,
-        "非法值应拒绝: {b3}"
+        "invalid values should be rejected: {b3}"
     );
 }
 
@@ -647,11 +644,11 @@ async fn skills_list_and_gate_local() {
         &mut app,
         Method::POST,
         "/api/skills/gate",
-        Some(r#"{"body":"正常技能内容；# 标题\n说明文字"}"#),
+        Some(r#"{"body":"normal skill content; # Title\ndescription text"}"#),
         None,
     )
     .await;
-    assert!(s2 == StatusCode::OK, "gate clean 应 200: {b2}");
+    assert!(s2 == StatusCode::OK, "gate clean should be 200: {b2}");
     let (s3, b3) = send(
         &mut app,
         Method::POST,
@@ -662,11 +659,11 @@ async fn skills_list_and_gate_local() {
     .await;
     assert!(
         s3 == StatusCode::OK,
-        "gate 注入也应 200（返回 issues）: {b3}"
+        "gate injection should also be 200 (returns issues): {b3}"
     );
     assert!(
         b3.contains("issues") || !b3.is_empty(),
-        "gate 响应含内容: {b3}"
+        "gate response has content: {b3}"
     );
 }
 
@@ -681,7 +678,7 @@ async fn memory_crud_and_toggle_local() {
         &mut app,
         Method::POST,
         "/api/memory",
-        Some(r#"{"kind":"preference","title":"测试偏好","content":"常用模型 z-ai/glm-5.3-flash"}"#),
+        Some(r#"{"kind":"preference","title":"test preference","content":"preferred model z-ai/glm-5.3-flash"}"#),
         None,
     )
     .await;
@@ -689,7 +686,7 @@ async fn memory_crud_and_toggle_local() {
     let (s3, b3) = send(&mut app, Method::GET, "/api/memory", None, None).await;
     assert!(
         s3 == StatusCode::OK && b3.contains("z-ai/glm-5.3-flash"),
-        "memory 应含新增条目: {b3}"
+        "memory should contain the new entry: {b3}"
     );
     let (s4, b4) = send(
         &mut app,
@@ -703,7 +700,7 @@ async fn memory_crud_and_toggle_local() {
     let (s5, b5) = send(&mut app, Method::GET, "/api/memory", None, None).await;
     assert!(
         s5 == StatusCode::OK && b5.contains("true"),
-        "toggle 后 enabled=true: {b5}"
+        "enabled=true after toggle: {b5}"
     );
 }
 
@@ -717,7 +714,7 @@ async fn tokens_import_cookie_then_list_local() {
     let (s2, b2) = send(&mut app, Method::GET, "/api/tokens", None, None).await;
     assert!(
         s2 == StatusCode::OK && b2.contains("web-cookie") || b2.contains("session-token"),
-        "tokens list 应含 web cookie: {b2}"
+        "tokens list should contain the web cookie: {b2}"
     );
 }
 
@@ -730,7 +727,7 @@ async fn accounts_health_local_shape() {
     assert_eq!(s, StatusCode::OK);
     assert!(
         b.contains("\"ok\"") && b.contains("accounts"),
-        "health 结构: {b}"
+        "health shape: {b}"
     );
 }
 
@@ -756,7 +753,7 @@ async fn usage_insights_empty_returns_shape() {
     assert_eq!(s, StatusCode::OK, "insights: {b}");
     assert!(
         b.contains("window_hours") && b.contains("slowest_accounts"),
-        "insights 契约: {b}"
+        "insights contract: {b}"
     );
 }
 
@@ -785,7 +782,7 @@ async fn doctor_returns_checks_local() {
     let mut app = build_router(Arc::unwrap_or_clone(state));
     let (s, b) = send(&mut app, Method::GET, "/api/doctor", None, None).await;
     assert_eq!(s, StatusCode::OK);
-    assert!(b.contains("checks"), "doctor 含 checks: {b}");
+    assert!(b.contains("checks"), "doctor contains checks: {b}");
 }
 
 #[tokio::test]
@@ -797,7 +794,7 @@ async fn export_config_schema_local() {
     assert_eq!(s, StatusCode::OK, "export: {b}");
     assert!(
         b.contains("schema_version"),
-        "export 含 schema_version: {b}"
+        "export contains schema_version: {b}"
     );
 }
 
@@ -814,7 +811,7 @@ async fn import_bad_schema_rejected_local() {
         None,
     )
     .await;
-    assert_eq!(s, StatusCode::BAD_REQUEST, "坏 schema 应 400: {b}");
+    assert_eq!(s, StatusCode::BAD_REQUEST, "bad schema should be 400: {b}");
 }
 
 #[tokio::test]
@@ -863,7 +860,7 @@ async fn guide_local_ok() {
     assert_eq!(s, StatusCode::OK, "guide: {b}");
     assert!(
         b.contains("listen_addr") || b.contains("47821"),
-        "guide 含接入信息: {b}"
+        "guide contains connection info: {b}"
     );
 }
 
@@ -893,10 +890,10 @@ async fn web_chat_without_cookie_returns_400() {
         None,
     )
     .await;
-    // 池无 web Cookie → 403 page? 或 400 未导入
+    // pool has no web Cookie → 403 page? or 400 not imported
     assert!(
         s == StatusCode::BAD_REQUEST || s == StatusCode::FORBIDDEN || s == StatusCode::UNAUTHORIZED,
-        "无 cookie 应有降级: {s} {b}"
+        "no cookie should degrade: {s} {b}"
     );
 }
 
@@ -923,7 +920,7 @@ async fn upload_without_cookie_returns_bad_request() {
     let base = start_mock(MockMode::JsonOk).await;
     let state = build_state(base).await;
     let mut app = build_router(Arc::unwrap_or_clone(state));
-    // /v1/uploads 上传裸字节（无 cookie）→ 400 multimodal_requires_web_cookie 或 503 pool_exhausted
+    // /v1/uploads raw bytes (no cookie) → 400 multimodal_requires_web_cookie or 503 pool_exhausted
     let (s, b) = send(
         &mut app,
         Method::POST,
@@ -932,12 +929,12 @@ async fn upload_without_cookie_returns_bad_request() {
         None,
     )
     .await;
-    assert_eq!(s, StatusCode::BAD_REQUEST, "无 cookie 上传 400: {b}");
+    assert_eq!(s, StatusCode::BAD_REQUEST, "upload without cookie 400: {b}");
     assert!(
         b.contains("multimodal_requires_web_cookie")
             || b.contains("web_cookie")
             || b.contains("pool_exhausted"),
-        "错误语义: {b}"
+        "error semantics: {b}"
     );
 }
 
@@ -946,7 +943,7 @@ async fn cross_site_write_blocked_for_config_save() {
     let base = start_mock(MockMode::JsonOk).await;
     let state = build_state(base).await;
     let mut app = build_router(Arc::unwrap_or_clone(state));
-    // 跨站 Origin 写请求 → 403（CSRF）
+    // cross-site Origin write request → 403 (CSRF)
     let (s, b) = send(
         &mut app,
         Method::POST,
@@ -957,6 +954,6 @@ async fn cross_site_write_blocked_for_config_save() {
     .await;
     assert!(
         s == StatusCode::FORBIDDEN || s == StatusCode::UNAUTHORIZED,
-        "跨站写应被拒(401/403): {s} {b}"
+        "cross-site write should be rejected (401/403): {s} {b}"
     );
 }

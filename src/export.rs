@@ -1,24 +1,24 @@
-//! 全配置导出/导入（v0.9 §2.3）：换机迁移，明文 JSON（v0.9 不加密，加密列 backlog）
+//! Full config export/import (v0.9 §2.3): migrating to a new machine, plaintext JSON (v0.9 doesn't encrypt; encryption is backlogged)
 //!
-//! 导出载荷（POST /api/export 的 `data`）：
-//! `{schema_version, exported_at, config(脱敏), tokens, skills:[{id,enabled}], memory_enabled, note}`
+//! Export payload (the `data` of POST /api/export):
+//! `{schema_version, exported_at, config(redacted), tokens, skills:[{id,enabled}], memory_enabled, note}`
 //!
-//! 导入（POST /api/import body `{data}`）：
-//! 1. 校验 schema_version / 字段类型 / 大小 ≤5MB
-//! 2. 写前自动备份到 `data/backup-<ts>/`（config.json / tokens.json / skills 目录）
-//! 3. 原子写回：tokens.json 整体替换、技能启用态、config 白名单字段
-//! 4. **安全最小集**：绝不覆盖 `api_keys` / `auth_tokens`（明文凭据只随用户显式迁移）
+//! Import (POST /api/import body `{data}`):
+//! 1. Validate schema_version / field types / size <=5MB
+//! 2. Auto-backup before writing to `data/backup-<ts>/` (config.json / tokens.json / skills directory)
+//! 3. Atomic write-back: tokens.json replaced wholesale, skill enabled states, config whitelisted fields
+//! 4. **Minimal security set**: never overwrite `api_keys` / `auth_tokens` (plaintext credentials only migrate via explicit user action)
 
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-/// 导出 schema 版本（导入校验用；升级格式时递增并做迁移）
+/// Export schema version (used for import validation; bump and migrate when the format is upgraded)
 pub const EXPORT_SCHEMA_VERSION: &str = "1";
-/// 导入 body 大小上限（5MB）
+/// Max size for the import body (5MB)
 pub const MAX_IMPORT_BYTES: usize = 5 * 1024 * 1024;
 
-/// 单条技能启用态（导出时从 SkillsManager.list() 采集）
+/// A single skill's enabled state (collected from SkillsManager.list() at export time)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillState {
     pub id: String,
@@ -30,12 +30,12 @@ fn default_true() -> bool {
     true
 }
 
-/// 导出载荷（序列化即 `data` 字段）
+/// Export payload (serializes directly as the `data` field)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExportPayload {
     pub schema_version: String,
     pub exported_at: String,
-    /// 脱敏后的配置（仅白名单字段；api_keys/auth_tokens 绝不写入）
+    /// Redacted config (whitelisted fields only; api_keys/auth_tokens are never written)
     pub config: serde_json::Value,
     #[serde(default)]
     pub tokens: Vec<crate::import::ExtractedAuth>,
@@ -46,26 +46,26 @@ pub struct ExportPayload {
     pub note: String,
 }
 
-/// 导入结果摘要（直接作为 handler 的 `imported` 返回）
+/// Import result summary (returned directly as the handler's `imported` field)
 #[derive(Debug, Clone, Serialize)]
 pub struct ImportSummary {
-    /// 恢复的条目（人类可读列表）
+    /// Restored entries (human-readable list)
     pub imported: Vec<String>,
-    /// 主动跳过的条目（未知技能/安全字段）
+    /// Entries intentionally skipped (unknown skill/security field)
     pub skipped: Vec<String>,
-    /// 备份目录（成功了才 Some）
+    /// Backup directory (Some only on success)
     pub backed_up_to: Option<String>,
-    /// 写回 tokens.json 的条数
+    /// Number of entries written back to tokens.json
     pub tokens: usize,
-    /// 应用启用态的技能数
+    /// Number of skills whose enabled state was applied
     pub skills_toggled: usize,
-    /// 是否写回 memory_enabled（None = 载荷未携带）
+    /// Whether memory_enabled was written back (None = payload didn't carry it)
     pub memory_enabled: Option<bool>,
-    /// 合并进 config.json 的白名单字段
+    /// Whitelisted fields merged into config.json
     pub config_fields: Vec<String>,
 }
 
-/// 导入上下文：apply_import 需要的全部宿主依赖（api.rs 组装）
+/// Import context: all host dependencies apply_import needs (assembled by api.rs)
 pub struct ImportContext<'a> {
     pub config_path: Option<String>,
     pub tokens_path: &'a str,
@@ -75,24 +75,24 @@ pub struct ImportContext<'a> {
     pub memory_runtime_enabled: &'a std::sync::atomic::AtomicBool,
 }
 
-/// 校验导入 body（`{data: ...}` 或直接载荷），返回规范化的 ExportPayload。
-/// 只做 schema/类型/必填校验，不做任何写操作。
+/// Validate the import body (`{data: ...}` or the payload directly), returns a normalized ExportPayload.
+/// Only does schema/type/required-field validation, no writes.
 pub fn validate_import_body(body: &serde_json::Value) -> Result<ExportPayload> {
     let raw = body.get("data").unwrap_or(body);
     if !raw.is_object() {
-        return Err(anyhow!("data 必须是 JSON 对象"));
+        return Err(anyhow!("data must be a JSON object"));
     }
     let payload: ExportPayload =
-        serde_json::from_value(raw.clone()).map_err(|e| anyhow!("data 字段类型不合法: {e}"))?;
+        serde_json::from_value(raw.clone()).map_err(|e| anyhow!("data field has an invalid type: {e}"))?;
     if payload.schema_version.is_empty() {
-        return Err(anyhow!("schema_version 缺失或不合法"));
+        return Err(anyhow!("schema_version is missing or invalid"));
     }
-    // 版本校验：当前只接受主版本一致的导出（未来格式升级时在这里迁移/拒绝）
+    // Version check: only accepts exports with a matching major version for now (future format upgrades migrate/reject here)
     if payload.schema_version.split('.').next().unwrap_or("")
         != EXPORT_SCHEMA_VERSION.split('.').next().unwrap_or("")
     {
         return Err(anyhow!(
-            "不支持导出 schema_version={}（当前支持主版本 {}）",
+            "unsupported export schema_version={} (currently supports major version {})",
             payload.schema_version,
             EXPORT_SCHEMA_VERSION
                 .split('.')
@@ -101,18 +101,18 @@ pub fn validate_import_body(body: &serde_json::Value) -> Result<ExportPayload> {
         ));
     }
     if payload.exported_at.is_empty() {
-        return Err(anyhow!("exported_at 缺失"));
+        return Err(anyhow!("exported_at is missing"));
     }
     for t in &payload.tokens {
         if t.token.trim().is_empty() {
-            return Err(anyhow!("tokens 中含空 token"));
+            return Err(anyhow!("tokens contains an empty token"));
         }
     }
     Ok(payload)
 }
 
-/// 导入前备份：复制 config.json / tokens.json / skills 目录到 `data_dir/backup-<ts>/`。
-/// 目标文件/目录不存在则跳过；全部复制失败才算 Err（部分成功可接受，返回实际复制项）。
+/// Backup before import: copy config.json / tokens.json / skills directory to `data_dir/backup-<ts>/`.
+/// Skipped if the target file/directory doesn't exist; only an Err if everything fails to copy (partial success is acceptable, returns actual copied items).
 pub fn backup_data(
     data_dir: &str,
     config_path: Option<&str>,
@@ -157,7 +157,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
-/// 原子写（临时文件 + rename；Windows 先移除目标再 rename，防截断）
+/// Atomic write (temp file + rename; on Windows, remove the target first before renaming to prevent truncation)
 fn atomic_write(path: &Path, data: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -174,14 +174,14 @@ fn atomic_write(path: &Path, data: &str) -> Result<()> {
     Ok(())
 }
 
-/// 写回 tokens.json（整体替换为导入清单；失败不中断后续项）
+/// Write back tokens.json (wholesale replace with the imported list; failure doesn't block subsequent steps)
 fn write_tokens(path: &str, tokens: &[crate::import::ExtractedAuth]) -> Result<()> {
     let json = serde_json::to_string_pretty(tokens)?;
     atomic_write(Path::new(path), &json)
 }
 
-/// 把 config.json 的非敏感字段合并（memory_enabled 由调用方决定；api_keys/auth_tokens 绝不写）。
-/// 返回实际合并的字段名。文件不存在则跳过（内存态已由 handler 处理）。
+/// Merge config.json's non-sensitive fields (memory_enabled is decided by the caller; api_keys/auth_tokens are never written).
+/// Returns the names of fields actually merged. Skipped if the file doesn't exist (in-memory state is already handled by the handler).
 fn merge_config_fields(
     config_path: Option<&str>,
     imported: &serde_json::Value,
@@ -199,7 +199,7 @@ fn merge_config_fields(
     if !root.is_object() {
         root = serde_json::json!({});
     }
-    // 白名单：与 api.rs CONFIG_EDITABLE 同步，绝不覆盖 api_keys/auth_tokens
+    // Whitelist: kept in sync with api.rs CONFIG_EDITABLE, never overwrites api_keys/auth_tokens
     const SAFE_FIELDS: &[&str] = &[
         "listen_addr",
         "memory_enabled",
@@ -235,8 +235,8 @@ fn merge_config_fields(
     Ok(applied)
 }
 
-/// 应用导入：备份 → 写 tokens → 技能启用态 → config 白名单字段 + memory_enabled。
-/// 全部写操作失败不中断后续（尽力恢复），最终报错由调用方决定是否整体失败。
+/// Apply an import: backup -> write tokens -> skill enabled states -> config whitelisted fields + memory_enabled.
+/// A failure in any write step doesn't block the rest (best-effort recovery); the caller decides whether the overall result is a failure.
 pub fn apply_import(payload: &ExportPayload, ctx: &ImportContext<'_>) -> Result<ImportSummary> {
     let mut summary = ImportSummary {
         imported: Vec::new(),
@@ -248,7 +248,7 @@ pub fn apply_import(payload: &ExportPayload, ctx: &ImportContext<'_>) -> Result<
         config_fields: Vec::new(),
     };
 
-    // 1) 备份（失败则不进入写回——先保障可回滚）
+    // 1) Backup (skip the write-back if this fails -- ensure rollback is possible first)
     let (backup_dir, copied) = backup_data(
         ctx.data_dir,
         ctx.config_path.as_deref(),
@@ -257,60 +257,60 @@ pub fn apply_import(payload: &ExportPayload, ctx: &ImportContext<'_>) -> Result<
     )?;
     summary.backed_up_to = Some(backup_dir.clone());
     summary.imported.push(format!(
-        "备份到 {}（{}）",
+        "Backed up to {} ({})",
         backup_dir,
         if copied.is_empty() {
-            "无文件需要备份".into()
+            "no files needed backup".into()
         } else {
             copied.join(", ")
         }
     ));
 
-    // 2) tokens.json 整体替换
+    // 2) Wholesale replace tokens.json
     if !payload.tokens.is_empty() {
         write_tokens(ctx.tokens_path, &payload.tokens)?;
         summary.tokens = payload.tokens.len();
         summary.imported.push(format!(
-            "tokens.json 已写入 {} 条凭证",
+            "tokens.json written with {} credentials",
             payload.tokens.len()
         ));
     } else {
         summary
             .skipped
-            .push("tokens（载荷为空，不覆盖现有凭证）".into());
+            .push("tokens (payload empty, existing credentials not overwritten)".into());
     }
 
-    // 3) 技能启用态（只对目标端已存在的技能生效，不新建/删除技能文件）
+    // 3) Skill enabled states (only applies to skills that already exist on the target; never creates/deletes skill files)
     for s in &payload.skills {
-        // toggle 对未知 id 返回 Ok(false)（非 Err），必须先判存在性
+        // toggle returns Ok(false) for an unknown id (not Err), so existence must be checked first
         if ctx.skills.get(&s.id).is_none() {
             summary
                 .skipped
-                .push(format!("技能 {}（目标端不存在）", s.id));
+                .push(format!("skill {} (does not exist on target)", s.id));
             continue;
         }
         match ctx.skills.toggle(&s.id, s.enabled) {
             Ok(_) => {
                 summary.skills_toggled += 1;
                 summary.imported.push(format!(
-                    "技能 {} -> {}",
+                    "skill {} -> {}",
                     s.id,
-                    if s.enabled { "启用" } else { "停用" }
+                    if s.enabled { "enabled" } else { "disabled" }
                 ));
             }
             Err(e) => {
                 summary
                     .imported
-                    .push(format!("技能 {} 保持原状（toggle 失败: {e}）", s.id));
+                    .push(format!("skill {} left unchanged (toggle failed: {e})", s.id));
             }
         }
     }
 
-    // 4) config 白名单字段 + memory_enabled
+    // 4) Config whitelisted fields + memory_enabled
     summary.config_fields = merge_config_fields(ctx.config_path.as_deref(), &payload.config)?;
     if !summary.config_fields.is_empty() {
         summary.imported.push(format!(
-            "config.json 已合并字段：{}",
+            "config.json merged fields: {}",
             summary.config_fields.join(", ")
         ));
     }
@@ -328,11 +328,11 @@ pub fn apply_import(payload: &ExportPayload, ctx: &ImportContext<'_>) -> Result<
             summary.config_fields.push("memory_enabled".into());
         }
         summary.imported.push(format!(
-            "记忆层已设为 {}",
+            "memory layer set to {}",
             if payload.memory_enabled {
-                "开启"
+                "on"
             } else {
-                "关闭"
+                "off"
             }
         ));
     }
@@ -340,7 +340,7 @@ pub fn apply_import(payload: &ExportPayload, ctx: &ImportContext<'_>) -> Result<
     Ok(summary)
 }
 
-/// 把单个 bool 配置项写回 config.json（memory_enabled 专用，幂等）
+/// Write a single bool config field back to config.json (dedicated to memory_enabled, idempotent)
 fn merge_config_field_bool(config_path: Option<&str>, key: &str, value: bool) -> Result<bool> {
     let Some(p) = config_path else {
         return Ok(true);
@@ -356,7 +356,7 @@ fn merge_config_field_bool(config_path: Option<&str>, key: &str, value: bool) ->
         root = serde_json::json!({});
     }
     if root.get(key).and_then(|v| v.as_bool()) == Some(value) {
-        return Ok(false); // 已一致，无需改写
+        return Ok(false); // already consistent, no rewrite needed
     }
     root[key] = serde_json::json!(value);
     let json = serde_json::to_string_pretty(&root)?;
@@ -425,10 +425,10 @@ mod tests {
         assert!(validate_import_body(&serde_json::json!({ "data": "x" })).is_err());
         assert!(validate_import_body(&serde_json::json!({
             "data": { "schema_version": "9", "exported_at": "t", "config": {}, "tokens": [], "skills": [], "memory_enabled": false }
-        })).is_err(), "主版本不一致应拒绝");
+        })).is_err(), "mismatched major version should be rejected");
         assert!(validate_import_body(&serde_json::json!({
             "data": { "schema_version": EXPORT_SCHEMA_VERSION, "exported_at": "", "config": {}, "tokens": [], "skills": [], "memory_enabled": false }
-        })).is_err(), "exported_at 缺失应拒绝");
+        })).is_err(), "missing exported_at should be rejected");
     }
 
     #[test]
@@ -440,7 +440,7 @@ mod tests {
         let skills_dir = p("skills");
         let skills_db = p("skills.sqlite");
 
-        // 目标端：技能库已 seed（git-guru 默认启用），config.json 带 api_keys
+        // Target: skills library already seeded (git-guru enabled by default), config.json carries api_keys
         let manager = crate::skills::SkillsManager::open(
             std::path::PathBuf::from(&skills_dir),
             std::path::PathBuf::from(&skills_db),
@@ -465,27 +465,27 @@ mod tests {
         };
         let summary = apply_import(&payload, &ctx).unwrap();
 
-        // tokens 恢复
+        // tokens restored
         let written: Vec<crate::import::ExtractedAuth> =
             serde_json::from_str(&std::fs::read_to_string(&tokens_path).unwrap()).unwrap();
         assert_eq!(written.len(), 2);
         assert!(written[0].token.contains("session-token"));
-        // 技能启用态：git-guru 被停用
+        // skill enabled state: git-guru disabled
         let git = manager.get("git-guru").unwrap();
-        assert!(!git.enabled, "导入后 git-guru 应停用");
-        // 未知技能跳过
+        assert!(!git.enabled, "git-guru should be disabled after import");
+        // unknown skill skipped
         assert!(summary.skipped.iter().any(|s| s.contains("no-such-skill")));
-        // memory_enabled：config.json + 运行时
+        // memory_enabled: config.json + runtime
         assert!(runtime.load(std::sync::atomic::Ordering::Relaxed));
         let cfg_text = std::fs::read_to_string(&config_path).unwrap();
         let cfg: serde_json::Value = serde_json::from_str(&cfg_text).unwrap();
         assert_eq!(cfg["memory_enabled"], true);
-        assert_eq!(cfg["api_keys"][0], "sk-original", "api_keys 严禁被覆盖");
+        assert_eq!(cfg["api_keys"][0], "sk-original", "api_keys must never be overwritten");
         assert_eq!(
             cfg["auth_tokens"][0], "tok-original",
-            "auth_tokens 严禁被覆盖"
+            "auth_tokens must never be overwritten"
         );
-        // 备份存在
+        // backup exists
         let backup_dir = summary.backed_up_to.as_ref().unwrap();
         assert!(Path::new(backup_dir).join("config.json").exists());
         assert!(summary.imported.iter().any(|i| i.contains("tokens.json")));

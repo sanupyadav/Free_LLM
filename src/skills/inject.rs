@@ -1,6 +1,6 @@
-//! roster 注入：把技能目录（名称 + 描述）包装成 system 前缀片段。
+//! Roster injection: wraps the skill catalog (name + description) into a system prefix snippet.
 
-/// 用 `[freebuff-skills]` 标签包裹 roster；prefix 为空时返回空串（调用方可直接拼接）。
+/// Wraps the roster in `[freebuff-skills]` tags; returns an empty string when prefix is empty (caller can concatenate directly).
 pub fn roster_block(prefix: &str) -> String {
     if prefix.trim().is_empty() {
         return String::new();

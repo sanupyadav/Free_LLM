@@ -1,14 +1,16 @@
-//! [`CanonicalEvent`] → Anthropic Messages 流式 SSE 事件行渲染。
+//! Renders [`CanonicalEvent`] into Anthropic Messages streaming SSE event lines.
 //!
-//! 输出帧形如 `event: <name>\ndata: <json>\n\n`，调用方 `join("")` 后直接写入响应体。
-//! 关键约束：
-//! - `message_start` 必须先于任何 `content_block_*`（可延迟到首个 delta）
-//! - 文本块实时输出；流结束时先 `content_block_stop` 再输出工具块
-//! - 工具块**缓冲渲染**：上游并行工具调用的 start 与 arguments 分片可能任意交错，
-//!   立即输出会产生指向已关闭块的非法序列；因此按上游 index 缓冲，
-//!   收尾时按 index 升序依次输出
-//!   `content_block_start → content_block_delta(完整参数) → content_block_stop`
-//! - content block 下标由本渲染器按 Anthropic 规范从 0 连续分配
+//! Output frames look like `event: <name>\ndata: <json>\n\n`; the caller `join("")`s them
+//! and writes the result straight to the response body.
+//! Key constraints:
+//! - `message_start` must precede any `content_block_*` (may be deferred until the first delta)
+//! - Text blocks are streamed out in real time; at stream end, `content_block_stop` is emitted before tool blocks
+//! - Tool blocks are **rendered from a buffer**: the start and arguments chunks of parallel upstream
+//!   tool calls can interleave in any order, and emitting them immediately could produce an
+//!   invalid sequence pointing at an already-closed block. So they're buffered by upstream index
+//!   and, at finalization, emitted in ascending index order as
+//!   `content_block_start -> content_block_delta(full arguments) -> content_block_stop`
+//! - Content block indices are assigned by this renderer, starting from 0 and increasing, per the Anthropic spec
 
 use std::collections::BTreeMap;
 
@@ -16,41 +18,41 @@ use serde_json::json;
 
 use super::stream::CanonicalEvent;
 
-/// 单条完整 SSE 帧（含结尾空行）。
+/// A single complete SSE frame (including the trailing blank line).
 type SseFrame = String;
 
-/// 缓冲中的工具调用：`ToolUseStart` 与参数分片可能任意交错到达，
-/// 收尾时整块输出以保证块嵌套合法。
+/// A buffered tool call: `ToolUseStart` and argument chunks can arrive interleaved in any order,
+/// so the whole block is emitted at finalization to keep block nesting valid.
 #[derive(Debug, Default, Clone)]
 struct BufferedTool {
     id: String,
     name: String,
-    /// 累积的上游 arguments JSON 分片
+    /// Accumulated upstream arguments JSON chunks
     arguments: String,
-    /// 是否收到过 ToolUseStart（未 start 过的增量忽略）
+    /// Whether a ToolUseStart has been received (deltas without a start are ignored)
     started: bool,
 }
 
-/// Anthropic SSE 渲染器。
+/// Anthropic SSE renderer.
 #[derive(Debug, Default)]
 pub struct AnthropicSseRenderer {
-    /// 消息 model（`MessageStart` 事件可覆盖）
+    /// Message model (can be overridden by a `MessageStart` event)
     model: String,
-    /// 消息 id（`MessageStart` 事件提供；缺失时生成回退 id）
+    /// Message id (provided by a `MessageStart` event; a fallback id is generated if missing)
     message_id: Option<String>,
-    /// 是否已发出 `message_start`
+    /// Whether `message_start` has been emitted
     started: bool,
-    /// 当前打开的 content block 下标（只可能是文本块；工具块收尾时整块输出）
+    /// Index of the currently open content block (can only be a text block; tool blocks are emitted whole at finalization)
     open_index: Option<u64>,
-    /// 下一个可分配的 content block 下标
+    /// Next content block index available for allocation
     next_index: u64,
-    /// 按上游 index 缓冲的工具调用（BTreeMap 保证收尾时按 index 升序输出）
+    /// Tool calls buffered by upstream index (BTreeMap guarantees ascending-index output at finalization)
     tools: BTreeMap<u64, BufferedTool>,
-    /// 输入 token 数（用于 message_start 与 message_delta 回填）
+    /// Input token count (used to backfill message_start and message_delta)
     input_tokens: u64,
-    /// 输出 token 数（用于 message_delta）
+    /// Output token count (used for message_delta)
     output_tokens: u64,
-    /// 是否已发出 message_stop（或终止性 error）
+    /// Whether message_stop (or a terminal error) has been emitted
     stop_sent: bool,
 }
 
@@ -62,7 +64,7 @@ impl AnthropicSseRenderer {
         }
     }
 
-    /// 渲染一个 canonical 事件为 0..n 条完整 SSE 帧。
+    /// Renders one canonical event into 0..n complete SSE frames.
     pub fn render(&mut self, ev: &CanonicalEvent) -> Vec<SseFrame> {
         match ev {
             CanonicalEvent::MessageStart {
@@ -87,8 +89,9 @@ impl AnthropicSseRenderer {
         }
     }
 
-    /// 流结束时兜底：确保 `content_block_stop`（如有打开块）、缓冲工具块、
-    /// `message_delta` 与 `message_stop` 已发出；已收尾则返回空。
+    /// Fallback at stream end: ensures `content_block_stop` (if a block is open), buffered
+    /// tool blocks, `message_delta`, and `message_stop` have all been emitted; returns
+    /// empty if already finalized.
     pub fn finish(&mut self) -> Vec<SseFrame> {
         if self.stop_sent {
             return Vec::new();
@@ -96,7 +99,7 @@ impl AnthropicSseRenderer {
         self.finalize("end_turn")
     }
 
-    /// 处理 MessageStart：记录 id/model/input_tokens（首个生效），已开始则忽略。
+    /// Handles MessageStart: records id/model/input_tokens (first one wins); ignored once already started.
     fn apply_message_start(&mut self, id: &str, model: &str, input_tokens: u64) -> Vec<SseFrame> {
         if !id.is_empty() {
             self.message_id = Some(id.to_string());
@@ -108,13 +111,13 @@ impl AnthropicSseRenderer {
         self.ensure_started()
     }
 
-    /// 文本增量：确保已开始并在文本块内，输出 text_delta。
+    /// Text delta: ensures started and inside a text block, then emits text_delta.
     fn render_text_delta(&mut self, text: &str) -> Vec<SseFrame> {
         let mut out = self.ensure_started();
         if text.is_empty() {
             return out;
         }
-        // 打开的块只可能是文本块（工具块收尾时整块输出）
+        // The open block can only be a text block (tool blocks are emitted whole at finalization)
         let index = match self.open_index {
             Some(index) => index,
             None => self.open_text_block(&mut out),
@@ -130,7 +133,7 @@ impl AnthropicSseRenderer {
         out
     }
 
-    /// 工具块开始：仅缓冲（不立即输出），保证并行工具调用的块嵌套合法。
+    /// Tool block start: only buffered (not emitted immediately), to keep parallel tool call block nesting valid.
     fn render_tool_start(&mut self, upstream_index: u64, id: &str, name: &str) -> Vec<SseFrame> {
         let out = self.ensure_started();
         let state = self.tools.entry(upstream_index).or_default();
@@ -146,7 +149,7 @@ impl AnthropicSseRenderer {
         out
     }
 
-    /// 工具参数增量：追加到对应缓冲（未 start 过的上游 index 忽略）。
+    /// Tool argument delta: appends to the matching buffer (ignored for an upstream index that never started).
     fn render_tool_input_delta(
         &mut self,
         upstream_index: u64,
@@ -162,14 +165,14 @@ impl AnthropicSseRenderer {
         out
     }
 
-    /// 用量：记录 token 数；若消息尚未开始则借此机会先发 message_start。
+    /// Usage: records the token counts; also takes the chance to emit message_start first if not yet started.
     fn render_usage(&mut self, input_tokens: u64, output_tokens: u64) -> Vec<SseFrame> {
         self.input_tokens = input_tokens;
         self.output_tokens = output_tokens;
         self.ensure_started()
     }
 
-    /// 消息结束：关文本块 + 输出缓冲工具块 + message_delta + message_stop（幂等）。
+    /// Message end: closes the text block + emits buffered tool blocks + message_delta + message_stop (idempotent).
     fn render_stop(&mut self, stop_reason: &str) -> Vec<SseFrame> {
         if self.stop_sent {
             return Vec::new();
@@ -177,7 +180,7 @@ impl AnthropicSseRenderer {
         self.finalize(stop_reason)
     }
 
-    /// 统一收尾：关文本块 → 按上游 index 升序输出缓冲工具块 → message_delta + message_stop。
+    /// Unified finalization: close the text block -> emit buffered tool blocks in ascending index order -> message_delta + message_stop.
     fn finalize(&mut self, stop_reason: &str) -> Vec<SseFrame> {
         let mut out = self.ensure_started();
         out.extend(self.close_block());
@@ -186,7 +189,7 @@ impl AnthropicSseRenderer {
         out
     }
 
-    /// 输出全部缓冲工具块：每块 start → delta（完整参数）→ stop。
+    /// Emits all buffered tool blocks: each block as start -> delta (full arguments) -> stop.
     fn flush_tools(&mut self) -> Vec<SseFrame> {
         let tools = std::mem::take(&mut self.tools);
         let mut out = Vec::new();
@@ -205,7 +208,7 @@ impl AnthropicSseRenderer {
                     },
                 }),
             ));
-            // 空参数按空 JSON 对象输出，保证客户端可解析
+            // Empty arguments are emitted as an empty JSON object, so the client can always parse it
             let partial = if tool.arguments.is_empty() {
                 "{}"
             } else {
@@ -227,8 +230,8 @@ impl AnthropicSseRenderer {
         out
     }
 
-    /// 错误事件：关闭打开的文本块、丢弃工具缓冲并输出 Anthropic error 帧，
-    /// 随后不再补正常收尾。
+    /// Error event: closes any open text block, discards the tool buffer, and emits an
+    /// Anthropic error frame; no normal finalization follows after this.
     fn render_error(&mut self, message: &str) -> Vec<SseFrame> {
         let mut out = self.ensure_started();
         out.extend(self.close_block());
@@ -244,7 +247,7 @@ impl AnthropicSseRenderer {
         out
     }
 
-    /// 确保 message_start 已发出（仅一次）。
+    /// Ensures message_start has been emitted (only once).
     fn ensure_started(&mut self) -> Vec<SseFrame> {
         if self.started {
             return Vec::new();
@@ -253,7 +256,7 @@ impl AnthropicSseRenderer {
         vec![self.message_start_frame()]
     }
 
-    /// 关闭当前打开的 content block（无打开块时为空）。
+    /// Closes the currently open content block (empty if none is open).
     fn close_block(&mut self) -> Vec<SseFrame> {
         match self.open_index.take() {
             Some(index) => vec![frame(
@@ -264,7 +267,7 @@ impl AnthropicSseRenderer {
         }
     }
 
-    /// 在文本块内打开新块（调用方保证当前块已关闭）。
+    /// Opens a new text block (caller guarantees the current block is already closed).
     fn open_text_block(&mut self, out: &mut Vec<SseFrame>) -> u64 {
         let index = self.alloc_index();
         self.open_index = Some(index);
@@ -279,7 +282,7 @@ impl AnthropicSseRenderer {
         index
     }
 
-    /// message_delta + message_stop 两帧，并置停止标记。
+    /// The message_delta + message_stop frame pair; also sets the stop flag.
     fn stop_frames(&mut self, stop_reason: &str) -> Vec<SseFrame> {
         self.stop_sent = true;
         vec![
@@ -301,7 +304,7 @@ impl AnthropicSseRenderer {
         ]
     }
 
-    /// 构造 message_start 帧。
+    /// Builds the message_start frame.
     fn message_start_frame(&self) -> SseFrame {
         let id = self.message_id.clone().unwrap_or_else(fallback_message_id);
         frame(
@@ -322,7 +325,7 @@ impl AnthropicSseRenderer {
         )
     }
 
-    /// 分配下一个 content block 下标。
+    /// Allocates the next content block index.
     fn alloc_index(&mut self) -> u64 {
         let index = self.next_index;
         self.next_index += 1;
@@ -330,12 +333,12 @@ impl AnthropicSseRenderer {
     }
 }
 
-/// 组装一条 SSE 帧。
+/// Assembles a single SSE frame.
 fn frame(event: &str, data: serde_json::Value) -> SseFrame {
     format!("event: {event}\ndata: {data}\n\n")
 }
 
-/// 上游 stop_reason 规范化：非 Anthropic 合法取值统一回落 end_turn。
+/// Normalizes the upstream stop_reason: any value not valid for Anthropic falls back to end_turn.
 fn normalize_stop_reason(reason: &str) -> &str {
     match reason {
         "end_turn" | "max_tokens" | "tool_use" | "stop_sequence" => reason,
@@ -343,7 +346,7 @@ fn normalize_stop_reason(reason: &str) -> &str {
     }
 }
 
-/// 缺少上游 message id 时的回退 id（时间戳保证进程内唯一）。
+/// Fallback id used when the upstream message id is missing (a timestamp guarantees uniqueness within the process).
 fn fallback_message_id() -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -432,7 +435,7 @@ mod tests {
         assert_eq!(out, expected);
     }
 
-    /// 工具块完整帧序列：start → delta(完整参数) → stop
+    /// Full tool block frame sequence: start -> delta(full arguments) -> stop
     fn tool_frames(index: u64, id: &str, name: &str, partial_json: &str) -> String {
         [
             frame(
@@ -484,7 +487,7 @@ mod tests {
             input_tokens: 1,
         });
         renderer.render(&CanonicalEvent::TextDelta("hi".to_string()));
-        // ToolUseStart 与参数分片只入缓冲，不立即输出
+        // ToolUseStart and argument chunks only go into the buffer, not emitted immediately
         assert!(renderer
             .render(&CanonicalEvent::ToolUseStart {
                 index: 0,
@@ -525,7 +528,7 @@ mod tests {
             input_tokens: 3,
         });
         renderer.render(&CanonicalEvent::TextDelta("hi".to_string()));
-        // 并行工具：首个 chunk 同时 start index 0/1，参数随后交错回填
+        // Parallel tools: the first chunk starts index 0/1 simultaneously; arguments backfill interleaved afterward
         renderer.render(&CanonicalEvent::ToolUseStart {
             index: 0,
             id: "toolu_a".to_string(),
@@ -579,7 +582,7 @@ mod tests {
             id: "toolu_0".to_string(),
             name: "f0".to_string(),
         });
-        assert_eq!(started.len(), 1); // 仅补发 message_start
+        assert_eq!(started.len(), 1); // only backfills message_start
         assert!(started[0].starts_with("event: message_start\n"));
         assert!(renderer
             .render(&CanonicalEvent::ToolUseInputDelta {
@@ -703,8 +706,8 @@ mod tests {
                 stop_reason: "end_turn".to_string(),
             })
             .concat();
-        // 仅断言结构：message_start 先于 message_delta 先于 message_stop，且无 content block
-        // （id 为时间戳回退值，不做字节级比较）
+        // Only asserts structure: message_start before message_delta before message_stop, and no content block
+        // (id is a timestamp fallback value, no byte-level comparison)
         let start_pos = out.find("event: message_start").unwrap_or(usize::MAX);
         let delta_pos = out.find("event: message_delta").unwrap_or(usize::MAX);
         let stop_pos = out.find("event: message_stop").unwrap_or(usize::MAX);

@@ -1,26 +1,26 @@
-//! 内嵌登录窗口的非 Windows stub（WebView2 仅 Windows 可用）
+//! Non-Windows stub for the embedded login window (WebView2 is Windows-only).
 //!
-//! 面板 `/api/login/embed` 在非 Windows 平台返回明确失败，
-//! 前端降级到 扩展 / 剪贴板 / 手动向导（登录向导文案已含平台说明）。
+//! The panel's `/api/login/embed` returns an explicit failure on non-Windows platforms,
+//! and the frontend falls back to the extension / clipboard / manual wizard (the login wizard copy already covers this platform note).
 //!
-//! 本 stub 与 `login_window_windows` 保持**签名一致**（经 `login_window` facade 再导出，
-//! 调用方无需感知平台差异）；Windows 上这些函数经 facade 有真实调用方，故 stub 侧
-//! 允许 dead_code 而不触发警告。
+//! This stub keeps a **matching signature** with `login_window_windows` (re-exported via the `login_window`
+//! facade, so callers don't need to be aware of platform differences); on Windows these functions have real
+//! callers through the facade, so the stub side allows dead_code without triggering a warning.
 
-/// 非 Windows 上永不处于登录模式（--login-window 参数在 main 分派时也走 stub 提示）
+/// Never in login mode on non-Windows (the --login-window flag also routes to this stub hint in main's dispatch)
 #[allow(dead_code)]
 pub fn is_login_mode() -> bool {
     false
 }
 
-/// 非 Windows stub：报告不支持（不会真正被调用——main 分派先检查平台）
+/// Non-Windows stub: reports unsupported (never actually called -- main's dispatch checks the platform first)
 #[allow(dead_code)]
 pub fn run_login_window(_gateway_port: Option<u16>) -> i32 {
-    eprintln!("内嵌登录窗口仅支持 Windows（需要 Microsoft Edge WebView2 Runtime）——请改用浏览器扩展或手动导入");
+    eprintln!("The embedded login window only supports Windows (requires the Microsoft Edge WebView2 Runtime) -- please use the browser extension or manual import instead");
     1
 }
 
-/// 非 Windows stub：返回 false → /api/login/embed 返回 ok:false 引导降级
+/// Non-Windows stub: returns false -> /api/login/embed returns ok:false to prompt a fallback
 #[allow(dead_code)]
 pub fn spawn_login_window(_gateway_port: u16) -> bool {
     false

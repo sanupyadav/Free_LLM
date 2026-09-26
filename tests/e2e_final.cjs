@@ -1,4 +1,4 @@
-// 最终 E2E 验收脚本：覆盖全部端点
+// Final E2E acceptance script: covers every endpoint
 const http = require("node:http");
 
 const BASE = { host: "127.0.0.1", port: 47821 };
@@ -33,93 +33,94 @@ async function check(name, fn) {
 }
 
 (async () => {
-  // 1. 健康检查
-  await check("GET /healthz 返回 ok + accounts", async () => {
+  // 1. Health check
+  await check("GET /healthz returns ok + accounts", async () => {
     const r = await req("GET", "/healthz");
     const j = JSON.parse(r.body);
     return r.status === 200 && j.ok === true && Array.isArray(j.accounts);
   });
 
-  // 2. 模型列表
-  await check("GET /v1/models ≥20 个模型", async () => {
+  // 2. Model list
+  await check("GET /v1/models has >=20 models", async () => {
     const r = await req("GET", "/v1/models");
     const j = JSON.parse(r.body);
     return r.status === 200 && j.data.length >= 20;
   });
 
-  // 3. 面板（注意：HTML 是浏览器端 JS 动态渲染按钮，服务端只返回脚本源码；
-//    这里校验「渲染 6 prompt + 5 skill 按钮」所需的源码锚点都齐全）
-  await check("GET /ui 面板 200 + 含提示词管理", async () => {
+  // 3. Panel (note: the HTML has the browser-side JS rendering buttons dynamically; the server
+  //    only returns the script source, so this just checks the source anchors needed to render
+  //    "6 prompt + 5 skill buttons" are all present)
+  await check("GET /ui panel 200 + has prompt management", async () => {
     const r = await req("GET", "/ui");
     const srcHasPromptsLoop = r.body.includes("pd.prompts") && r.body.includes("togglePrompt('prompt'");
     const srcHasSkillsLoop = r.body.includes("pd.skills") && r.body.includes("togglePrompt('skill'");
     const srcHasToggleFn = r.body.includes("async function togglePrompt");
-    return r.status === 200 && r.body.includes("内置提示词") && srcHasPromptsLoop && srcHasSkillsLoop && srcHasToggleFn;
+    return r.status === 200 && r.body.includes("Built-in prompts") && srcHasPromptsLoop && srcHasSkillsLoop && srcHasToggleFn;
   });
 
-  // 4. 用量统计
-  await check("GET /api/usage/totals 返回统计", async () => {
+  // 4. Usage totals
+  await check("GET /api/usage/totals returns stats", async () => {
     const r = await req("GET", "/api/usage/totals");
     const j = JSON.parse(r.body);
     return r.status === 200 && typeof j.total_requests === "number";
   });
 
-  // 5. 请求明细
-  await check("GET /api/usage/requests 返回数组", async () => {
+  // 5. Request detail
+  await check("GET /api/usage/requests returns an array", async () => {
     const r = await req("GET", "/api/usage/requests");
     return r.status === 200 && Array.isArray(JSON.parse(r.body));
   });
 
-  // 6. 账号列表
-  await check("GET /api/usage/accounts 返回账号", async () => {
+  // 6. Account list
+  await check("GET /api/usage/accounts returns accounts", async () => {
     const r = await req("GET", "/api/usage/accounts");
     const j = JSON.parse(r.body);
     return r.status === 200 && Array.isArray(j.accounts);
   });
 
-  // 7. 提示词列表
-  await check("GET /api/prompts 6 prompts + 5 skills", async () => {
+  // 7. Prompt list
+  await check("GET /api/prompts has 6 prompts + 5 skills", async () => {
     const r = await req("GET", "/api/prompts");
     const j = JSON.parse(r.body);
     return r.status === 200 && j.prompts.length === 6 && j.skills.length === 5;
   });
 
-  // 8. 提示词启用
-  await check("POST /api/prompts/toggle 启用 skill 并注入 prefix", async () => {
+  // 8. Enable a prompt
+  await check("POST /api/prompts/toggle enables a skill and injects the prefix", async () => {
     const r = await req("POST", "/api/prompts/toggle", { type: "skill", id: "git-guru", enabled: true });
     const j = JSON.parse(r.body);
-    return r.status === 200 && j.ok && j.system_prefix_preview.includes("Git 专家");
+    return r.status === 200 && j.ok && j.system_prefix_preview.includes("Git Expert");
   });
 
-  // 9. token 列表
-  await check("GET /api/tokens 返回已导入 token", async () => {
+  // 9. Token list
+  await check("GET /api/tokens returns the imported token", async () => {
     const r = await req("GET", "/api/tokens");
     const j = JSON.parse(r.body);
     return r.status === 200 && j.ok && Array.isArray(j.tokens);
   });
 
-  // 10. 余额查询（web Cookie）
-  await check("GET /api/account/balance 返回 freebucks", async () => {
+  // 10. Balance lookup (web Cookie)
+  await check("GET /api/account/balance returns freebucks", async () => {
     const r = await req("GET", "/api/account/balance");
     const j = JSON.parse(r.body);
     return r.status === 200 && j.freebucks && typeof j.freebucks.balance === "number";
   });
 
-  // 11. 账号详情卡片
-  await check("POST /api/account/detail 返回 user+usage", async () => {
+  // 11. Account detail card
+  await check("POST /api/account/detail returns user+usage", async () => {
     const r = await req("POST", "/api/account/detail", {});
     const j = JSON.parse(r.body);
     return r.status === 200 && j.user && j.usage_summary;
   });
 
-  // 12. 错误透传（假 token → 上游 401 透传）
-  await check("POST /v1/chat/completions 假token → 上游401透传", async () => {
+  // 12. Error passthrough (fake token -> upstream 401 passed through)
+  await check("POST /v1/chat/completions with a fake token -> upstream 401 passed through", async () => {
     const r = await req("POST", "/v1/chat/completions", { model: "z-ai/glm-5.3-flash", messages: [{ role: "user", content: "hi" }] });
     return r.status === 502 && r.body.includes("401") && r.body.includes("Invalid API key");
   });
 
-  // 13. web chat 真实增量流式（Cookie 版）
-  await check("POST /v1/web/chat 真实流式含 content+DONE", async () => {
+  // 13. Real incremental web chat streaming (Cookie variant)
+  await check("POST /v1/web/chat real streaming has content+DONE", async () => {
     return new Promise((resolve) => {
       const data = JSON.stringify({ model: "glm-5.3-flash", content: "reply literally: OK" });
       const r = http.request({ ...BASE, path: "/v1/web/chat", method: "POST", headers: { "content-type": "application/json", "content-length": Buffer.byteLength(data) } }, (res) => {
@@ -135,15 +136,15 @@ async function check(name, fn) {
     });
   });
 
-  // 14. 思考程度降级（solar-pro4 不支持 effort → 应剥离后仍请求；status 0=网络断需排除）
-  await check("POST /v1/chat/completions solar-pro4+max effort → 上游协议层处理", async () => {
+  // 14. Reasoning-effort downgrade (solar-pro4 doesn't support effort -> should be stripped and still requested; status 0=network unreachable is excluded)
+  await check("POST /v1/chat/completions solar-pro4+max effort -> handled at the upstream protocol layer", async () => {
     const r = await req("POST", "/v1/chat/completions", { model: "upstage/solar-pro4", messages: [{ role: "user", content: "hi" }], reasoning_effort: "max" });
-    // 剥离逻辑生效：不应 500；status=0 表示请求未发出（网络/服务不可达），不算通过
+    // Stripping logic works: should not be 500; status=0 means the request never went out (network/service unreachable), doesn't count as a pass
     return r.status !== 0 && r.status !== 500;
   });
 
-  console.log("========== E2E 验收结果 ==========");
+  console.log("========== E2E acceptance results ==========");
   results.forEach((r) => console.log(r));
-  console.log(`\n通过: ${pass}  失败: ${fail}`);
+  console.log(`\nPassed: ${pass}  Failed: ${fail}`);
   process.exit(fail > 0 ? 1 : 0);
 })();
