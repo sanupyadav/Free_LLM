@@ -7,12 +7,12 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  # GHCR package name rule: ${github.repository}/${name} -> ghcr.io/lza6/freebuff2api.
+  # GHCR package name rule: ${github.repository}/${name} -> ghcr.io/sanupyadav/free_llm.
   # A plain lowercased substring doesn't work (drops the owner), so it's composed here as
   # the full lowercase name instead.
-  # Note: github.repository is lza6/Freebuff-2API (contains uppercase) and can't be used
+  # Note: github.repository is sanupyadav/Free_LLM (contains uppercase) and can't be used
   # directly, hence the explicit owner below.
-  IMAGE_NAME: lza6/freebuff2api
+  IMAGE_NAME: sanupyadav/free_llm
 
 jobs:
   build:
