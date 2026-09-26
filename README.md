@@ -20,6 +20,8 @@ Freebuff2API reverse-engineers the [Freebuff](https://freebuff.com) free tier in
 
 ## Quick start
 
+> **New here?** Follow the step-by-step [Easy Setup Guide](docs/SETUP.md): get your cookie, run it locally or on Render, test it, and connect Claude Code or Cursor.
+
 ### Desktop (recommended)
 1. Download the latest `Freebuff2API Setup x64.exe` (Releases page, currently v0.8.x)
 2. Install and double-click → the gateway auto-starts and the console opens
