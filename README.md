@@ -81,6 +81,87 @@ The gateway ships a **zero-LLM, rule-based** local memory store (SQLite, `data/m
 | `/ui` | GET | Control panel |
 | `/healthz` | GET | Health check |
 
+### curl examples
+
+Set these once (use your deployed URL instead of localhost, e.g. `https://your-app.onrender.com`):
+
+```bash
+export BASE=http://127.0.0.1:47821
+export KEY=sk-local-xxxxxxxx   # a value from api_keys; any string works if api_keys is empty and you're on localhost
+```
+
+Every endpoint except `/ui` and `/healthz` needs the key, as `Authorization: Bearer $KEY` (Claude-style `x-api-key: $KEY` also works). Admin `POST`s must send `content-type: application/json` (CSRF protection).
+
+**`POST /v1/chat/completions`**: OpenAI chat. `model` and `messages` are required; `stream` and `reasoning_effort` are optional.
+
+```bash
+curl $BASE/v1/chat/completions \
+  -H "Authorization: Bearer $KEY" \
+  -H "content-type: application/json" \
+  -d '{"model":"z-ai/glm-5.3-flash","messages":[{"role":"user","content":"Say hi"}]}'
+
+# streaming (Server-Sent Events)
+curl -N $BASE/v1/chat/completions \
+  -H "Authorization: Bearer $KEY" \
+  -H "content-type: application/json" \
+  -d '{"model":"z-ai/glm-5.3-flash","stream":true,"messages":[{"role":"user","content":"Say hi"}]}'
+```
+
+**`POST /v1/messages`**: Claude (Anthropic) chat. `model`, `max_tokens` and `messages` are required.
+
+```bash
+curl $BASE/v1/messages \
+  -H "x-api-key: $KEY" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "content-type: application/json" \
+  -d '{"model":"z-ai/glm-5.3-flash","max_tokens":1024,"messages":[{"role":"user","content":"Say hi"}]}'
+```
+
+**`GET /v1/models`**: list the model ids you can pass as `model`.
+
+```bash
+curl $BASE/v1/models -H "Authorization: Bearer $KEY"
+```
+
+**`POST /api/tokens/import`**: add a Freebuff account. Send the full `Cookie` header copied from freebuff.com (it must contain `__Secure-next-auth.session-token=`); use `"text"` instead of `"cookie"` to paste a whole curl command or HAR.
+
+```bash
+curl $BASE/api/tokens/import \
+  -H "Authorization: Bearer $KEY" \
+  -H "content-type: application/json" \
+  -d '{"cookie":"__Secure-next-auth.session-token=PASTE_VALUE_HERE"}'
+```
+
+**`GET /api/account/balance`**: credits and remaining daily quota per model (uses the first imported cookie).
+
+```bash
+curl $BASE/api/account/balance -H "Authorization: Bearer $KEY"
+```
+
+**`POST /api/account/detail`**: account card (plan, limits, balance). The body may be `{}` (first imported account) or `{"cookie":"..."}` for a specific one.
+
+```bash
+curl $BASE/api/account/detail \
+  -H "Authorization: Bearer $KEY" \
+  -H "content-type: application/json" \
+  -d '{}'
+```
+
+**`GET /api/usage/*`**: usage stats. Available: `totals`, `daily` (last 7 days), `requests` (last 50), `requests/{id}`, `models`, `cost`, `insights`, `accounts`.
+
+```bash
+curl $BASE/api/usage/totals -H "Authorization: Bearer $KEY"
+curl $BASE/api/usage/requests -H "Authorization: Bearer $KEY"
+```
+
+**`GET /ui`**: control panel; open `$BASE/ui` in a browser.
+
+**`GET /healthz`**: health check, no key needed (with the key it also returns accounts and model count).
+
+```bash
+curl $BASE/healthz
+```
+
 Full guide: [docs/API_GUIDE.md](docs/API_GUIDE.md).
 
 ## Multi-account rotation and concurrency
