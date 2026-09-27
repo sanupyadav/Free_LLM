@@ -276,8 +276,12 @@ function importCookiesToGateway(cookieStr) {
 }
 
 // Capture the freebuff.com session cookie (including the next-auth triplet)
+// Each login window gets a fresh in-memory partition (no "persist:" prefix = incognito-like):
+// adding a 2nd account never reuses account 1's session, and closing the window never logs anyone out.
+let loginSession = null;
 async function captureCookies() {
-  const ses = session.fromPartition('persist:freebuff-login');
+  const ses = loginSession;
+  if (!ses) return { cookieStr: '', result: { ok: false, body: 'No login window open' } };
   const cookies = await ses.cookies.get({ url: 'https://freebuff.com' });
   const cookieStr = buildCookieHeader(cookies);
   if (cookieStr.includes('__Secure-next-auth.session-token')) {
@@ -289,11 +293,12 @@ async function captureCookies() {
 
 function openLoginWindow() {
   if (loginWindow) { loginWindow.show(); return; }
-  const ses = session.fromPartition('persist:freebuff-login');
+  const partition = `freebuff-login-${Date.now()}`;
+  loginSession = session.fromPartition(partition);
   loginWindow = new BrowserWindow({
     width: 1000, height: 720,
-    title: 'Freebuff Login',
-    webPreferences: { nodeIntegration: false, contextIsolation: true, session: ses, partition: 'persist:freebuff-login' },
+    title: 'Freebuff Login (private session)',
+    webPreferences: { nodeIntegration: false, contextIsolation: true, partition },
   });
   // Listen for navigation completion: capture the cookie on entering /chat, /account
   // or /web (the login-success signal)

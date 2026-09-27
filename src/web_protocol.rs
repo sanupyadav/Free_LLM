@@ -383,6 +383,7 @@ impl WebClient {
         attachments: Vec<WebAttachment>,
     ) -> Result<axum::body::Body> {
         use futures::StreamExt;
+        let content = fit_web_limit(content);
         let body = serde_json::json!({
             "threadId": thread_id,
             "content": content,
@@ -481,6 +482,7 @@ impl WebClient {
         images: Vec<WebImage>,
         attachments: Vec<WebAttachment>,
     ) -> Result<StreamResult> {
+        let content = fit_web_limit(content);
         let body = serde_json::json!({
             "threadId": thread_id,
             "content": content,
@@ -1533,5 +1535,38 @@ mod tests {
         let a2 = GravityContext::for_cookie("__Secure-next-auth.session-token=acc-a");
         assert_eq!(a.user_data.visitor_id, a2.user_data.visitor_id);
         assert_eq!(a.client_context, a2.client_context);
+    }
+}
+
+/// Upstream rejects `content` over 32,000 characters (`message_too_long`); counted in JS UTF-16 units,
+/// so budget below that in chars. Keeps the head (system instructions) and the tail (latest turns).
+const WEB_CONTENT_MAX_CHARS: usize = 30_000;
+const WEB_CONTENT_HEAD_CHARS: usize = 6_000;
+
+// ponytail: blind head+tail cut; drop whole old turns in flatten_messages if the middle loss hurts answers
+pub fn fit_web_limit(content: &str) -> std::borrow::Cow<'_, str> {
+    let total = content.chars().count();
+    if total <= WEB_CONTENT_MAX_CHARS {
+        return std::borrow::Cow::Borrowed(content);
+    }
+    let marker = format!("\n\n[... {} characters of earlier context omitted ...]\n\n", total - WEB_CONTENT_MAX_CHARS);
+    let tail_len = WEB_CONTENT_MAX_CHARS - WEB_CONTENT_HEAD_CHARS - marker.chars().count();
+    let head: String = content.chars().take(WEB_CONTENT_HEAD_CHARS).collect();
+    let tail: String = content.chars().skip(total - tail_len).collect();
+    std::borrow::Cow::Owned(format!("{head}{marker}{tail}"))
+}
+
+#[cfg(test)]
+mod fit_tests {
+    use super::*;
+
+    #[test]
+    fn fit_web_limit_caps_long_content() {
+        assert_eq!(fit_web_limit("short"), "short");
+        let long = format!("HEAD{}TAIL", "x".repeat(50_000));
+        let out = fit_web_limit(&long);
+        assert!(out.chars().count() <= WEB_CONTENT_MAX_CHARS);
+        assert!(out.starts_with("HEAD") && out.ends_with("TAIL"));
+        assert!(out.contains("omitted"));
     }
 }

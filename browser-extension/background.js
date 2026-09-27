@@ -86,10 +86,17 @@ async function storedApiKey() {
 
 // ---------- Cookie ----------
 
+/** Cookie API query for freebuff.com, optionally scoped to one cookie store (the incognito one) */
+function cookieQuery(extra, storeId) {
+  const q = Object.assign({ url: COOKIE_URL }, extra);
+  if (storeId) q.storeId = storeId;
+  return q;
+}
+
 /** Reads all freebuff.com cookies and joins them into a Cookie header (including HttpOnly) */
-async function readFreebuffCookie() {
+async function readFreebuffCookie(storeId) {
   const cookies = (await chromeCall(function (cb) {
-    chrome.cookies.getAll({ url: COOKIE_URL }, cb);
+    chrome.cookies.getAll(cookieQuery({}, storeId), cb);
   })) || [];
   if (cookies.length === 0) return { ok: false, reason: 'no_cookie' };
   const str = cookies
@@ -233,16 +240,56 @@ async function openOrFocusFreebuff() {
 }
 
 /** Polls the session-token every 2 seconds, up to timeoutMs; returns true as soon as detected */
-async function waitForSessionCookie(timeoutMs) {
+async function waitForSessionCookie(timeoutMs, storeId) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const c = await chromeCall(function (cb) {
-      chrome.cookies.get({ url: COOKIE_URL, name: SESSION_COOKIE }, cb);
+      chrome.cookies.get(cookieQuery({ name: SESSION_COOKIE }, storeId), cb);
     });
     if (c && c.value) return true;
     await sleep(POLL_INTERVAL_MS);
   }
   return false;
+}
+
+/**
+ * Add-account flow in a private window: its cookie store is separate from the normal profile, so a
+ * 2nd account can log in while account 1 stays logged in. The window is closed (never logged out)
+ * after import, which keeps the imported session valid upstream.
+ */
+async function incognitoFlow() {
+  notify(
+    'Private window opened, log in with the account to add',
+    'The credential is imported automatically and the window closes itself. Do NOT click "Log out".'
+  );
+  const win = await chromeCall(function (cb) {
+    chrome.windows.create({ url: FREEBUFF_URL, incognito: true }, cb);
+  });
+  const tabId = win && win.tabs && win.tabs[0] && win.tabs[0].id;
+  const stores = (await chromeCall(function (cb) { chrome.cookies.getAllCookieStores(cb); })) || [];
+  const store = stores.find(function (st) { return st.tabIds.indexOf(tabId) !== -1; });
+  if (!win) {
+    notify('Could not open a private window', 'Incognito may be disabled in this browser. Open one yourself (Ctrl+Shift+N), log in at freebuff.com, then paste the Cookie in the panel.');
+    return { ok: false, port: 0, error: 'incognito_window_failed' };
+  }
+  if (!store) {
+    await chromeCall(function (cb) { chrome.windows.remove(win.id, cb); });
+    return { ok: false, port: 0, error: 'incognito_window_failed' };
+  }
+  try {
+    const got = await waitForSessionCookie(LOGIN_TIMEOUT_MS, store.id);
+    if (!got) {
+      notify('⏱ Timed out waiting for login', 'No login detected in the private window within 3 minutes. Click "One-click login" to try again.');
+      return { ok: false, port: 0, error: 'login_timeout' };
+    }
+    const after = await readFreebuffCookie(store.id);
+    if (!after.ok) return { ok: false, port: 0, error: after.reason };
+    const res = await importCookieToGateway(after.cookie, flowPanelPort, flowApiKey);
+    notifyImportResult(res);
+    return res;
+  } finally {
+    await chromeCall(function (cb) { chrome.windows.remove(win.id, cb); });
+  }
 }
 
 // ---------- Main flow (only one runs at a time; repeat triggers reuse the in-flight flow) ----------
@@ -259,6 +306,13 @@ function startFlow(panelPort, panelApiKey) {
   if (runningFlow) return runningFlow;
   runningFlow = (async function () {
     try {
+      if (await chromeCall(function (cb) { chrome.extension.isAllowedIncognitoAccess(cb); })) {
+        return await incognitoFlow();
+      }
+      notify(
+        'Tip: enable "Allow in Incognito" for this extension',
+        'chrome://extensions -> Freebuff2API -> Details -> Allow in Incognito. Then each "One-click login" opens a private window, so you can add more accounts without logging out.'
+      );
       const r = await readFreebuffCookie();
       if (r.ok) {
         const res = await importCookieToGateway(r.cookie, flowPanelPort, flowApiKey);

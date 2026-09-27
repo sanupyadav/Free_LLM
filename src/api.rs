@@ -5635,6 +5635,10 @@ async fn pick_web_cookie(st: &AppState) -> Option<(String, serde_json::Value, St
 /// v0.9: web pool failure write-back -- 401/403 deterministic invalidation cools down immediately (10 minutes, aligned with Bearer pool semantics),
 /// others (network/5xx) accumulate consecutive failures -> trips the breaker once the threshold is reached.
 async fn web_pool_failure(st: &AppState, id: &str, err: &str) {
+    // 400 = our request was bad (e.g. message_too_long), not the account's fault: don't hurt its health
+    if err.contains("HTTP 400") {
+        return;
+    }
     if err.contains("401") || err.contains("403") {
         st.web_pool
             .mark_cooldown(id, std::time::Duration::from_secs(600), err)

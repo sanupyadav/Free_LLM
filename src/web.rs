@@ -131,6 +131,35 @@ details { margin:6px 0; } summary { cursor:pointer; color:var(--muted); font-siz
 .wizard-flash { animation:wizardFlash .8s ease-in-out 2; }
 /* Narrow-screen nav horizontal scroll (v0.8 accessibility) */
 @media(max-width:640px){ nav{ flex-wrap:nowrap; overflow-x:auto; } nav button{ flex:none; min-height:44px; } button:not(.sm), input, select, textarea { min-height:44px; } }
+/* Colorful layer: vivid accents on top of the dark theme */
+:root { --c1:#7c5cff; --c2:#ff5c8a; --c3:#ffb020; --c4:#20d0a0; --c5:#3fa9ff; --grad:linear-gradient(135deg,var(--c1),var(--c2) 50%,var(--c3)); }
+body { background:radial-gradient(900px 500px at 0% -10%,rgba(124,92,255,.18),transparent 60%),radial-gradient(800px 500px at 100% 0%,rgba(255,92,138,.14),transparent 60%),radial-gradient(900px 600px at 50% 110%,rgba(32,208,160,.10),transparent 60%),var(--bg); background-attachment:fixed; }
+header { background:rgba(22,27,34,.85); backdrop-filter:blur(8px); border-bottom:1px solid transparent; border-image:var(--grad) 1; }
+header h1 { background:var(--grad); -webkit-background-clip:text; background-clip:text; color:transparent; font-weight:800; }
+nav button.active { border-bottom-color:var(--c2); background:linear-gradient(180deg,transparent,rgba(255,92,138,.12)); }
+nav button:hover { color:var(--c3); }
+button:not(.ghost):not(.seg button) { background:linear-gradient(135deg,var(--c1),var(--c5)); box-shadow:0 2px 10px rgba(124,92,255,.35); }
+button.ghost:hover { border-color:var(--c2); color:var(--c2); }
+.card { position:relative; overflow:hidden; border-top:3px solid var(--c1); }
+.cards .card:nth-child(5n+2) { border-top-color:var(--c2); } .cards .card:nth-child(5n+3) { border-top-color:var(--c3); }
+.cards .card:nth-child(5n+4) { border-top-color:var(--c4); } .cards .card:nth-child(5n+5) { border-top-color:var(--c5); }
+.cards .card:nth-child(5n+1) .num { color:var(--c1); } .cards .card:nth-child(5n+2) .num { color:var(--c2); } .cards .card:nth-child(5n+3) .num { color:var(--c3); }
+.cards .card:nth-child(5n+4) .num { color:var(--c4); } .cards .card:nth-child(5n+5) .num { color:var(--c5); }
+.card:hover { box-shadow:0 6px 20px rgba(124,92,255,.25); }
+.panel { border-left:3px solid var(--c1); }
+.panel h2 { color:var(--c3); }
+.banner { background:linear-gradient(135deg,rgba(124,92,255,.25),rgba(255,92,138,.15),#161b22); border-color:var(--c1); }
+.switch input:checked + .slider { background:var(--grad); }
+.msg.user { background:linear-gradient(135deg,rgba(124,92,255,.35),rgba(63,169,255,.25)); border-color:var(--c1); }
+.msg.assistant { border-left:3px solid var(--c4); }
+tr.click:hover { background:rgba(124,92,255,.10); }
+.chip { border-color:rgba(124,92,255,.5); color:#cbbcff; }
+/* Rounded pill buttons everywhere, nav tabs (Overview, Playground, ...) included */
+button, .seg { border-radius:999px; }
+nav { border-bottom:none; gap:var(--sp-2); }
+nav button { border-radius:999px; border:1px solid var(--border); padding:8px 18px; }
+nav button.active { color:#fff; border-color:transparent; background:var(--grad); box-shadow:0 2px 12px rgba(255,92,138,.35); }
+.msg .who button { border-radius:999px; }
 </style>
 </head>
 <body>
@@ -252,7 +281,7 @@ details { margin:6px 0; } summary { cursor:pointer; color:var(--muted); font-siz
         </div>
         <b style="font-size:13px">Manual paste (fallback): <span style="color:var(--muted);font-weight:400">supports cookie string / cURL / HAR</span></b> <span class="badge dim">About 1 minute</span>
         <ol style="margin:6px 0 10px 20px;font-size:13px;color:var(--muted);line-height:2">
-          <li><button class="ghost sm" onclick="window.open('https://freebuff.com/','_blank','noopener')">Open freebuff.com and log in</button> (GitHub login works)</li>
+          <li><button class="ghost sm" onclick="openFreebuffIncognito()">Copy link for Incognito login</button> press <b>Ctrl+Shift+N</b>, paste, log in (GitHub works). Adding another account? Always use a new Incognito window and just <b>close it</b> afterwards, never click "Log out" (that kills the imported session)</li>
           <li>Press <b>F12</b> -> <b>Network</b> -> refresh -> click any request -> find <code>Cookie:</code> under <b>Headers</b> and copy the whole line (or copy the value of <code>__Secure-next-auth.session-token</code> from Application -> Cookies)</li>
           <li>Come back to this page, paste it into the input box below -> click "Import" (validity is verified automatically after import)</li>
         </ol>
@@ -1238,8 +1267,17 @@ async function oneClickLogin() {
     void clipCard.offsetWidth;
     clipCard.classList.add('wizard-flash');
   }
-  window.open('https://freebuff.com/', '_blank', 'noopener');
-  toast('Browser extension not detected — freebuff.com has been opened, we recommend using the wizard "Plan B: auto-detect clipboard" (just copy and click)', 9000);
+  openFreebuffIncognito();
+}
+/**
+ * Page JS can't open an Incognito window, so copy the login link and tell the user to open one.
+ * A private window keeps each account's session separate: log in, copy the Cookie, close the window (never "Log out").
+ */
+async function openFreebuffIncognito() {
+  const url = 'https://freebuff.com/';
+  let copied = false;
+  try { await navigator.clipboard.writeText(url); copied = true; } catch (e) { /* clipboard needs a secure context */ }
+  toast((copied ? 'Link copied. ' : 'Open ' + url + ' — ') + 'Press Ctrl+Shift+N (Incognito), paste the link and log in. When done, copy the Cookie and just close the window — do NOT click "Log out".', 12000);
 }
 /**
  * Clipboard auto-import: read clipboard text -> fill into the input box -> automatically trigger import.

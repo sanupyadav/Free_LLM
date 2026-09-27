@@ -12,6 +12,7 @@ The browser edition can't read `__Secure-next-auth.session-token` with a page sc
 4. Click **Load unpacked** → select this directory (`browser-extension`)
 5. The Freebuff2API icon appears in the extensions bar
 6. **Refresh the already-open gateway panel page** (so the extension's `bridge.js` injects and completes the handshake)
+7. **Recommended for multiple accounts:** on the extension's **Details** page turn on **Allow in Incognito**. "One-click login" then opens a private (Incognito) window, imports the account you log in with, and closes the window. Your existing accounts stay logged in, so there's no need to log out. Never click "Log out" on an account you've imported: that kills its session.
 
 ## Method A: panel "one-click login" (recommended — fully automatic)
 

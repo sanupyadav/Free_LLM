@@ -198,7 +198,13 @@ async fn main() -> anyhow::Result<()> {
             conc_free_multi,
             conc_sub_slots,
             conc_sub_multi,
-        )),
+        )
+        .with_wait(std::time::Duration::from_millis(
+            std::env::var("CONCURRENCY_WAIT_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(freebuff2api::semaphore::ACQUIRE_TIMEOUT_MS),
+        ))),
         started: std::time::Instant::now(),
     };
 

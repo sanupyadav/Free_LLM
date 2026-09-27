@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Freebuff2API One-Click Login",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Reads freebuff.com login credentials (including HttpOnly cookies) and sends them to the local Freebuff2API gateway with one click; clicking \"One-click login\" on the panel is fully automatic, opening the login page and waiting if not logged in.",
   "permissions": ["cookies", "notifications", "storage"],
   "host_permissions": ["https://freebuff.com/*", "https://*.freebuff.com/*", "http://127.0.0.1/*", "http://localhost/*"],

@@ -72,7 +72,9 @@ fn run_login_window_inner(gateway_port: Option<u16>) -> Result<String> {
         .build(&event_loop)
         .map_err(|e| anyhow!("failed to create login window: {e}"))?;
 
+    // InPrivate: every login starts clean, so adding a 2nd account doesn't reuse the 1st one's session
     let webview = WebViewBuilder::new()
+        .with_incognito(true)
         .with_url("https://freebuff.com/")
         .build(&window)
         .map_err(|e| {

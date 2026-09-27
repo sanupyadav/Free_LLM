@@ -31,8 +31,10 @@ pub const DEFAULT_FREE_MULTI: usize = 3;
 /// Default subscriber bucket: 3 paid slots / 8 ordinary
 pub const DEFAULT_SUB_SLOTS: usize = 3;
 pub const DEFAULT_SUB_MULTI: usize = 8;
-/// acquire timeout (milliseconds): a timeout is treated as concurrency-busy, returning 429 semantics
-pub const ACQUIRE_TIMEOUT_MS: u64 = 2000;
+/// acquire timeout (milliseconds): a timeout is treated as concurrency-busy, returning 429 semantics.
+/// A streaming reply holds its permit for the whole stream, so a short wait turns every parallel client
+/// request into a 429; queue long enough for a typical reply to finish. Override: CONCURRENCY_WAIT_MS.
+pub const ACQUIRE_TIMEOUT_MS: u64 = 120_000;
 
 /// Failed to acquire a permit
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +49,7 @@ pub struct TieredSemaphore {
     free_multi: Arc<Semaphore>,
     sub_slots: Arc<Semaphore>,
     sub_multi: Arc<Semaphore>,
+    wait: Duration,
 }
 
 /// RAII guard for a single permit: returns the corresponding semaphore on Drop
@@ -82,7 +85,14 @@ impl TieredSemaphore {
             free_multi: Arc::new(Semaphore::new(free_multi.max(1))),
             sub_slots: Arc::new(Semaphore::new(sub_slots.max(1))),
             sub_multi: Arc::new(Semaphore::new(sub_multi.max(1))),
+            wait: Duration::from_millis(ACQUIRE_TIMEOUT_MS),
         }
+    }
+
+    /// Overrides how long `acquire` queues before returning Busy
+    pub fn with_wait(mut self, wait: Duration) -> Self {
+        self.wait = wait;
+        self
     }
 
     /// Default capacities (1/3/3/8)
@@ -118,7 +128,7 @@ impl TieredSemaphore {
         };
         // Grab slots first (scarcer), then multi
         let slot_permit = match timeout(
-            Duration::from_millis(ACQUIRE_TIMEOUT_MS),
+            self.wait,
             slots.acquire_owned(),
         )
         .await
@@ -127,7 +137,7 @@ impl TieredSemaphore {
             _ => return Err(AcquireError::Busy),
         };
         let multi_permit = match timeout(
-            Duration::from_millis(ACQUIRE_TIMEOUT_MS),
+            self.wait,
             multi.acquire_owned(),
         )
         .await
@@ -147,7 +157,7 @@ impl TieredSemaphore {
             self.free_slots.clone()
         };
         match timeout(
-            Duration::from_millis(ACQUIRE_TIMEOUT_MS),
+            self.wait,
             slots.acquire_owned(),
         )
         .await
@@ -211,10 +221,10 @@ mod tests {
 
     #[tokio::test]
     async fn permit_exhaustion_returns_busy_within_timeout() {
-        let sem = TieredSemaphore::new(1, 1, 3, 8);
+        let sem = TieredSemaphore::new(1, 1, 3, 8).with_wait(Duration::from_millis(2000));
         let _g = sem.acquire(false).await.unwrap();
         let start = std::time::Instant::now();
-        // ACQUIRE_TIMEOUT_MS is internally 2s; the test uses a 3s outer window to ensure Busy rather than hanging forever
+        // wait is 2s here; the test uses a 3s outer window to ensure Busy rather than hanging forever
         let r = tokio::time::timeout(Duration::from_millis(3000), sem.acquire(false)).await;
         assert!(r.is_ok(), "must not block indefinitely");
         assert_eq!(r.unwrap().unwrap_err(), AcquireError::Busy);
