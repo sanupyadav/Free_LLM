@@ -89,6 +89,11 @@ impl TieredSemaphore {
         }
     }
 
+    /// How long `acquire` queues before returning Busy
+    pub fn wait(&self) -> Duration {
+        self.wait
+    }
+
     /// Overrides how long `acquire` queues before returning Busy
     pub fn with_wait(mut self, wait: Duration) -> Self {
         self.wait = wait;

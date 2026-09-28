@@ -1540,10 +1540,10 @@ mod tests {
 
 /// Upstream rejects `content` over 32,000 characters (`message_too_long`); counted in JS UTF-16 units,
 /// so budget below that in chars. Keeps the head (system instructions) and the tail (latest turns).
-const WEB_CONTENT_MAX_CHARS: usize = 30_000;
+pub const WEB_CONTENT_MAX_CHARS: usize = 30_000;
 const WEB_CONTENT_HEAD_CHARS: usize = 6_000;
 
-// ponytail: blind head+tail cut; drop whole old turns in flatten_messages if the middle loss hurts answers
+// Last-resort cut for a single oversized message; flatten_messages already drops whole old turns first
 pub fn fit_web_limit(content: &str) -> std::borrow::Cow<'_, str> {
     let total = content.chars().count();
     if total <= WEB_CONTENT_MAX_CHARS {

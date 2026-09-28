@@ -249,6 +249,18 @@ pub fn flatten_messages(
             parts.push(format!("{label}\n{t}"));
         }
     }
+    // Too long for upstream's per-message limit: drop whole oldest turns (keep system + latest) rather
+    // than cutting mid-message; fit_web_limit still guards a single oversized message.
+    let first_turn = usize::from(!systems.is_empty());
+    let size = |ps: &[String]| ps.iter().map(|p| p.chars().count() + 2).sum::<usize>();
+    let mut dropped = 0;
+    while parts.len() > first_turn + 1 && size(&parts) > crate::web_protocol::WEB_CONTENT_MAX_CHARS {
+        parts.remove(first_turn);
+        dropped += 1;
+    }
+    if dropped > 0 {
+        parts.insert(first_turn, format!("[{dropped} earlier messages omitted]"));
+    }
     let prompt = parts.join("\n\n");
     if prompt.trim().is_empty() {
         None
@@ -260,6 +272,22 @@ pub fn flatten_messages(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn long_chat_drops_oldest_turns_keeps_system_and_latest() {
+        let big = "x".repeat(12_000);
+        let msgs = serde_json::json!([
+            {"role":"system","content":"SYS"},
+            {"role":"user","content":format!("old1 {big}")},
+            {"role":"assistant","content":format!("old2 {big}")},
+            {"role":"user","content":format!("mid {big}")},
+            {"role":"user","content":"LATEST"},
+        ]);
+        let (p, _) = flatten_messages(&msgs, false).unwrap();
+        assert!(p.chars().count() <= crate::web_protocol::WEB_CONTENT_MAX_CHARS);
+        assert!(p.contains("SYS") && p.ends_with("LATEST"));
+        assert!(!p.contains("old1") && p.contains("earlier messages omitted"));
+    }
 
     fn msgs(v: serde_json::Value) -> serde_json::Value {
         v

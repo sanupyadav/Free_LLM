@@ -1105,7 +1105,6 @@ async fn web_bridge_openai(
     // v0.8 dual-bucket concurrency semaphore: the bridge path also acquires before the first byte is written out
     // (conservative: web credentials default to the free bucket, the subscription bucket if a plan field is
     // present). The guard is held by the background forwarding task until the stream ends.
-    let bridge_is_sub = crate::semaphore::is_subscriber_token(&cookie, None);
     // Test hook: FREEBUFF2API_WEB_HOST can override the upstream host (production keeps the WEB_HOST default)
     let web_host = std::env::var("FREEBUFF2API_WEB_HOST")
         .unwrap_or_else(|_| crate::web_protocol::WEB_HOST.to_string());
@@ -1113,9 +1112,11 @@ async fn web_bridge_openai(
         Ok(c) => c,
         Err(e) => return internal_err(&anyhow::Error::msg(e.to_string())),
     };
-    let bridge_guard = match st.semaphore.acquire(bridge_is_sub).await {
-        Ok(g) => g,
-        Err(_) => {
+    // Per-account slot (see WebCookiePool::acquire): parallel requests spread across accounts, and only
+    // queue when every account is busy
+    let bridge_guard = match st.web_pool.acquire(&cid, st.semaphore.wait()).await {
+        Some(g) => g,
+        None => {
             let ms = start.elapsed().as_millis() as i64;
             st.usage
                 .record_ex("web-cookie", &model, 0, 0, ms, 429, "", "", &req_id)
@@ -1329,7 +1330,7 @@ async fn web_bridge_openai(
         rx.recv().await.map(|item| (item, rx))
     });
     if !stream {
-        return aggregate_bridge_sse(Box::pin(body_stream), &model, &req_id).await;
+        return aggregate_bridge_sse(Box::pin(body_stream), &model, &req_id, est_input_chars).await;
     }
     Response::builder()
         .header("content-type", "text/event-stream")
@@ -1598,6 +1599,7 @@ async fn aggregate_bridge_sse(
     mut stream: impl futures::Stream<Item = Result<axum::body::Bytes, std::io::Error>> + Unpin,
     model: &str,
     req_id: &str,
+    input_chars: usize,
 ) -> Response {
     let mut raw = String::new();
     while let Some(chunk) = stream.next().await {
@@ -1672,7 +1674,13 @@ async fn aggregate_bridge_sse(
                     .unwrap_or(0),
             )
         })
-        .unwrap_or((0, 0));
+        // upstream web SSE carries no usage: estimate like the stats path does (estimate_tokens)
+        .unwrap_or_else(|| {
+            (
+                estimate_tokens(input_chars),
+                estimate_tokens(content.chars().count()),
+            )
+        });
     let mut resp = serde_json::json!({
         "id": format!("chatcmpl-webbridge-{}", &req_id[..8.min(req_id.len())]),
         "object": "chat.completion",

@@ -19,8 +19,9 @@ use crate::config::Config;
 use crate::import;
 use crate::pool::CircuitBreaker;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
+use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
 
 /// Credential source
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -40,6 +41,9 @@ struct WebEntry {
     score: f64,
     breaker: CircuitBreaker,
     last_ok_at: Option<Instant>,
+    /// Per-account concurrency slots (upstream free tier allows 1 formal session per account at a time):
+    /// N accounts = N parallel requests, instead of one gateway-wide slot
+    slots: Arc<Semaphore>,
 }
 
 /// Pick result (caller only gets the cookie + display info + stable id, no internal state)
@@ -107,6 +111,7 @@ impl WebEntry {
             score: 0.0,
             breaker: CircuitBreaker::new(),
             last_ok_at: None,
+            slots: Arc::new(Semaphore::new(1)),
         }
     }
 }
@@ -162,6 +167,7 @@ impl WebCookiePool {
                 e.score = prev.score;
                 e.breaker = prev.breaker;
                 e.last_ok_at = prev.last_ok_at;
+                e.slots = prev.slots; // keep in-flight permits across reloads
             }
             merged.push(e);
         }
@@ -211,17 +217,23 @@ impl WebCookiePool {
         self.inner.read().await.len()
     }
 
-    /// Pick the highest-health credential allowed by the circuit breaker; None if all unavailable
+    /// Pick the credential allowed by the circuit breaker: an idle account (free concurrency slot) first,
+    /// then the highest health score; None if all unavailable
     pub async fn pick(&self) -> Option<WebPick> {
         let mut entries = self.inner.write().await;
         let mut best: Option<usize> = None;
+        let rank = |e: &WebEntry| (e.slots.available_permits() > 0, e.score);
         // Index-based access (avoid iter_mut + closure double-borrow conflict; breaker.allow's mutable semantics unchanged)
         for i in 0..entries.len() {
             if !entries[i].breaker.allow() {
                 continue;
             }
-            let score = entries[i].score;
-            if best.map(|b| score > entries[b].score).unwrap_or(true) {
+            let (idle, score) = rank(&entries[i]);
+            let better = best.map_or(true, |b| {
+                let (b_idle, b_score) = rank(&entries[b]);
+                (idle, score) > (b_idle, b_score)
+            });
+            if better {
                 best = Some(i);
             }
         }
@@ -244,6 +256,13 @@ impl WebCookiePool {
                 }),
             }
         })
+    }
+
+    /// Take this account's concurrency slot, queueing up to `wait`; None = still busy (or unknown id).
+    /// ponytail: pick-then-acquire can race two requests onto one idle account (the 2nd queues); pick-with-permit if it matters
+    pub async fn acquire(&self, id: &str, wait: Duration) -> Option<OwnedSemaphorePermit> {
+        let slots = self.inner.read().await.iter().find(|e| e.id == id)?.slots.clone();
+        tokio::time::timeout(wait, slots.acquire_owned()).await.ok()?.ok()
     }
 
     /// Request succeeded (HalfOpen probe success -> gradual recovery)
@@ -330,6 +349,26 @@ mod tests {
         );
         let pool = WebCookiePool::load(&c);
         assert_eq!(pool.count().await, 1, "only cookie values enter the pool");
+    }
+
+    #[tokio::test]
+    async fn busy_account_is_skipped_for_an_idle_one() {
+        let c = cfg_with(
+            vec![
+                "__Secure-next-auth.session-token=acct-a",
+                "__Secure-next-auth.session-token=acct-b",
+            ],
+            "no-such-tokens.json",
+        );
+        let pool = WebCookiePool::load(&c);
+        let first = pool.pick().await.unwrap();
+        let _held = pool.acquire(&first.id, Duration::from_millis(50)).await.unwrap();
+        // first account is busy -> the next request goes to the other account, not a queue
+        let second = pool.pick().await.unwrap();
+        assert_ne!(first.id, second.id);
+        assert!(pool.acquire(&second.id, Duration::from_millis(50)).await.is_some());
+        // both busy -> acquire on a busy one times out
+        assert!(pool.acquire(&first.id, Duration::from_millis(50)).await.is_none());
     }
 
     #[tokio::test]
